@@ -2578,6 +2578,7 @@ static void set_aud_info_pkt(struct hdmitx_dev *hdev,
 	switch (audio_param->type) {
 	case CT_MAT:
 	case CT_DTS_HD_MA:
+	case CT_DTS_HD:
 		/* CC: 8ch */
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDICONF0, 7, 4, 3);
 		hdmitx_wr_reg(HDMITX_DWC_FC_AUDICONF2, 0x13);
@@ -2609,7 +2610,6 @@ static void set_aud_info_pkt(struct hdmitx_dev *hdev,
 		}
 		break;
 	case CT_DTS:
-	case CT_DTS_HD:
 	default:
 		/* CC: 2ch */
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDICONF0, 1, 4, 3);
@@ -2630,7 +2630,8 @@ static void set_aud_acr_pkt(struct hdmitx_dev *hdev,
 	hdmitx_wr_reg(HDMITX_DWC_AUD_INPUTCLKFS, hdev->tx_aud_src ? 4 : 0);
 
 	if ((audio_param->type == CT_MAT)
-	|| (audio_param->type == CT_DTS_HD_MA))
+	|| (audio_param->type == CT_DTS_HD_MA)
+	|| (audio_param->type == CT_DTS_HD))
 		hdmitx_wr_reg(HDMITX_DWC_AUD_INPUTCLKFS, 2);
 
 	if ((hdev->frac_rate_policy) && (hdev->para->timing.frac_freq))
@@ -2643,6 +2644,9 @@ static void set_aud_acr_pkt(struct hdmitx_dev *hdev,
 	else
 		aud_n_para = hdmi_get_aud_n_paras(audio_param->sample_rate,
 			hdev->para->cd, char_rate);
+	/* Force correct N for HBR (DTS-HD HRA): 6144 per HDMI spec */
+	if (audio_param->type == CT_DTS_HD)
+		aud_n_para = 6144;
 	pr_info(HW "aud_n_para = %d\n", aud_n_para);
 
 	/* ACR packet configuration */
@@ -2666,6 +2670,15 @@ static void set_aud_acr_pkt(struct hdmitx_dev *hdev,
 	hdmitx_wr_reg(HDMITX_DWC_AUD_N3, data32);
 	hdmitx_wr_reg(HDMITX_DWC_AUD_N2, (aud_n_para>>8)&0xff); /* AudN[15:8] */
 	hdmitx_wr_reg(HDMITX_DWC_AUD_N1, aud_n_para&0xff); /* AudN[7:0] */
+
+	if (audio_param->type == CT_DTS_HD) {
+		/* Make sure N_shift stays 0 so sinks that dislike shifted N still lock */
+		data32 = 0;
+		data32 |= (0 << 7);  /* [7:5] N_shift */
+		data32 |= (0 << 4);  /* [  4] CTS_manual */
+		data32 |= (0 << 0);  /* [3:0] manual AudCTS[19:16] */
+		hdmitx_wr_reg(HDMITX_DWC_AUD_CTS3, data32);
+	}
 }
 
 static void set_aud_fifo_rst(void)
@@ -2816,8 +2829,10 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	hdmitx_wr_reg(HDMITX_DWC_AUD_CONF1, data32);
 
 	data32 = 0;
-	data32 |= (0 << 1);  /* [  1] NLPCM */
-	data32 |= (0 << 0);  /* [  0] HBR */
+	if (audio_param->type == CT_DTS_HD) {
+		data32 |= (1 << 1);  /* [  1] NLPCM for compressed streams */
+		data32 |= (1 << 0);  /* [  0] HBR for high bitrate compressed audio */
+	}
 	hdmitx_wr_reg(HDMITX_DWC_AUD_CONF2, data32);
 
 	/* spdif sampler config */
