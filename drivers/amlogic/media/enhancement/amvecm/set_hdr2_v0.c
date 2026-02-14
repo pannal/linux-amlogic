@@ -703,6 +703,10 @@ static uint hdr2_debug;
 module_param(hdr2_debug, uint, 0664);
 MODULE_PARM_DESC(hdr2_debug, "\n hdr2_debug\n");
 
+static bool osd_pq_bypass;
+module_param(osd_pq_bypass, bool, 0664);
+MODULE_PARM_DESC(osd_pq_bypass, "\n osd_pq_bypass\n");
+
 /* gamut 3x3 matrix*/
 /*standard 2020rgb->709rgb*/
 int ncl_2020_709[9] = {
@@ -2452,7 +2456,6 @@ enum hdr_process_sel hdr_func(
 	int *oft_post_in = bypass_pos;
 	int *oft_pre_out = bypass_pre;
 	int *oft_post_out = bypass_pos;
-	bool always_full_func = false;
 
 	pr_csc(16, "hdr func: hdr module=%d, select=0x%x\n",
 	       module_sel,
@@ -2469,12 +2472,8 @@ enum hdr_process_sel hdr_func(
 		/* turn off OSD mtx and use HDR for g12, sm1, tl1 */
 		VSYNC_WRITE_VPP_REG(
 			VPP_WRAP_OSD1_MATRIX_EN_CTRL, 0);
-		if (!is_dolby_vision_on() || is_hdr_tvmode())
+		if (!is_dolby_vision_on() || is_hdr_tvmode() || osd_pq_bypass)
 			hdr_process_select |= RGB_OSD;
-		/*for g12a/g12b osd blend shift rtl bug*/
-		if (is_meson_g12a_cpu() ||
-		    (is_meson_g12b_cpu() && is_meson_rev_a()))
-			always_full_func = true;
 	}
 
 	if (cpu_after_eq(MESON_CPU_MAJOR_ID_TM2)) {
@@ -2534,7 +2533,8 @@ enum hdr_process_sel hdr_func(
 		hdr_lut_param.hist_en = LUT_OFF;
 	} else if (hdr_process_select & HDR_BYPASS ||
 		   hdr_process_select & HLG_BYPASS ||
-		   hdr_process_select & CUVA_BYPASS) {
+		   hdr_process_select & CUVA_BYPASS ||
+		   (module_sel == OSD1_HDR && osd_pq_bypass)) {
 		if (!(hdr_process_select & IPT_MAP)) {
 			for (i = 0; i < HDR2_OETF_LUT_SIZE; i++) {
 				hdr_lut_param.oetf_lut[i] =	oe_y_lut_bypass[i];
@@ -2546,13 +2546,9 @@ enum hdr_process_sel hdr_func(
 					hdr_lut_param.cgain_lut[i] =
 						cgain_lut_bypass[i] - 1;
 			}
-			if (always_full_func) {
-				hdr_lut_param.lut_on = LUT_ON;
-				hdr_lut_param.cgain_en = LUT_ON;
-			} else {
-				hdr_lut_param.lut_on = LUT_OFF;
-				hdr_lut_param.cgain_en = LUT_OFF;
-			}
+
+			hdr_lut_param.lut_on = LUT_OFF;
+			hdr_lut_param.cgain_en = LUT_OFF;
 		} else {
 			for (i = 0; i < HDR2_OETF_LUT_SIZE; i++) {
 				hdr_lut_param.oetf_lut[i]  = oe_y_lut_hdr[i];
@@ -2673,13 +2669,9 @@ enum hdr_process_sel hdr_func(
 				hdr_lut_param.cgain_lut[i] =
 					cgain_lut_bypass[i] - 1;
 		}
-		if (always_full_func) {
-			hdr_lut_param.lut_on = LUT_ON;
-			hdr_lut_param.cgain_en = LUT_ON;
-		} else {
-			hdr_lut_param.lut_on = LUT_OFF;
-			hdr_lut_param.cgain_en = LUT_OFF;
-		}
+		hdr_lut_param.lut_on = LUT_OFF;
+		hdr_lut_param.cgain_en = LUT_OFF;
+
 		hdr_lut_param.bitdepth = bit_depth;
 	} else if (hdr_process_select & SDR_HLG) {
 		for (i = 0; i < HDR2_OETF_LUT_SIZE; i++) {
@@ -2691,12 +2683,9 @@ enum hdr_process_sel hdr_func(
 				hdr_lut_param.cgain_lut[i] =
 					cgain_lut_bypass[i] - 1;
 		}
-		if (always_full_func)
-			hdr_lut_param.cgain_en = LUT_ON;
-		else
-			hdr_lut_param.cgain_en = LUT_OFF;
-		hdr_lut_param.lut_on = LUT_ON;
 		hdr_lut_param.bitdepth = bit_depth;
+		hdr_lut_param.cgain_en = LUT_OFF;
+		hdr_lut_param.lut_on = LUT_ON;
 		hdr_lut_param.hist_en = LUT_OFF;
 	} else if (hdr_process_select & HLG_CUVA) {
 		for (i = 0; i < HDR2_OETF_LUT_SIZE; i++) {
@@ -2968,7 +2957,7 @@ enum hdr_process_sel hdr_func(
 				oft_pre_out = bypass_pre;
 				oft_post_out = bypass_pos;
 			} else {
-				coeff_in = rgb2ycbcr_709;
+				coeff_in = rgb2ycbcr_ncl2020;
 				oft_pre_in = rgb2yuvpre;
 				oft_post_in = rgb2yuvpos;
 				oft_pre_out = bypass_pre;
@@ -3121,7 +3110,7 @@ enum hdr_process_sel hdr_func(
 			}
 		}
 
-		if (always_full_func || (hdr_process_select & IPT_MAP)) {
+		if (hdr_process_select & IPT_MAP) {
 			hdr_mtx_param.mtx_only = HDR_ONLY;
 			hdr_mtx_param.mtx_on = MTX_ON;
 		} else {
@@ -3335,13 +3324,9 @@ enum hdr_process_sel hdr_func(
 					bypass_pos[i];
 			}
 		}
-		if (always_full_func) {
-			hdr_mtx_param.mtx_only = HDR_ONLY;
-			hdr_mtx_param.mtx_on = MTX_ON;
-		} else {
-			hdr_mtx_param.mtx_only = MTX_ONLY;
-			hdr_mtx_param.mtx_on = MTX_OFF;
-		}
+		hdr_mtx_param.mtx_only = MTX_ONLY;
+		hdr_mtx_param.mtx_on = MTX_OFF;
+
 		hdr_mtx_param.p_sel = hdr_process_select;
 	}  else if (hdr_process_select & HLG_CUVA) {
 		hdr_mtx_param.mtx_only = HDR_ONLY;
