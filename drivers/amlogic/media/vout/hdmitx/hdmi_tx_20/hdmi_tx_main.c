@@ -75,6 +75,7 @@
 #define HDMI_TX_PWR_CTRL_NUM	6
 
 static struct class *hdmitx_class;
+extern bool xbmc_aml_linux_force_422;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -678,6 +679,8 @@ static int set_disp_mode_auto(void)
 	hdev->para = para;
 	vic = hdmitx_edid_get_VIC(hdev, mode, 1);
 
+	if (xbmc_aml_linux_force_422) para->cs = COLORSPACE_YUV422;
+
 	pr_info("set_disp_mode_auto - eotf type [%d] tunnel mode [%d] vic [%d] cd [%d] cs [%s]\n",
 		hdev->hdmi_current_eotf_type, hdev->hdmi_current_tunnel_mode, vic,
 		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs]);
@@ -711,6 +714,8 @@ static int set_disp_mode_auto(void)
 		default:
 			break;
 	}
+
+	if (xbmc_aml_linux_force_422 && (para->cs == COLORSPACE_YUV422)) para->cd = COLORDEPTH_36B;
 
 	// parse and set maximum colourdepth given by edid
 	// check for colour subsampling limit
