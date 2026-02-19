@@ -173,6 +173,23 @@ module_param(dolby_vision_wait_delay, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_wait_delay, "\n dolby_vision_wait_delay\n");
 static int dolby_vision_wait_count;
 
+/* EL stall detection for FEL EOS freeze.
+ *
+ * When the EL decoder runs out of frames (EL track ends), every subsequent
+ * BL vframe is held in dolby_vision_wait_metadata() indefinitely (ret=1).
+ * To break this freeze we count vsync cycles spent waiting for EL on a given
+ * BL PTS.  After EL_STALL_MAX_WAIT cycles we allow the frame to proceed
+ * without EL.  After EL_ABSENT_THRESHOLD distinct BL frames have each timed
+ * out we conclude the EL track is exhausted and set el_track_ended=true,
+ * which makes every subsequent BL frame return 2 immediately (no per-frame
+ * wait) so playback resumes at full speed for the remainder. */
+#define EL_STALL_MAX_WAIT    1   /* vsync cycles before a single frame times out */
+#define EL_ABSENT_THRESHOLD  2   /* distinct timed-out frames before fast path */
+static u64  el_stall_pts_us64;
+static int  el_stall_count;
+static int  el_absent_frames;
+static bool el_track_ended;
+
 /* reset 1st fake frame (bit 0)*/
 /*   and other fake frames (bit 1)*/
 /*   and other toggle frames (bit 2) */
@@ -2511,6 +2528,10 @@ void enable_dolby_vision(int enable)
 		dolby_vision_wait_init = false;
 		dolby_vision_wait_count = 0;
 		vsync_count = 0;
+		el_stall_pts_us64 = 0;
+		el_stall_count = 0;
+		el_absent_frames = 0;
+		el_track_ended = false;
 
 	} else {
 
@@ -2636,6 +2657,10 @@ void enable_dolby_vision(int enable)
 		dolby_vision_wait_init = false;
 		dolby_vision_wait_count = 0;
 		dolby_vision_status = BYPASS_PROCESS;
+		el_stall_pts_us64 = 0;
+		el_stall_count = 0;
+		el_absent_frames = 0;
+		el_track_ended = false;
 		dolby_vision_target_mode = DOLBY_VISION_OUTPUT_MODE_BYPASS;
 		dolby_vision_mode = DOLBY_VISION_OUTPUT_MODE_BYPASS;
 		dolby_vision_src_format = 0;
@@ -6163,7 +6188,9 @@ int dolby_vision_wait_metadata(struct vframe_s *vf)
 					     el_vf, el_vf->pts_us64);
 			if (el_vf->pts_us64 == vf->pts_us64 ||
 			    !(dolby_vision_flags & FLAG_CHECK_ES_PTS)) {
-				/* found el */
+				/* found el — reset EOS-stall state */
+				el_absent_frames = 0;
+				el_track_ended = false;
 				ret = 3;
 				break;
 			} else if (el_vf->pts_us64 < vf->pts_us64) {
@@ -6188,12 +6215,46 @@ int dolby_vision_wait_metadata(struct vframe_s *vf)
 				break;
 			}
 		}
-		/* need wait el */
+		/* EL queue is empty for this BL frame */
 		if (!el_vf) {
-			if (debug_dolby & 2)
-				pr_dolby_dbg("=== bl wait el(%p-%lld) ===\n",
-					     vf, vf->pts_us64);
-			ret = 1;
+			/* Fast path: EL track already confirmed exhausted —
+			 * proceed immediately without any per-frame stall so
+			 * the remaining BL-only frames play at full speed. */
+			if (el_track_ended) {
+				return 2;
+			}
+
+			/* Per-frame stall: count vsync cycles waiting for EL
+			 * on this specific BL PTS.  A new pts resets the
+			 * counter (new frame, fresh chance for EL to arrive).
+			 * After EL_STALL_MAX_WAIT cycles declare this frame
+			 * timed out and count it as an absent EL frame. */
+			if (vf->pts_us64 != el_stall_pts_us64) {
+				el_stall_pts_us64 = vf->pts_us64;
+				el_stall_count = 0;
+			}
+			if (++el_stall_count <= EL_STALL_MAX_WAIT) {
+				if (debug_dolby & 2)
+					pr_dolby_dbg("=== bl wait el(%p-%lld) count %d ===\n",
+						     vf, vf->pts_us64,
+						     el_stall_count);
+				ret = 1;
+			} else {
+				/* This BL frame timed out waiting for EL.
+				 * If enough distinct frames have timed out,
+				 * lock in the fast path for all future frames. */
+				el_stall_count = 0;
+				el_absent_frames++;
+				if (el_absent_frames >= EL_ABSENT_THRESHOLD) {
+					pr_info("amdolby_vision: EL track ended (FEL EOS), switching to BL-only display\n");
+					el_track_ended = true;
+				} else {
+					pr_dolby_dbg("=== bl(%p-%lld) el stall timeout (%d/%d) ===\n",
+						     vf, vf->pts_us64,
+						     el_absent_frames, EL_ABSENT_THRESHOLD);
+				}
+				return 2;
+			}
 		}
 	}
 	if (ret == 1)
