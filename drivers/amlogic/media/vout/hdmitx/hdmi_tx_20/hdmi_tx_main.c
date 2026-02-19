@@ -76,6 +76,7 @@
 
 static struct class *hdmitx_class;
 extern bool xbmc_aml_linux_force_422;
+extern unsigned int xbmc_dv_vp;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -732,19 +733,15 @@ static int set_disp_mode_auto(void)
 						break;
 					case RGB_10_12BIT:
 					case YUV444_10_12BIT:
+					{
 						if (dv_info->ver == 2) {
-							switch (dv_info->sup_10b_12b_444) {
-								case 1:
-									para->cd = COLORDEPTH_30B;
-									break;
-								case 2:
-									para->cd = COLORDEPTH_36B;
-									break;
-								default:
-									break;
-							}
+							if ((dv_info->sup_10b_12b_444 == 1) && (xbmc_dv_vp == 0))
+								para->cd = COLORDEPTH_30B;
+							else if (((dv_info->sup_10b_12b_444 == 2) && (xbmc_dv_vp == 0)) || (xbmc_dv_vp == 4) || (xbmc_dv_vp == 5))
+								para->cd = COLORDEPTH_36B;
 						}
 						break;
+					}
 					case YUV422_BIT12:
 						para->cd = COLORDEPTH_36B;
 						break;
