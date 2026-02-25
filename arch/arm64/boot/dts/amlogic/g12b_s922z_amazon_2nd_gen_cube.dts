@@ -118,7 +118,29 @@
 		cbus@ffd00000 {
 			i2c@1c000 {  
 				/delete-node/ rt5651@1a;
-			
+				
+				tsl2540@39 {
+					compatible = "amstaos,tsl2540";
+					reg = <0x39>;
+					als_name = "taos_als";
+					persist = <0x12>;
+					als_gain = <0x03>;
+					als_gain_factor = <0x01>;
+					als_deltap = <0x0a>;
+					als_time = <0x7b>;
+					d_factor = <0xb79b>;
+					ch0_coef0 = <0x3e8>;
+					ch1_coef0 = <0x1ed>;
+					ch0_coef1 = <0x26b>;
+					ch1_coef1 = <0xffffffe0>;
+					az_iterations = <0x7e>;
+					als_can_wake = <0x00>;
+					boot-on;
+					#address-cells = <0x01>;
+					#size-cells = <0x01>;
+					status = "okay";
+				};	
+						
 				is31fl3236@3F {
 					compatible = "issi,is31fl3236,gva";
 					reg = <0x3f>;
