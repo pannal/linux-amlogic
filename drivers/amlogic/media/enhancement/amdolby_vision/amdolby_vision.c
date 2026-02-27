@@ -526,8 +526,6 @@ module_param(dolby_vision_graphic_max, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_graphic_max, "\n dolby_vision_graphic_max\n");
 
 static unsigned int dv_HDR10_graphics_max = 300;
-module_param(dv_HDR10_graphics_max, uint, 0664);
-MODULE_PARM_DESC(dv_HDR10_graphics_max, "\n dv_HDR10_graphics_max\n");
 static unsigned int dv_graphic_blend_test;
 module_param(dv_graphic_blend_test, uint, 0664);
 MODULE_PARM_DESC(dv_graphic_blend_test, "\n dv_graphic_blend_test\n");
@@ -1776,10 +1774,10 @@ static int dolby_core3_set
     new_dovi_setting.vsvdb_changed = 0;
     new_dovi_setting.mode_changed = 0;
 
+    /* TODO: verify 962e case */
     if (is_meson_box() || is_meson_tm2_stbmode() || is_meson_sc2()) {
 
-      if ((new_dovi_setting.dovi_ll_enable && new_dovi_setting.diagnostic_enable == 0) ||
-          cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) {
+      if (new_dovi_setting.dovi_ll_enable && new_dovi_setting.diagnostic_enable == 0) {
         VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 3, 6, 2); /* post matrix */
         VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL, 1, 0, 1); /* post matrix */
       } else {
@@ -1815,11 +1813,8 @@ static int dolby_core3_set
     reset_post_table = true;
   }
 
-  /* flush post matrix table when ll mode or HDR10 output mode and setting changed */
-  /* Core3 HDR10 mode outputs RGB, needs POST matrix for RGB->YUV conversion */
-  if ((new_dovi_setting.dovi_ll_enable ||
-       cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
-      new_dovi_setting.diagnostic_enable == 0 &&
+  /* flush post matrix table when ll mode on and setting changed */
+  if (new_dovi_setting.dovi_ll_enable && new_dovi_setting.diagnostic_enable == 0 &&
       dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
     enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
 
@@ -2432,16 +2427,6 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(VPP_GAINOFF_CTRL0, 0);			// bypass gainoff
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 1, 2);	// enable wm tp vks - bypass gainoff to vks
 					enable_rgb_to_yuv_matrix_for_dvll(1, &reg[18], (dv_ll_output_mode >> 8) & 0xff);
-				} else if (dolby_vision_mode ==
-					   DOLBY_VISION_OUTPUT_MODE_HDR10) {
-					u32 *reg = (u32 *)&dovi_setting.dm_reg3;
-					/* Core3 HDR10 outputs RGB, needs POST matrix */
-					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL,
-						3, 6, 2); /* post matrix */
-					VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL,
-						1, 0, 1); /* post matrix */
-					enable_rgb_to_yuv_matrix_for_dvll(
-						1, &reg[18], 12);
 				} else {
 					enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
 				}
@@ -2477,8 +2462,7 @@ void enable_dolby_vision(int enable)
 				VSYNC_WR_DV_REG(VPP_MATRIX_CTRL, 0);
 				VSYNC_WR_DV_REG(VPP_DUMMY_DATA1, 0x20000000);
 
-				if (dvll ||
-				    dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) {
+				if (dvll) {
 					u32 *reg = (u32 *)&dovi_setting.dm_reg3;
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 3, 6, 2); // post matrix
 					enable_rgb_to_yuv_matrix_for_dvll(1, &reg[18], 12);
@@ -2496,29 +2480,6 @@ void enable_dolby_vision(int enable)
 			dolby_vision_core1_on_cnt = 0;
 
 		} else {
-
-			/* DV already on: update POST matrix for mode changes.
-			 * Core3 HDR10 mode outputs RGB which needs POST
-			 * matrix for RGB->YUV conversion. */
-			if (is_meson_box() || is_meson_tm2_stbmode() ||
-			    is_meson_sc2()) {
-				if (dvll || dolby_vision_mode ==
-				    DOLBY_VISION_OUTPUT_MODE_HDR10) {
-					VSYNC_WR_DV_REG_BITS(
-						VPP_DOLBY_CTRL,
-						3, 6, 2); /* post matrix */
-					VSYNC_WR_DV_REG_BITS(
-						VPP_MATRIX_CTRL,
-						1, 0, 1); /* post matrix */
-				} else {
-					VSYNC_WR_DV_REG_BITS(
-						VPP_DOLBY_CTRL,
-						0, 6, 2); /* post matrix */
-					VSYNC_WR_DV_REG_BITS(
-						VPP_MATRIX_CTRL,
-						0, 0, 1); /* post matrix */
-				}
-			}
 
 			if (!dolby_vision_core1_on && core1) {
 
