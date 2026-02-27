@@ -5848,7 +5848,9 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	/* STB core */
 	/* check target luminance */
 	graphic_min = dolby_vision_graphic_min;
-	if (dolby_vision_graphic_max != 0) {
+	if (dv_graphic_blend_test && dst_format == FORMAT_HDR10) {
+		graphic_max = dv_HDR10_graphics_max;
+	} else if (dolby_vision_graphic_max != 0) {
 		graphic_max = dolby_vision_graphic_max;
 	} else {
 		if ((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
@@ -5857,8 +5859,6 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		} else {
 			graphic_max = dv_target_graphics_max[src_format][dst_format];
 		}
-		if (dv_graphic_blend_test && dst_format == FORMAT_HDR10)
-			graphic_max = dv_HDR10_graphics_max;
 	}
 
 	if (dolby_vision_flags & FLAG_USE_SINK_MIN_MAX) {
