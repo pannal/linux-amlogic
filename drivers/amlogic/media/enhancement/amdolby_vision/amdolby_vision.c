@@ -6041,6 +6041,14 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		}
 	}
 
+	/* VS10 DV→SDR: clear extension block count so the DV engine uses
+	 * default tone mapping instead of being influenced by source L1/L2
+	 * metadata, which can cause incorrect brightness in SDR output. */
+	if ((xbmc_dv_vp == 0) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
+	    (dst_format == FORMAT_SDR))
+		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
+
 	if (debug_dolby & 0x400)
 		do_gettimeofday(&start);
 
