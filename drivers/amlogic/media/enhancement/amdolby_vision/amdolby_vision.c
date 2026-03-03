@@ -1657,8 +1657,11 @@ static int dolby_core2_set
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 2, 1);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 0);
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 0);
+  /* DOLBY_CORE2A_CTRL is the same register as REG_START+1 (both map to
+   * 0x3401). Writing 0 here was clearing the bypass flags set above.
+   * Preserve the bypass flags by writing the same control value. */
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 2 | bypass_flag);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 2 | bypass_flag);
 
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
