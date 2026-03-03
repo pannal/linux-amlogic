@@ -1708,6 +1708,39 @@ static int dolby_core2_set
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
 
+  /* VP: bypass Core2 via DOLBY_PATH_CTRL when Core3 is in IPT bypass.
+   * OSD then composites at post-blend in RGB. Enable the VIU OSD1
+   * matrix with BT.2020 RGB->YCbCr to match the video's color space
+   * at the compositing point. */
+  if (is_meson_box2()) {
+    int vp_bypass = (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3);
+    VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL, vp_bypass ? 1 : 0, 2, 1);
+    if (vp_bypass) {
+      /* BT.2020 limited range RGB->YCbCr (COEFF_NORM scale ~1024)
+       * Coefficients from RGB2020_to_YUV2020l_coeff in amcsc.c */
+      VSYNC_WR_DV_REG(0x1a98, 0);           /* pre_offset0_1 */
+      VSYNC_WR_DV_REG(0x1a99, 0);           /* pre_offset2 */
+      VSYNC_WR_DV_REG(0x1a91,               /* coef00_01: Y_R=231, Y_G=596 */
+        (231 & 0x1fff) << 16 | (596 & 0x1fff));
+      VSYNC_WR_DV_REG(0x1a92,               /* coef02_10: Y_B=52, Cb_R=-125 */
+        (52 & 0x1fff) << 16 | ((-125) & 0x1fff));
+      VSYNC_WR_DV_REG(0x1a93,               /* coef11_12: Cb_G=-323, Cb_B=450 */
+        ((-323) & 0x1fff) << 16 | (450 & 0x1fff));
+      VSYNC_WR_DV_REG(0x1a94,               /* coef20_21: Cr_R=450, Cr_G=-413 */
+        (450 & 0x1fff) << 16 | ((-413) & 0x1fff));
+      VSYNC_WR_DV_REG(0x1a9d,               /* coef22: Cr_B=-36 */
+        ((-36) & 0x1fff) << 16);
+      VSYNC_WR_DV_REG(0x1a96,               /* offset0_1: Y=64, Cb=512 */
+        (64 & 0xfff) << 16 | (512 & 0xfff));
+      VSYNC_WR_DV_REG(0x1a97, 512 & 0xfff); /* offset2: Cr=512 */
+      VSYNC_WR_DV_REG(0x1a90, 1);           /* OSD1 matrix enable */
+      VSYNC_WR_DV_REG(0x3d6d, 1);           /* VPP_WRAP_OSD1_MATRIX_EN_CTRL */
+    } else {
+      VSYNC_WR_DV_REG(0x1a90, 0);           /* OSD1 matrix disable */
+      VSYNC_WR_DV_REG(0x3d6d, 0);           /* VPP_WRAP_OSD1_MATRIX_EN_CTRL */
+    }
+  }
+
   return 0;
 }
 
@@ -1854,13 +1887,14 @@ static int dolby_core3_set
   /*   02- HDR10 output, RGB 10 bit 444 PQ*/
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
-  /* VP: always use cur_dv_mode (e.g. HDR10 = 0x02) instead of forcing
-   * mode 0x00 (IPT bypass). Mode 0x00 skips the IPT->RGB output
-   * conversion, leaving OSD (converted to IPT by Core2) in the wrong
-   * color space. Keeping cur_dv_mode preserves the Core2->Core3
-   * round-trip so OSD colors are correct. */
-  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
-  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    /* VP: force IPT 12-bit 444 bypass */
+    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
+    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
+  } else {
+    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
+    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
+  }
 
   /* for delay */
 
