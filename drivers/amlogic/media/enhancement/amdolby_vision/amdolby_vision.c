@@ -1652,16 +1652,12 @@ static int dolby_core2_set
 
   if (need_skip_cvm(1)) bypass_flag |= 1 << 0;
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 1) bypass_flag |= 1 << 0; /* VP: bypass CVM */
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) bypass_flag |= 1 << 2; /* VP: bypass CSC */
 
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 2, 1);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
-  /* DOLBY_CORE2A_CTRL is the same register as REG_START+1 (both map to
-   * 0x3401). Bit 1 (value 2) enables metadata programming mode above.
-   * For processing mode, clear bit 1 but preserve bypass flags. */
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 0);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, 0);
 
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
@@ -1711,6 +1707,15 @@ static int dolby_core2_set
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
+
+  /* VP: bypass Core2 entirely when Core3 is in IPT bypass mode.
+   * Core2 CSC converts OSD from RGB to DV internal format (IPT-like).
+   * Core2's control register bypass bits are non-functional (CTRL=0
+   * write is required for processing mode). Use path-level bypass
+   * instead to keep OSD in its original format. */
+  if (is_meson_box2())
+    VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL,
+      (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) ? 1 : 0, 2, 1);
 
   return 0;
 }
@@ -1825,8 +1830,29 @@ static int dolby_core3_set
   if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
       new_dovi_setting.diagnostic_enable == 0 &&
-      dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
-    enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
+      dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32))) {
+    if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+      /* Core2 bypassed via DOLBY_PATH_CTRL: OSD arrives at POST matrix
+       * without Core2's SWAP_CTRL5 channel reordering, likely in BGR.
+       * Swap R and B columns in the POST matrix to compensate.
+       * DV packing: [0]=M00:M02 [1]=M12:M01 [2]=M11:M10 [3]=M20:M22 */
+      u32 swapped[8];
+      u32 t1, t2;
+      memcpy(swapped, &p_core3_dm_regs[18], 32);
+      /* swap halves of reg[0]: M00:M02 -> M02:M00 */
+      swapped[0] = ((swapped[0] & 0xffff) << 16) | ((swapped[0] >> 16) & 0xffff);
+      /* cross-swap reg[1] and reg[2]: M12:M01,M11:M10 -> M10:M01,M11:M12 */
+      t1 = swapped[1]; t2 = swapped[2];
+      swapped[1] = ((t2 & 0xffff) << 16) | (t1 & 0xffff);
+      swapped[2] = (t2 & 0xffff0000) | ((t1 >> 16) & 0xffff);
+      /* swap halves of reg[3]: M20:M22 -> M22:M20 */
+      swapped[3] = ((swapped[3] & 0xffff) << 16) | ((swapped[3] >> 16) & 0xffff);
+      /* reg[4] (scale:M21) and offsets [5..7] unchanged */
+      enable_rgb_to_yuv_matrix_for_dvll(1, swapped, 12);
+    } else {
+      enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
+    }
+  }
 
   if (is_meson_box2()) {
     if (get_vpu_mem_pd_vmod(VPU_DOLBY_CORE3) == VPU_MEM_POWER_DOWN ||
