@@ -1832,10 +1832,23 @@ static int dolby_core3_set
       new_dovi_setting.diagnostic_enable == 0 &&
       dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32))) {
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* VP: Core2 bypassed, Core3 in IPT passthrough (mode 0x00).
-       * Core3's d2c_coeff still transforms data — skip the POST matrix
-       * RGB->YCbCr conversion to avoid double-mangling the signal. */
-      enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
+      /* Core2 bypassed via DOLBY_PATH_CTRL: OSD arrives at POST matrix
+       * without Core2's SWAP_CTRL5 channel reordering, likely in BGR.
+       * Swap R and B columns in the POST matrix to compensate.
+       * DV packing: [0]=M00:M02 [1]=M12:M01 [2]=M11:M10 [3]=M20:M22 */
+      u32 swapped[8];
+      u32 t1, t2;
+      memcpy(swapped, &p_core3_dm_regs[18], 32);
+      /* swap halves of reg[0]: M00:M02 -> M02:M00 */
+      swapped[0] = ((swapped[0] & 0xffff) << 16) | ((swapped[0] >> 16) & 0xffff);
+      /* cross-swap reg[1] and reg[2]: M12:M01,M11:M10 -> M10:M01,M11:M12 */
+      t1 = swapped[1]; t2 = swapped[2];
+      swapped[1] = ((t2 & 0xffff) << 16) | (t1 & 0xffff);
+      swapped[2] = (t2 & 0xffff0000) | ((t1 >> 16) & 0xffff);
+      /* swap halves of reg[3]: M20:M22 -> M22:M20 */
+      swapped[3] = ((swapped[3] & 0xffff) << 16) | ((swapped[3] >> 16) & 0xffff);
+      /* reg[4] (scale:M21) and offsets [5..7] unchanged */
+      enable_rgb_to_yuv_matrix_for_dvll(1, swapped, 12);
     } else {
       enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
     }
