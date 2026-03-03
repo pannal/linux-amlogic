@@ -1830,29 +1830,8 @@ static int dolby_core3_set
   if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
       new_dovi_setting.diagnostic_enable == 0 &&
-      dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32))) {
-    if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* Core2 bypassed via DOLBY_PATH_CTRL: OSD arrives at POST matrix
-       * without Core2's SWAP_CTRL5 channel reordering, likely in BGR.
-       * Swap R and B columns in the POST matrix to compensate.
-       * DV packing: [0]=M00:M02 [1]=M12:M01 [2]=M11:M10 [3]=M20:M22 */
-      u32 swapped[8];
-      u32 t1, t2;
-      memcpy(swapped, &p_core3_dm_regs[18], 32);
-      /* swap halves of reg[0]: M00:M02 -> M02:M00 */
-      swapped[0] = ((swapped[0] & 0xffff) << 16) | ((swapped[0] >> 16) & 0xffff);
-      /* cross-swap reg[1] and reg[2]: M12:M01,M11:M10 -> M10:M01,M11:M12 */
-      t1 = swapped[1]; t2 = swapped[2];
-      swapped[1] = ((t2 & 0xffff) << 16) | (t1 & 0xffff);
-      swapped[2] = (t2 & 0xffff0000) | ((t1 >> 16) & 0xffff);
-      /* swap halves of reg[3]: M20:M22 -> M22:M20 */
-      swapped[3] = ((swapped[3] & 0xffff) << 16) | ((swapped[3] >> 16) & 0xffff);
-      /* reg[4] (scale:M21) and offsets [5..7] unchanged */
-      enable_rgb_to_yuv_matrix_for_dvll(1, swapped, 12);
-    } else {
-      enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
-    }
-  }
+      dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
+    enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
 
   if (is_meson_box2()) {
     if (get_vpu_mem_pd_vmod(VPU_DOLBY_CORE3) == VPU_MEM_POWER_DOWN ||
@@ -1898,6 +1877,13 @@ static int dolby_core3_set
   for (i = 0; i < 26; i++) {
     if (reset || p_core3_dm_regs[i] != last_dm[i] || is_core3_mute_reg(i)) {
       if ((dolby_vision_flags & FLAG_MUTE) && is_core3_mute_reg(i))
+        VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, 0);
+      else if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3 &&
+               (i <= 4 || (i >= 12 && i <= 15)))
+        /* VP: zero d2c_coeff (0-4) and ipt_scale/off (12-15) so Core3
+         * passes data through without transforming it in mode 0x00.
+         * These registers are active in IPT mode and would mangle
+         * OSD data that bypassed Core2. */
         VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, 0);
       else
         VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, p_core3_dm_regs[i]);
