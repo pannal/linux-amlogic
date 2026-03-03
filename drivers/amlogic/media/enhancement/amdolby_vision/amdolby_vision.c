@@ -1652,6 +1652,7 @@ static int dolby_core2_set
 
   if (need_skip_cvm(1)) bypass_flag |= 1 << 0;
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 1) bypass_flag |= 1 << 0; /* VP: bypass CVM */
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) bypass_flag |= 1 << 2; /* VP: bypass CSC */
 
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 2, 1);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
@@ -1707,16 +1708,6 @@ static int dolby_core2_set
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
-
-  /* VP: bypass Core2 entirely when Core3 is in IPT bypass mode.
-   * Core2 CSC (active even with CVM bypass) converts OSD from RGB to DV
-   * internal format (IPT-like). When Core3 is forced to IPT bypass (mode
-   * 0x00), it does not convert back to RGB, leaving OSD in the wrong color
-   * space (pink/magenta whites). Bypassing Core2 keeps OSD in its original
-   * RGB format, allowing the POST matrix to correctly handle RGB->YUV. */
-  if (is_meson_box2())
-    VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL,
-      (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) ? 1 : 0, 2, 1);
 
   return 0;
 }
