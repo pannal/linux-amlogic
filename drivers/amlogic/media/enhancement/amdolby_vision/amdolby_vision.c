@@ -1666,18 +1666,25 @@ static int dolby_core2_set
     /* VP: Core3 mode 0x00 passes data straight to HDMI as YCbCr.
      * Video from Core1 (bypassed) is already YCbCr → correct.
      * OSD from Core2 normally outputs IPT → interpreted as YCbCr → pink.
-     * Fix: keep original a2b (RGB→LMS) so CVM LUTs receive proper LMS.
-     * Only override c2d: LMS→YCbCr instead of LMS→IPT.
-     * c2d = BT.2020_RGB2YCbCr × inv(a2b_original), Cr/Cb rows swapped
-     * to match Core2→Core3 channel rotation [I,P,T]→[P,T,I].
-     * Row0 = Y:  [ 0.031,  0.188,  0.781]
-     * Row1 = Cr: [-0.847,  1.512, -0.665]
-     * Row2 = Cb: [ 3.066, -2.735, -0.331] */
-    p_core2_dm_regs[17] = 0x00800C80; /* (Y:M00=128)<<16 | (Y:M02=3200) */
-    p_core2_dm_regs[18] = 0xF55A0300; /* (Cr:M12=-2726)<<16 | (Y:M01=768) */
-    p_core2_dm_regs[19] = 0x1832F264; /* (Cr:M11=6194)<<16 | (Cr:M10=-3468) */
-    p_core2_dm_regs[20] = 0x3111FAB4; /* (Cb:M20=12561)<<16 | (Cb:M22=-1356) */
-    p_core2_dm_regs[21] = 0x000CD43B; /* (scale=12)<<16 | (Cb:M21=-11205) */
+     * Fix: set a2b to identity, c2d to BT.709 RGB→YCrCb.
+     * Combined with CVM bypass (set after programming below),
+     * this gives a clean RGB → YCrCb round-trip.
+     * Cr/Cb rows swapped to match channel ordering. */
+    /* a2b: identity (scale=14, 1.0=0x4000) */
+    p_core2_dm_regs[12] = 0x40000000;
+    p_core2_dm_regs[13] = 0x00000000;
+    p_core2_dm_regs[14] = 0x40000000;
+    p_core2_dm_regs[15] = 0x00004000;
+    p_core2_dm_regs[16] = 0x000e0000;
+    /* c2d: BT.709 RGB→YCrCb (scale=12)
+     * Row0 = Y:   0.2126*R + 0.7152*G + 0.0722*B
+     * Row1 = Cr:  0.5000*R - 0.4541*G - 0.0458*B
+     * Row2 = Cb: -0.1146*R - 0.3859*G + 0.5000*B */
+    p_core2_dm_regs[17] = 0x03660128; /* (Y:M00=870)<<16 | (Y:M02=296) */
+    p_core2_dm_regs[18] = 0xFF440B72; /* (Cr:M12=-188)<<16 | (Y:M01=2930) */
+    p_core2_dm_regs[19] = 0xF8BC0800; /* (Cr:M11=-1860)<<16 | (Cr:M10=2048) */
+    p_core2_dm_regs[20] = 0xFE2B0800; /* (Cb:M20=-469)<<16 | (Cb:M22=2048) */
+    p_core2_dm_regs[21] = 0x000CF9D4; /* (scale=12)<<16 | (Cb:M21=-1580) */
     p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
   }
 
@@ -1877,6 +1884,14 @@ static int dolby_core3_set
     /* VP: force IPT 12-bit 444 bypass */
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
+    /* d2c is still active in mode 0x00 — override with identity so our
+     * Core2 YCrCb output passes through unchanged. ipt_scale + ipt_off
+     * then provide proper full-range → limited-range 12-bit conversion. */
+    p_core3_dm_regs[0] = 0x40000000; /* d2c identity (scale=14) */
+    p_core3_dm_regs[1] = 0x00000000;
+    p_core3_dm_regs[2] = 0x40000000;
+    p_core3_dm_regs[3] = 0x00004000;
+    p_core3_dm_regs[4] = 0x000e0000;
   } else {
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
