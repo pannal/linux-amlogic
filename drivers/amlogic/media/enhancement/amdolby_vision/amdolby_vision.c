@@ -1832,43 +1832,35 @@ static int dolby_core3_set
     enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
 
   /* VP: OSD bypasses Core2 via DOLBY_PATH_CTRL and composites at
-   * post-blend in raw RGB on a YCbCr signal. Program the VPP shared
-   * matrix OSD port with BT.2020 RGB->YCbCr to fix OSD colors.
-   * Must run AFTER enable_rgb_to_yuv_matrix_for_dvll which disables
-   * the OSD matrix each time it runs. */
+   * post-blend in raw RGB on a YCbCr signal. Use the OSD1 HDR2
+   * output matrix (the active OSD processing path on G12) to
+   * convert RGB->YCbCr before the OSD enters the DV pipeline. */
   if (is_meson_box2() && xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    u32 ctrl = READ_VPP_REG(VPP_MATRIX_CTRL);
-
-    /* select OSD port (4) for coefficient programming */
-    VSYNC_WR_DV_REG(VPP_MATRIX_CTRL,
-      (ctrl & ~(7 << 8)) | (4 << 8));
-
     /* BT.2020 limited range RGB->YCbCr, no pre-offset */
-    VSYNC_WR_DV_REG(VPP_MATRIX_PRE_OFFSET0_1, 0);
-    VSYNC_WR_DV_REG(VPP_MATRIX_PRE_OFFSET2, 0);
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_PRE_OFFSET0_1, 0);
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_PRE_OFFSET2, 0);
 
     /* Y:  0.2256*R + 0.5823*G + 0.0509*B */
-    VSYNC_WR_DV_REG(VPP_MATRIX_COEF00_01,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_COEF00_01,
       (231 << 16) | (596 & 0x1fff));
-    VSYNC_WR_DV_REG(VPP_MATRIX_COEF02_10,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_COEF02_10,
       (52 << 16) | ((-125) & 0x1fff));
     /* Cb: -0.1227*R - 0.3166*G + 0.4392*B */
-    VSYNC_WR_DV_REG(VPP_MATRIX_COEF11_12,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_COEF11_12,
       (((-323) & 0x1fff) << 16) | (450 & 0x1fff));
     /* Cr:  0.4392*R - 0.4039*G - 0.0353*B */
-    VSYNC_WR_DV_REG(VPP_MATRIX_COEF20_21,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_COEF20_21,
       ((450 & 0x1fff) << 16) | ((-413) & 0x1fff));
-    VSYNC_WR_DV_REG(VPP_MATRIX_COEF22,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_COEF22,
       (-35) & 0x1fff);
 
     /* post-offset: Y=64, Cb=Cr=512 (10-bit limited range) */
-    VSYNC_WR_DV_REG(VPP_MATRIX_OFFSET0_1,
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_OFFSET0_1,
       (64 << 16) | 512);
-    VSYNC_WR_DV_REG(VPP_MATRIX_OFFSET2, 512);
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_OFFSET2, 512);
 
-    /* restore POST port select (0) and enable OSD matrix */
-    VSYNC_WR_DV_REG(VPP_MATRIX_CTRL,
-      (ctrl & ~(7 << 8)) | (1 << 7));
+    /* enable the output matrix */
+    VSYNC_WR_DV_REG(OSD1_HDR2_MATRIXO_EN_CTRL, 1);
   }
 
   if (is_meson_box2()) {
