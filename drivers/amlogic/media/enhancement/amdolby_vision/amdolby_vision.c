@@ -1715,15 +1715,14 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* VP: g_2_l LUT applies gamma→linear conversion between a2b
-       * and c2d. With a2b=identity, our RGB enters g_2_l which
-       * non-linearly expands it before c2d's RGB→YCrCb matrix.
-       * Override with linear ramp to preserve gamma-encoded RGB. */
-      u32 g2l_max = p_core2_lut[1279];
+      /* VP: g_2_l normally outputs huge values (up to 103M) for the
+       * linear-domain DV pipeline. With our c2d at scale=12, it
+       * expects input in ~0-4096 range. Override g_2_l with a
+       * 12-bit linear ramp so c2d produces proper YCbCr levels.
+       * Core3 ipt_scale+ipt_off then maps to limited-range 12-bit. */
       int j;
       for (j = 0; j < 256; j++)
-        p_core2_lut[1024 + j] =
-          (u32)(((u64)j * g2l_max + 127) / 255);
+        p_core2_lut[1024 + j] = j << 4; /* 0..4080 */
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
@@ -1857,8 +1856,10 @@ static int dolby_core3_set
   /* flush post matrix table when ll mode or HDR10 output mode and setting changed */
   /* Core3 HDR10 mode outputs RGB, needs POST matrix for RGB->YUV conversion */
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: Core2 c2d already outputs YCbCr, disable POST RGB→YCbCr */
-    enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
+    /* VP: Core2 c2d already outputs YCbCr, disable POST RGB→YCbCr.
+     * Direct register write — enable_rgb_to_yuv_matrix_for_dvll(0)
+     * is guarded by restore_post_table which may be false. */
+    VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL, 0, 0, 1);
   } else if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
       new_dovi_setting.diagnostic_enable == 0 &&
