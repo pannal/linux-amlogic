@@ -1669,12 +1669,12 @@ static int dolby_core2_set
      * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
      *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
      *          reg[4]=(scale<<16)|M21 */
-    /* a2b: identity (scale=15, 1.0=0x8000) */
-    p_core2_dm_regs[12] = 0x80000000;
+    /* a2b: identity (scale=14, 1.0=0x4000; 0x8000 is signed negative) */
+    p_core2_dm_regs[12] = 0x40000000;
     p_core2_dm_regs[13] = 0x00000000;
-    p_core2_dm_regs[14] = 0x80000000;
-    p_core2_dm_regs[15] = 0x00008000;
-    p_core2_dm_regs[16] = 0x000f0000;
+    p_core2_dm_regs[14] = 0x40000000;
+    p_core2_dm_regs[15] = 0x00004000;
+    p_core2_dm_regs[16] = 0x000e0000;
     /* c2d: identity (scale=12, 1.0=0x1000) */
     p_core2_dm_regs[17] = 0x10000000;
     p_core2_dm_regs[18] = 0x00000000;
