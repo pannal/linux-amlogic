@@ -1663,31 +1663,19 @@ static int dolby_core2_set
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: Override entire Core2 DM pipeline to passthrough.
-     * Core3 mode 0x00 skips IPT→RGB back-conversion, so Core2
-     * must not transform the OSD either - keep it as raw RGB.
-     * Video with Core1 CSC bypass is also in a near-RGB format
-     * at pre-blend, so both blend correctly.
+    /* VP: Override a2b (RGB→LMS) and c2d (LMS→IPT) with identity.
+     * Keep y2rgb and EOTF at original DV values - they handle
+     * OSD input format and transfer function.
      * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
      *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
      *          reg[4]=(scale<<16)|M21 */
-    /* y2rgb: identity (scale=14, 1.0=16384=0x4000) */
-    p_core2_dm_regs[2]  = 0x40000000;
-    p_core2_dm_regs[3]  = 0x00000000;
-    p_core2_dm_regs[4]  = 0x40000000;
-    p_core2_dm_regs[5]  = 0x00004000;
-    p_core2_dm_regs[6]  = 0x000e0000;
-    p_core2_dm_regs[7]  = 0x00000000; /* y2rgb_off1 */
-    p_core2_dm_regs[8]  = 0x00000000; /* y2rgb_off2 */
-    p_core2_dm_regs[9]  = 0x00000000; /* y2rgb_off3 */
-    p_core2_dm_regs[11] = 0x00000000; /* eotf: linear */
-    /* a2b: identity (scale=15, 1.0=32768=0x8000) */
+    /* a2b: identity (scale=15, 1.0=0x8000) */
     p_core2_dm_regs[12] = 0x80000000;
     p_core2_dm_regs[13] = 0x00000000;
     p_core2_dm_regs[14] = 0x80000000;
     p_core2_dm_regs[15] = 0x00008000;
     p_core2_dm_regs[16] = 0x000f0000;
-    /* c2d: identity (scale=12, 1.0=4096=0x1000) */
+    /* c2d: identity (scale=12, 1.0=0x1000) */
     p_core2_dm_regs[17] = 0x10000000;
     p_core2_dm_regs[18] = 0x00000000;
     p_core2_dm_regs[19] = 0x10000000;
