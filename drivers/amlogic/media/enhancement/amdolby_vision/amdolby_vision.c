@@ -1672,6 +1672,10 @@ static int dolby_core2_set
      * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
      *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
      *          reg[4]=(scale<<16)|M21 */
+    /* Zero y2rgb offsets so y2rgb+c2d round-trips to identity */
+    p_core2_dm_regs[7]  = 0x00000000; /* y2rgb_off1 */
+    p_core2_dm_regs[8]  = 0x00000000; /* y2rgb_off2 */
+    p_core2_dm_regs[9]  = 0x00000000; /* y2rgb_off3 */
     /* a2b: identity (scale=14, 1.0=0x4000) */
     p_core2_dm_regs[12] = 0x40000000;
     p_core2_dm_regs[13] = 0x00000000;
