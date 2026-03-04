@@ -1664,34 +1664,20 @@ static int dolby_core2_set
 
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
     /* VP: Core3 mode 0x00 passes data straight to HDMI as YCbCr.
-     * Video from Core1 (bypassed) is already YCbCr → looks correct.
-     * OSD from Core2 is normally IPT → looks wrong (pink).
-     * Fix: replace a2b+c2d with identity+RGB→YCbCr so Core2
-     * outputs YCbCr matching the video format.
-     * y2rgb (input→RGB) and EOTF (=0, linear) stay original.
-     * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
-     *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
-     *          reg[4]=(scale<<16)|M21 */
-    /* Zero y2rgb offsets so y2rgb+c2d round-trips to identity */
-    p_core2_dm_regs[7]  = 0x00000000; /* y2rgb_off1 */
-    p_core2_dm_regs[8]  = 0x00000000; /* y2rgb_off2 */
-    p_core2_dm_regs[9]  = 0x00000000; /* y2rgb_off3 */
-    /* a2b: identity (scale=14, 1.0=0x4000) */
-    p_core2_dm_regs[12] = 0x40000000;
-    p_core2_dm_regs[13] = 0x00000000;
-    p_core2_dm_regs[14] = 0x40000000;
-    p_core2_dm_regs[15] = 0x00004000;
-    p_core2_dm_regs[16] = 0x000e0000;
-    /* c2d: Exact inverse of y2rgb (BT.709) RGB→YCrCb (scale=12)
-     * Cr/Cb swapped vs standard to match Core2→Core3 channel rotation.
-     * Row0 = Y:   0.2126*R + 0.7152*G + 0.0722*B  (870, 2930, 296)
-     * Row1 = Cr:  0.5000*R - 0.4541*G - 0.0458*B  (2048, -1860, -188)
-     * Row2 = Cb: -0.1146*R - 0.3859*G + 0.5000*B  (-469, -1580, 2048) */
-    p_core2_dm_regs[17] = 0x03660128; /* (Y:M00=870)<<16 | (Y:M02=296) */
-    p_core2_dm_regs[18] = 0xFF440B72; /* (Cr:M12=-188)<<16 | (Y:M01=2930) */
-    p_core2_dm_regs[19] = 0xF8BC0800; /* (Cr:M11=-1860)<<16 | (Cr:M10=2048) */
-    p_core2_dm_regs[20] = 0xFE2B0800; /* (Cb:M20=-469)<<16 | (Cb:M22=2048) */
-    p_core2_dm_regs[21] = 0x000CF9D4; /* (scale=12)<<16 | (Cb:M21=-1580) */
+     * Video from Core1 (bypassed) is already YCbCr → correct.
+     * OSD from Core2 normally outputs IPT → interpreted as YCbCr → pink.
+     * Fix: keep original a2b (RGB→LMS) so CVM LUTs receive proper LMS.
+     * Only override c2d: LMS→YCbCr instead of LMS→IPT.
+     * c2d = BT.2020_RGB2YCbCr × inv(a2b_original), Cr/Cb rows swapped
+     * to match Core2→Core3 channel rotation [I,P,T]→[P,T,I].
+     * Row0 = Y:  [ 0.031,  0.188,  0.781]
+     * Row1 = Cr: [-0.847,  1.512, -0.665]
+     * Row2 = Cb: [ 3.066, -2.735, -0.331] */
+    p_core2_dm_regs[17] = 0x00800C80; /* (Y:M00=128)<<16 | (Y:M02=3200) */
+    p_core2_dm_regs[18] = 0xF55A0300; /* (Cr:M12=-2726)<<16 | (Y:M01=768) */
+    p_core2_dm_regs[19] = 0x1832F264; /* (Cr:M11=6194)<<16 | (Cr:M10=-3468) */
+    p_core2_dm_regs[20] = 0x3111FAB4; /* (Cb:M20=12561)<<16 | (Cb:M22=-1356) */
+    p_core2_dm_regs[21] = 0x000CD43B; /* (scale=12)<<16 | (Cb:M21=-11205) */
     p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
   }
 
