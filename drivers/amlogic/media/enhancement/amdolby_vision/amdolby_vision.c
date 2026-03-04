@@ -1734,10 +1734,6 @@ static int dolby_core2_set
         (64 & 0xfff) << 16 | (512 & 0xfff));
       VSYNC_WR_DV_REG(0x1a97, 512 & 0xfff); /* offset2: Cr=512 */
       VSYNC_WR_DV_REG(0x1a90, 1);           /* OSD1 matrix enable */
-      VSYNC_WR_DV_REG(0x3d6d, 1);           /* VPP_WRAP_OSD1_MATRIX_EN_CTRL */
-    } else {
-      VSYNC_WR_DV_REG(0x1a90, 0);           /* OSD1 matrix disable */
-      VSYNC_WR_DV_REG(0x3d6d, 0);           /* VPP_WRAP_OSD1_MATRIX_EN_CTRL */
     }
   }
 
