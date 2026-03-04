@@ -1714,6 +1714,36 @@ static int dolby_core2_set
     if (is_meson_gxm() && (dolby_vision_flags & FLAG_CLKGATE_WHEN_LOAD_LUT))
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
+    if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+      /* Dump first/last entries of each CVM LUT section to understand format */
+      static int lut_dump_count;
+      if (lut_dump_count < 3) {
+        lut_dump_count++;
+        pr_info("Core2 CVM LUT dump (VP_TM>3):\n");
+        pr_info("  tm_lut_i[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[0], p_core2_lut[1], p_core2_lut[2], p_core2_lut[3],
+          p_core2_lut[4], p_core2_lut[5], p_core2_lut[6], p_core2_lut[7]);
+        pr_info("  tm_lut_i[248..255]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[248], p_core2_lut[249], p_core2_lut[250], p_core2_lut[251],
+          p_core2_lut[252], p_core2_lut[253], p_core2_lut[254], p_core2_lut[255]);
+        pr_info("  tm_lut_s[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[256], p_core2_lut[257], p_core2_lut[258], p_core2_lut[259],
+          p_core2_lut[260], p_core2_lut[261], p_core2_lut[262], p_core2_lut[263]);
+        pr_info("  sm_lut_i[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[512], p_core2_lut[513], p_core2_lut[514], p_core2_lut[515],
+          p_core2_lut[516], p_core2_lut[517], p_core2_lut[518], p_core2_lut[519]);
+        pr_info("  sm_lut_s[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[768], p_core2_lut[769], p_core2_lut[770], p_core2_lut[771],
+          p_core2_lut[772], p_core2_lut[773], p_core2_lut[774], p_core2_lut[775]);
+        pr_info("  g_2_l[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[1024], p_core2_lut[1025], p_core2_lut[1026], p_core2_lut[1027],
+          p_core2_lut[1028], p_core2_lut[1029], p_core2_lut[1030], p_core2_lut[1031]);
+        pr_info("  g_2_l[248..255]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          p_core2_lut[1272], p_core2_lut[1273], p_core2_lut[1274], p_core2_lut[1275],
+          p_core2_lut[1276], p_core2_lut[1277], p_core2_lut[1278], p_core2_lut[1279]);
+      }
+    }
+
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
 
     for (i = 0; i < (256 * 5); i += 4) {
