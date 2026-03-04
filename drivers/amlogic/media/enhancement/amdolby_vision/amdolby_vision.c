@@ -1663,25 +1663,26 @@ static int dolby_core2_set
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: Override a2b (RGB→LMS) and c2d (LMS→IPT) with identity.
-     * Keep y2rgb and EOTF at original DV values - they handle
-     * OSD input format and transfer function.
-     * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
-     *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
-     *          reg[4]=(scale<<16)|M21 */
-    /* a2b: identity (scale=14, 1.0=0x4000; 0x8000 is signed negative) */
-    p_core2_dm_regs[12] = 0x40000000;
-    p_core2_dm_regs[13] = 0x00000000;
-    p_core2_dm_regs[14] = 0x40000000;
-    p_core2_dm_regs[15] = 0x00004000;
-    p_core2_dm_regs[16] = 0x000e0000;
-    /* c2d: identity (scale=12, 1.0=0x1000) */
-    p_core2_dm_regs[17] = 0x10000000;
-    p_core2_dm_regs[18] = 0x00000000;
-    p_core2_dm_regs[19] = 0x10000000;
-    p_core2_dm_regs[20] = 0x00001000;
-    p_core2_dm_regs[21] = 0x000c0000;
-    p_core2_dm_regs[22] = 0x00000000; /* c2d_off */
+    static bool dm_dumped;
+    if (!dm_dumped) {
+      pr_info("DV VP Core2 DM: "
+              "y2rgb=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x] "
+              "fmt=%08x eotf=%08x "
+              "a2b=[%08x %08x %08x %08x %08x] "
+              "c2d=[%08x %08x %08x %08x %08x] off=%08x\n",
+              p_core2_dm_regs[2], p_core2_dm_regs[3],
+              p_core2_dm_regs[4], p_core2_dm_regs[5],
+              p_core2_dm_regs[6], p_core2_dm_regs[7],
+              p_core2_dm_regs[8], p_core2_dm_regs[9],
+              p_core2_dm_regs[10], p_core2_dm_regs[11],
+              p_core2_dm_regs[12], p_core2_dm_regs[13],
+              p_core2_dm_regs[14], p_core2_dm_regs[15],
+              p_core2_dm_regs[16],
+              p_core2_dm_regs[17], p_core2_dm_regs[18],
+              p_core2_dm_regs[19], p_core2_dm_regs[20],
+              p_core2_dm_regs[21], p_core2_dm_regs[22]);
+      dm_dumped = true;
+    }
   }
 
   for (i = 0; i < 24; i++) {
@@ -1877,6 +1878,27 @@ static int dolby_core3_set
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    static bool c3_dumped;
+    if (!c3_dumped) {
+      pr_info("DV VP Core3 DM: "
+              "d2c=[%08x %08x %08x %08x %08x] "
+              "b2a=[%08x %08x %08x %08x %08x] "
+              "eotf=[%08x %08x] "
+              "ipt_scale=%08x off=[%08x %08x %08x] "
+              "range=[%08x %08x] mode=%02x\n",
+              p_core3_dm_regs[0], p_core3_dm_regs[1],
+              p_core3_dm_regs[2], p_core3_dm_regs[3],
+              p_core3_dm_regs[4],
+              p_core3_dm_regs[5], p_core3_dm_regs[6],
+              p_core3_dm_regs[7], p_core3_dm_regs[8],
+              p_core3_dm_regs[9],
+              p_core3_dm_regs[10], p_core3_dm_regs[11],
+              p_core3_dm_regs[12], p_core3_dm_regs[13],
+              p_core3_dm_regs[14], p_core3_dm_regs[15],
+              p_core3_dm_regs[16], p_core3_dm_regs[17],
+              cur_dv_mode);
+      c3_dumped = true;
+    }
     /* VP: force IPT 12-bit 444 bypass */
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
