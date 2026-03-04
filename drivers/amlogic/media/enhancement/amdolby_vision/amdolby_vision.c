@@ -1663,24 +1663,24 @@ static int dolby_core2_set
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    static bool c2d_dumped;
-    if (!c2d_dumped) {
-      pr_info("DV VP Core2 DM regs: "
-              "c2d=[%08x %08x %08x %08x %08x] off=%08x "
-              "a2b=[%08x %08x %08x %08x %08x] "
-              "y2rgb=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x]\n",
-              p_core2_dm_regs[17], p_core2_dm_regs[18],
-              p_core2_dm_regs[19], p_core2_dm_regs[20],
-              p_core2_dm_regs[21], p_core2_dm_regs[22],
-              p_core2_dm_regs[12], p_core2_dm_regs[13],
-              p_core2_dm_regs[14], p_core2_dm_regs[15],
-              p_core2_dm_regs[16],
-              p_core2_dm_regs[2], p_core2_dm_regs[3],
-              p_core2_dm_regs[4], p_core2_dm_regs[5],
-              p_core2_dm_regs[6], p_core2_dm_regs[7],
-              p_core2_dm_regs[8], p_core2_dm_regs[9]);
-      c2d_dumped = true;
-    }
+    /* VP: Override Core2 c2d (RGB→IPT) with identity to keep OSD in RGB.
+     * Core3 mode 0x00 skips IPT→RGB back-conversion, so OSD must not
+     * be converted to IPT by Core2 either.
+     * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
+     *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
+     *          reg[4]=(scale<<16)|M21. Scale=12 (4096=1.0) */
+    p_core2_dm_regs[17] = 0x10000000; /* M00=4096, M02=0 */
+    p_core2_dm_regs[18] = 0x00000000; /* M12=0, M01=0 */
+    p_core2_dm_regs[19] = 0x10000000; /* M11=4096, M10=0 */
+    p_core2_dm_regs[20] = 0x00001000; /* M20=0, M22=4096 */
+    p_core2_dm_regs[21] = 0x000c0000; /* scale=12, M21=0 */
+    p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
+    /* Also override a2b (RGB→LMS) with identity */
+    p_core2_dm_regs[12] = 0x10000000;
+    p_core2_dm_regs[13] = 0x00000000;
+    p_core2_dm_regs[14] = 0x10000000;
+    p_core2_dm_regs[15] = 0x00001000;
+    p_core2_dm_regs[16] = 0x000c0000;
   }
 
   for (i = 0; i < 24; i++) {
