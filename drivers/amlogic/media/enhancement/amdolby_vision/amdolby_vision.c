@@ -1573,6 +1573,46 @@ static int dolby_core1_set
   return 0;
 }
 
+/* SDR gamma 2.2 -> PQ (ST2084) at 100 nits reference white.
+ * Normalized to 0..65535 where 65535 = PQ(100 nits) ≈ 0.508.
+ * Used to override Core2 g_2_l LUT for VP_TM > 3: the display
+ * expects PQ-encoded signal (HDR10 mode), but Core3 mode 0x00
+ * bypasses the OETF that normally does linear→PQ encoding. */
+static const u16 pq_sdr_to_pq[256] = {
+	    0,   554,  1297,  2080,  2869,  3651,  4419,  5172,
+	 5908,  6627,  7329,  8015,  8685,  9340,  9980, 10606,
+	11220, 11820, 12408, 12984, 13549, 14104, 14648, 15182,
+	15706, 16222, 16728, 17226, 17716, 18198, 18672, 19139,
+	19599, 20051, 20498, 20937, 21371, 21798, 22220, 22635,
+	23046, 23450, 23850, 24245, 24634, 25019, 25399, 25774,
+	26145, 26512, 26874, 27233, 27587, 27937, 28284, 28627,
+	28966, 29301, 29633, 29962, 30287, 30609, 30928, 31243,
+	31556, 31865, 32172, 32475, 32776, 33074, 33369, 33662,
+	33952, 34239, 34524, 34807, 35087, 35364, 35639, 35912,
+	36183, 36451, 36718, 36982, 37244, 37504, 37761, 38017,
+	38271, 38523, 38773, 39021, 39267, 39512, 39754, 39995,
+	40234, 40471, 40707, 40941, 41173, 41404, 41633, 41860,
+	42086, 42311, 42534, 42755, 42975, 43194, 43411, 43626,
+	43841, 44054, 44265, 44475, 44684, 44892, 45098, 45303,
+	45507, 45709, 45910, 46111, 46309, 46507, 46704, 46899,
+	47093, 47286, 47478, 47669, 47859, 48048, 48235, 48422,
+	48608, 48792, 48976, 49158, 49340, 49520, 49700, 49879,
+	50056, 50233, 50409, 50584, 50758, 50931, 51103, 51275,
+	51445, 51615, 51783, 51951, 52118, 52285, 52450, 52615,
+	52778, 52941, 53103, 53265, 53426, 53585, 53745, 53903,
+	54061, 54217, 54374, 54529, 54684, 54838, 54991, 55144,
+	55296, 55447, 55597, 55747, 55896, 56045, 56193, 56340,
+	56487, 56633, 56778, 56923, 57067, 57210, 57353, 57495,
+	57637, 57778, 57919, 58058, 58198, 58336, 58475, 58612,
+	58749, 58886, 59022, 59157, 59292, 59426, 59560, 59693,
+	59826, 59958, 60090, 60221, 60351, 60481, 60611, 60740,
+	60869, 60997, 61125, 61252, 61378, 61505, 61630, 61756,
+	61880, 62005, 62129, 62252, 62375, 62497, 62620, 62741,
+	62862, 62983, 63103, 63223, 63343, 63462, 63580, 63699,
+	63816, 63934, 64051, 64167, 64283, 64399, 64514, 64629,
+	64744, 64858, 64972, 65085, 65198, 65311, 65423, 65535
+};
+
 static int dolby_core2_set
   (u32 *p_core2_dm_regs,
    u32 *p_core2_lut,
@@ -1667,7 +1707,7 @@ static int dolby_core2_set
      * Video from Core1 (bypassed) is already YCbCr → correct.
      * OSD from Core2 normally outputs IPT → interpreted as YCbCr → pink.
      * Fix: set a2b to identity so CVM LUTs get RGB (not LMS),
-     * linearize g_2_l LUT (done below in LUT write section),
+     * override g_2_l with gamma→PQ curve (done below in LUT section),
      * set c2d to BT.2020 RGB→YCrCb matching y2rgb's BT.2020 decode.
      * Cr/Cb rows swapped to match channel ordering. */
     /* a2b: identity (scale=14, 1.0=0x4000) */
@@ -1715,16 +1755,17 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* VP: g_2_l applies gamma→linear between a2b and c2d.
-       * Override with linear ramp preserving original output range
-       * (up to ~103M) — Core3 ipt_scale compresses this to 12-bit.
-       * The ramp removes non-linear gamma while keeping the scale
-       * that the downstream pipeline expects. */
+      /* VP: g_2_l normally does gamma→linear for the DV pipeline.
+       * Core3 mode 0x00 bypasses the OETF (linear→PQ encoding),
+       * so the display (HDR10/PQ mode) gets wrong transfer function.
+       * Override g_2_l with gamma→PQ curve so c2d produces
+       * PQ-encoded YCbCr that the display can decode correctly.
+       * Table is normalized 0..65535, scaled to original g_2_l max. */
       u32 g2l_max = p_core2_lut[1279];
       int j;
       for (j = 0; j < 256; j++)
         p_core2_lut[1024 + j] =
-          (u32)(((u64)j * g2l_max + 127) / 255);
+          (u32)(((u64)pq_sdr_to_pq[j] * g2l_max) >> 16);
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
