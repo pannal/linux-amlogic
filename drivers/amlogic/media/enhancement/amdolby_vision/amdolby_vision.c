@@ -1662,6 +1662,27 @@ static int dolby_core2_set
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    static bool c2d_dumped;
+    if (!c2d_dumped) {
+      pr_info("DV VP Core2 DM regs: "
+              "c2d=[%08x %08x %08x %08x %08x] off=%08x "
+              "a2b=[%08x %08x %08x %08x %08x] "
+              "y2rgb=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x]\n",
+              p_core2_dm_regs[17], p_core2_dm_regs[18],
+              p_core2_dm_regs[19], p_core2_dm_regs[20],
+              p_core2_dm_regs[21], p_core2_dm_regs[22],
+              p_core2_dm_regs[12], p_core2_dm_regs[13],
+              p_core2_dm_regs[14], p_core2_dm_regs[15],
+              p_core2_dm_regs[16],
+              p_core2_dm_regs[2], p_core2_dm_regs[3],
+              p_core2_dm_regs[4], p_core2_dm_regs[5],
+              p_core2_dm_regs[6], p_core2_dm_regs[7],
+              p_core2_dm_regs[8], p_core2_dm_regs[9]);
+      c2d_dumped = true;
+    }
+  }
+
   for (i = 0; i < 24; i++) {
     if (reset || p_core2_dm_regs[i] != last_dm[i]) {
       VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 6 + i, p_core2_dm_regs[i]);
