@@ -1856,7 +1856,10 @@ static int dolby_core3_set
 
   /* flush post matrix table when ll mode or HDR10 output mode and setting changed */
   /* Core3 HDR10 mode outputs RGB, needs POST matrix for RGB->YUV conversion */
-  if ((new_dovi_setting.dovi_ll_enable ||
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    /* VP: Core2 c2d already outputs YCbCr, disable POST RGB→YCbCr */
+    enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
+  } else if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
       new_dovi_setting.diagnostic_enable == 0 &&
       dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
