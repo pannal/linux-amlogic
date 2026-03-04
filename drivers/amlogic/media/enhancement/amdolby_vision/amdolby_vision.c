@@ -1715,14 +1715,16 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* VP: g_2_l normally outputs huge values (up to 103M) for the
-       * linear-domain DV pipeline. With our c2d at scale=12, it
-       * expects input in ~0-4096 range. Override g_2_l with a
-       * 12-bit linear ramp so c2d produces proper YCbCr levels.
-       * Core3 ipt_scale+ipt_off then maps to limited-range 12-bit. */
+      /* VP: g_2_l applies gamma→linear between a2b and c2d.
+       * Override with linear ramp preserving original output range
+       * (up to ~103M) — Core3 ipt_scale compresses this to 12-bit.
+       * The ramp removes non-linear gamma while keeping the scale
+       * that the downstream pipeline expects. */
+      u32 g2l_max = p_core2_lut[1279];
       int j;
       for (j = 0; j < 256; j++)
-        p_core2_lut[1024 + j] = j << 4; /* 0..4080 */
+        p_core2_lut[1024 + j] =
+          (u32)(((u64)j * g2l_max + 127) / 255);
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
