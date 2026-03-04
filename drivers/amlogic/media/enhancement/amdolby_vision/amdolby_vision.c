@@ -1663,26 +1663,31 @@ static int dolby_core2_set
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    static bool dm_dumped;
-    if (!dm_dumped) {
-      pr_info("DV VP Core2 DM: "
-              "y2rgb=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x] "
-              "fmt=%08x eotf=%08x "
-              "a2b=[%08x %08x %08x %08x %08x] "
-              "c2d=[%08x %08x %08x %08x %08x] off=%08x\n",
-              p_core2_dm_regs[2], p_core2_dm_regs[3],
-              p_core2_dm_regs[4], p_core2_dm_regs[5],
-              p_core2_dm_regs[6], p_core2_dm_regs[7],
-              p_core2_dm_regs[8], p_core2_dm_regs[9],
-              p_core2_dm_regs[10], p_core2_dm_regs[11],
-              p_core2_dm_regs[12], p_core2_dm_regs[13],
-              p_core2_dm_regs[14], p_core2_dm_regs[15],
-              p_core2_dm_regs[16],
-              p_core2_dm_regs[17], p_core2_dm_regs[18],
-              p_core2_dm_regs[19], p_core2_dm_regs[20],
-              p_core2_dm_regs[21], p_core2_dm_regs[22]);
-      dm_dumped = true;
-    }
+    /* VP: Core3 mode 0x00 passes data straight to HDMI as YCbCr.
+     * Video from Core1 (bypassed) is already YCbCr → looks correct.
+     * OSD from Core2 is normally IPT → looks wrong (pink).
+     * Fix: replace a2b+c2d with identity+RGB→YCbCr so Core2
+     * outputs YCbCr matching the video format.
+     * y2rgb (input→RGB) and EOTF (=0, linear) stay original.
+     * Packing: reg[0]=(M00<<16)|M02, reg[1]=(M12<<16)|M01,
+     *          reg[2]=(M11<<16)|M10, reg[3]=(M20<<16)|M22,
+     *          reg[4]=(scale<<16)|M21 */
+    /* a2b: identity (scale=14, 1.0=0x4000) */
+    p_core2_dm_regs[12] = 0x40000000;
+    p_core2_dm_regs[13] = 0x00000000;
+    p_core2_dm_regs[14] = 0x40000000;
+    p_core2_dm_regs[15] = 0x00004000;
+    p_core2_dm_regs[16] = 0x000e0000;
+    /* c2d: BT.2020 RGB→YCbCr (scale=12, 1.0=4096)
+     * Y  =  0.2627*R + 0.6780*G + 0.0593*B  (1076, 2777, 243)
+     * Cb = -0.1396*R - 0.3604*G + 0.5000*B  (-572, -1476, 2048)
+     * Cr =  0.5000*R - 0.4598*G - 0.0402*B  (2048, -1884, -165) */
+    p_core2_dm_regs[17] = 0x043400F3; /* (Y:M00=1076)<<16 | (Y:M02=243) */
+    p_core2_dm_regs[18] = 0x08000AD9; /* (Cb:M12=2048)<<16 | (Y:M01=2777) */
+    p_core2_dm_regs[19] = 0xFA3CFDC4; /* (Cb:M11=-1476)<<16 | (Cb:M10=-572) */
+    p_core2_dm_regs[20] = 0x0800FF5B; /* (Cr:M20=2048)<<16 | (Cr:M22=-165) */
+    p_core2_dm_regs[21] = 0x000CF8A4; /* (scale=12)<<16 | (Cr:M21=-1884) */
+    p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
   }
 
   for (i = 0; i < 24; i++) {
@@ -1878,27 +1883,6 @@ static int dolby_core3_set
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    static bool c3_dumped;
-    if (!c3_dumped) {
-      pr_info("DV VP Core3 DM: "
-              "d2c=[%08x %08x %08x %08x %08x] "
-              "b2a=[%08x %08x %08x %08x %08x] "
-              "eotf=[%08x %08x] "
-              "ipt_scale=%08x off=[%08x %08x %08x] "
-              "range=[%08x %08x] mode=%02x\n",
-              p_core3_dm_regs[0], p_core3_dm_regs[1],
-              p_core3_dm_regs[2], p_core3_dm_regs[3],
-              p_core3_dm_regs[4],
-              p_core3_dm_regs[5], p_core3_dm_regs[6],
-              p_core3_dm_regs[7], p_core3_dm_regs[8],
-              p_core3_dm_regs[9],
-              p_core3_dm_regs[10], p_core3_dm_regs[11],
-              p_core3_dm_regs[12], p_core3_dm_regs[13],
-              p_core3_dm_regs[14], p_core3_dm_regs[15],
-              p_core3_dm_regs[16], p_core3_dm_regs[17],
-              cur_dv_mode);
-      c3_dumped = true;
-    }
     /* VP: force IPT 12-bit 444 bypass */
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
