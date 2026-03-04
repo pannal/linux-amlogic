@@ -1709,33 +1709,11 @@ static int dolby_core2_set
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
 
   /* VP: bypass Core2 via DOLBY_PATH_CTRL when Core3 is in IPT bypass.
-   * OSD then composites at post-blend in RGB. Enable the VIU OSD1
-   * matrix with BT.2020 RGB->YCbCr to match the video's color space
-   * at the compositing point. */
-  if (is_meson_box2()) {
-    int vp_bypass = (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3);
-    VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL, vp_bypass ? 1 : 0, 2, 1);
-    if (vp_bypass) {
-      /* BT.2020 limited range RGB->YCbCr (COEFF_NORM scale ~1024)
-       * Coefficients from RGB2020_to_YUV2020l_coeff in amcsc.c */
-      VSYNC_WR_DV_REG(0x1a98, 0);           /* pre_offset0_1 */
-      VSYNC_WR_DV_REG(0x1a99, 0);           /* pre_offset2 */
-      VSYNC_WR_DV_REG(0x1a91,               /* coef00_01: Y_R=231, Y_G=596 */
-        (231 & 0x1fff) << 16 | (596 & 0x1fff));
-      VSYNC_WR_DV_REG(0x1a92,               /* coef02_10: Y_B=52, Cb_R=-125 */
-        (52 & 0x1fff) << 16 | ((-125) & 0x1fff));
-      VSYNC_WR_DV_REG(0x1a93,               /* coef11_12: Cb_G=-323, Cb_B=450 */
-        ((-323) & 0x1fff) << 16 | (450 & 0x1fff));
-      VSYNC_WR_DV_REG(0x1a94,               /* coef20_21: Cr_R=450, Cr_G=-413 */
-        (450 & 0x1fff) << 16 | ((-413) & 0x1fff));
-      VSYNC_WR_DV_REG(0x1a9d,               /* coef22: Cr_B=-36 */
-        ((-36) & 0x1fff) << 16);
-      VSYNC_WR_DV_REG(0x1a96,               /* offset0_1: Y=64, Cb=512 */
-        (64 & 0xfff) << 16 | (512 & 0xfff));
-      VSYNC_WR_DV_REG(0x1a97, 512 & 0xfff); /* offset2: Cr=512 */
-      VSYNC_WR_DV_REG(0x1a90, 1);           /* OSD1 matrix enable */
-    }
-  }
+   * OSD then composites at post-blend in RGB and needs RGB->YCbCr
+   * conversion — programmed via VPP shared matrix in dolby_core3_set. */
+  if (is_meson_box2())
+    VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL,
+      (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) ? 1 : 0, 2, 1);
 
   return 0;
 }
@@ -1852,6 +1830,46 @@ static int dolby_core3_set
       new_dovi_setting.diagnostic_enable == 0 &&
       dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
     enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
+
+  /* VP: OSD bypasses Core2 via DOLBY_PATH_CTRL and composites at
+   * post-blend in raw RGB on a YCbCr signal. Program the VPP shared
+   * matrix OSD port with BT.2020 RGB->YCbCr to fix OSD colors.
+   * Must run AFTER enable_rgb_to_yuv_matrix_for_dvll which disables
+   * the OSD matrix each time it runs. */
+  if (is_meson_box2() && xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    u32 ctrl = READ_VPP_REG(VPP_MATRIX_CTRL);
+
+    /* select OSD port (4) for coefficient programming */
+    VSYNC_WR_DV_REG(VPP_MATRIX_CTRL,
+      (ctrl & ~(7 << 8)) | (4 << 8));
+
+    /* BT.2020 limited range RGB->YCbCr, no pre-offset */
+    VSYNC_WR_DV_REG(VPP_MATRIX_PRE_OFFSET0_1, 0);
+    VSYNC_WR_DV_REG(VPP_MATRIX_PRE_OFFSET2, 0);
+
+    /* Y:  0.2256*R + 0.5823*G + 0.0509*B */
+    VSYNC_WR_DV_REG(VPP_MATRIX_COEF00_01,
+      (231 << 16) | (596 & 0x1fff));
+    VSYNC_WR_DV_REG(VPP_MATRIX_COEF02_10,
+      (52 << 16) | ((-125) & 0x1fff));
+    /* Cb: -0.1227*R - 0.3166*G + 0.4392*B */
+    VSYNC_WR_DV_REG(VPP_MATRIX_COEF11_12,
+      (((-323) & 0x1fff) << 16) | (450 & 0x1fff));
+    /* Cr:  0.4392*R - 0.4039*G - 0.0353*B */
+    VSYNC_WR_DV_REG(VPP_MATRIX_COEF20_21,
+      ((450 & 0x1fff) << 16) | ((-413) & 0x1fff));
+    VSYNC_WR_DV_REG(VPP_MATRIX_COEF22,
+      (-35) & 0x1fff);
+
+    /* post-offset: Y=64, Cb=Cr=512 (10-bit limited range) */
+    VSYNC_WR_DV_REG(VPP_MATRIX_OFFSET0_1,
+      (64 << 16) | 512);
+    VSYNC_WR_DV_REG(VPP_MATRIX_OFFSET2, 512);
+
+    /* restore POST port select (0) and enable OSD matrix */
+    VSYNC_WR_DV_REG(VPP_MATRIX_CTRL,
+      (ctrl & ~(7 << 8)) | (1 << 7));
+  }
 
   if (is_meson_box2()) {
     if (get_vpu_mem_pd_vmod(VPU_DOLBY_CORE3) == VPU_MEM_POWER_DOWN ||
