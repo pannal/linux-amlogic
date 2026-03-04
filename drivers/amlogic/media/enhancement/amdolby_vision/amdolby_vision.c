@@ -1734,6 +1734,15 @@ static int dolby_core2_set
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
 
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    /* VP: re-assert CVM bypass after programming is complete.
+     * CTRL=0 above clears bypass, so set it again in processing mode.
+     * (Previous test of this was without c2d override — couldn't tell
+     * if bypass worked since output was still IPT → pink regardless.) */
+    VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
+    VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
+  }
+
   return 0;
 }
 
