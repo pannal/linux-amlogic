@@ -1666,9 +1666,9 @@ static int dolby_core2_set
     /* VP: Core3 mode 0x00 passes data straight to HDMI as YCbCr.
      * Video from Core1 (bypassed) is already YCbCr → correct.
      * OSD from Core2 normally outputs IPT → interpreted as YCbCr → pink.
-     * Fix: set a2b to identity, c2d to BT.709 RGB→YCrCb.
-     * Combined with CVM bypass (set after programming below),
-     * this gives a clean RGB → YCrCb round-trip.
+     * Fix: set a2b to identity so CVM LUTs get RGB (not LMS),
+     * linearize g_2_l LUT (done below in LUT write section),
+     * set c2d to BT.709 RGB→YCrCb for correct YCbCr output.
      * Cr/Cb rows swapped to match channel ordering. */
     /* a2b: identity (scale=14, 1.0=0x4000) */
     p_core2_dm_regs[12] = 0x40000000;
@@ -1715,33 +1715,15 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* Dump first/last entries of each CVM LUT section to understand format */
-      static int lut_dump_count;
-      if (lut_dump_count < 3) {
-        lut_dump_count++;
-        pr_info("Core2 CVM LUT dump (VP_TM>3):\n");
-        pr_info("  tm_lut_i[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[0], p_core2_lut[1], p_core2_lut[2], p_core2_lut[3],
-          p_core2_lut[4], p_core2_lut[5], p_core2_lut[6], p_core2_lut[7]);
-        pr_info("  tm_lut_i[248..255]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[248], p_core2_lut[249], p_core2_lut[250], p_core2_lut[251],
-          p_core2_lut[252], p_core2_lut[253], p_core2_lut[254], p_core2_lut[255]);
-        pr_info("  tm_lut_s[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[256], p_core2_lut[257], p_core2_lut[258], p_core2_lut[259],
-          p_core2_lut[260], p_core2_lut[261], p_core2_lut[262], p_core2_lut[263]);
-        pr_info("  sm_lut_i[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[512], p_core2_lut[513], p_core2_lut[514], p_core2_lut[515],
-          p_core2_lut[516], p_core2_lut[517], p_core2_lut[518], p_core2_lut[519]);
-        pr_info("  sm_lut_s[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[768], p_core2_lut[769], p_core2_lut[770], p_core2_lut[771],
-          p_core2_lut[772], p_core2_lut[773], p_core2_lut[774], p_core2_lut[775]);
-        pr_info("  g_2_l[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[1024], p_core2_lut[1025], p_core2_lut[1026], p_core2_lut[1027],
-          p_core2_lut[1028], p_core2_lut[1029], p_core2_lut[1030], p_core2_lut[1031]);
-        pr_info("  g_2_l[248..255]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-          p_core2_lut[1272], p_core2_lut[1273], p_core2_lut[1274], p_core2_lut[1275],
-          p_core2_lut[1276], p_core2_lut[1277], p_core2_lut[1278], p_core2_lut[1279]);
-      }
+      /* VP: g_2_l LUT applies gamma→linear conversion between a2b
+       * and c2d. With a2b=identity, our RGB enters g_2_l which
+       * non-linearly expands it before c2d's RGB→YCrCb matrix.
+       * Override with linear ramp to preserve gamma-encoded RGB. */
+      u32 g2l_max = p_core2_lut[1279];
+      int j;
+      for (j = 0; j < 256; j++)
+        p_core2_lut[1024 + j] =
+          (u32)(((u64)j * g2l_max + 127) / 255);
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
@@ -1763,15 +1745,6 @@ static int dolby_core2_set
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
-
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: re-assert CVM bypass after programming is complete.
-     * CTRL=0 above clears bypass, so set it again in processing mode.
-     * (Previous test of this was without c2d override — couldn't tell
-     * if bypass worked since output was still IPT → pink regardless.) */
-    VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
-    VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, bypass_flag);
-  }
 
   return 0;
 }
@@ -1920,17 +1893,9 @@ static int dolby_core3_set
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: force IPT 12-bit 444 bypass */
+    /* VP: force IPT 12-bit 444 bypass (Core3 mode 0x00) */
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
-    /* d2c is still active in mode 0x00 — override with identity so our
-     * Core2 YCrCb output passes through unchanged. ipt_scale + ipt_off
-     * then provide proper full-range → limited-range 12-bit conversion. */
-    p_core3_dm_regs[0] = 0x40000000; /* d2c identity (scale=14) */
-    p_core3_dm_regs[1] = 0x00000000;
-    p_core3_dm_regs[2] = 0x40000000;
-    p_core3_dm_regs[3] = 0x00004000;
-    p_core3_dm_regs[4] = 0x000e0000;
   } else {
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
