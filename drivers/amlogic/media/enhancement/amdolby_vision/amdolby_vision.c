@@ -1702,6 +1702,12 @@ static int dolby_core2_set
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
 
+  /* DIAG: frame counter for VP_TM>3 diagnostic logging */
+  {
+  static int diag_frame;
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3)
+    diag_frame++;
+
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
     /* VP: Core3 mode 0x00 passes data straight to HDMI as YCbCr.
      * Video from Core1 (bypassed) is already YCbCr → correct.
@@ -1710,6 +1716,27 @@ static int dolby_core2_set
      * override g_2_l with gamma→PQ curve (done below in LUT section),
      * set c2d to BT.2020 RGB→YCrCb matching y2rgb's BT.2020 decode.
      * Cr/Cb rows swapped to match channel ordering. */
+
+    /* DIAG: log original library values BEFORE our overrides */
+    if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
+      pr_info("DV_DIAG frame=%d reset=%d set_lut=%d flag=0x%x\n",
+        diag_frame, reset, set_lut, stb_core_setting_update_flag);
+      pr_info("DV_DIAG LIB y2rgb=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x]\n",
+        p_core2_dm_regs[2], p_core2_dm_regs[3], p_core2_dm_regs[4],
+        p_core2_dm_regs[5], p_core2_dm_regs[6],
+        p_core2_dm_regs[7], p_core2_dm_regs[8], p_core2_dm_regs[9]);
+      pr_info("DV_DIAG LIB eotf=%08x a2b=[%08x %08x %08x %08x %08x]\n",
+        p_core2_dm_regs[11],
+        p_core2_dm_regs[12], p_core2_dm_regs[13], p_core2_dm_regs[14],
+        p_core2_dm_regs[15], p_core2_dm_regs[16]);
+      pr_info("DV_DIAG LIB c2d=[%08x %08x %08x %08x %08x] off=%08x\n",
+        p_core2_dm_regs[17], p_core2_dm_regs[18], p_core2_dm_regs[19],
+        p_core2_dm_regs[20], p_core2_dm_regs[21], p_core2_dm_regs[22]);
+      pr_info("DV_DIAG LIB g_2_l[0]=%08x [64]=%08x [128]=%08x [192]=%08x [255]=%08x\n",
+        p_core2_lut[1024], p_core2_lut[1088], p_core2_lut[1152],
+        p_core2_lut[1216], p_core2_lut[1279]);
+    }
+
     /* a2b: identity (scale=14, 1.0=0x4000) */
     p_core2_dm_regs[12] = 0x40000000;
     p_core2_dm_regs[13] = 0x00000000;
@@ -1766,6 +1793,14 @@ static int dolby_core2_set
       for (j = 0; j < 256; j++)
         p_core2_lut[1024 + j] =
           (u32)(((u64)pq_sdr_to_pq[j] * g2l_max) >> 16);
+
+      /* DIAG: log overridden g_2_l values + confirm set_lut state */
+      if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
+        pr_info("DV_DIAG LUT_WRITE set_lut=%d g2l_max=%u\n", set_lut, g2l_max);
+        pr_info("DV_DIAG OVR g_2_l[0]=%08x [64]=%08x [128]=%08x [192]=%08x [255]=%08x\n",
+          p_core2_lut[1024], p_core2_lut[1088], p_core2_lut[1152],
+          p_core2_lut[1216], p_core2_lut[1279]);
+      }
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
@@ -1784,6 +1819,21 @@ static int dolby_core2_set
 
   }
   force_set_lut = false;
+
+  /* DIAG: log buffer state after all processing (LUT may or may not have been written) */
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+    if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
+      u32 hw_dm12 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 12);
+      u32 hw_dm17 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 17);
+      u32 hw_dm18 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 18);
+      pr_info("DV_DIAG HW_RD a2b[0]=%08x c2d[0]=%08x c2d[1]=%08x\n",
+        hw_dm12, hw_dm17, hw_dm18);
+      pr_info("DV_DIAG BUF g_2_l[128]=%08x (buffer state, set_lut=%d reset=%d)\n",
+        p_core2_lut[1152], set_lut, reset);
+    }
+  }
+
+  } /* end diag_frame scope */
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
@@ -1943,6 +1993,33 @@ static int dolby_core3_set
     /* VP: force IPT 12-bit 444 bypass (Core3 mode 0x00) */
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
+
+    /* DIAG: Core3 state */
+    {
+      static int c3_diag;
+      c3_diag++;
+      if (c3_diag <= 3 || c3_diag == 60) {
+        u32 mtx_ctrl = READ_VPP_REG(VPP_MATRIX_CTRL);
+        pr_info("DV_DIAG C3 frame=%d cur_dv_mode=%d\n", c3_diag, cur_dv_mode);
+        pr_info("DV_DIAG C3 ipt_scale=%08x off=[%08x %08x %08x]\n",
+          p_core3_dm_regs[12], p_core3_dm_regs[13],
+          p_core3_dm_regs[14], p_core3_dm_regs[15]);
+        pr_info("DV_DIAG C3 d2c=[%08x %08x %08x %08x %08x]\n",
+          p_core3_dm_regs[0], p_core3_dm_regs[1], p_core3_dm_regs[2],
+          p_core3_dm_regs[3], p_core3_dm_regs[4]);
+        pr_info("DV_DIAG C3 b2a=[%08x %08x %08x %08x %08x]\n",
+          p_core3_dm_regs[5], p_core3_dm_regs[6], p_core3_dm_regs[7],
+          p_core3_dm_regs[8], p_core3_dm_regs[9]);
+        pr_info("DV_DIAG C3 eotf=[%08x %08x] range=[%08x %08x]\n",
+          p_core3_dm_regs[10], p_core3_dm_regs[11],
+          p_core3_dm_regs[16], p_core3_dm_regs[17]);
+        pr_info("DV_DIAG C3 rgb2yuv=[%08x %08x %08x %08x %08x] off=[%08x %08x %08x]\n",
+          p_core3_dm_regs[18], p_core3_dm_regs[19], p_core3_dm_regs[20],
+          p_core3_dm_regs[21], p_core3_dm_regs[22],
+          p_core3_dm_regs[23], p_core3_dm_regs[24], p_core3_dm_regs[25]);
+        pr_info("DV_DIAG C3 VPP_MATRIX_CTRL=%08x\n", mtx_ctrl);
+      }
+    }
   } else {
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
     VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
