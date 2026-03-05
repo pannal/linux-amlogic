@@ -1783,25 +1783,21 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-      /* VP: g_2_l normally does gamma→linear for the DV pipeline.
-       * Core3 mode 0x00 bypasses the OETF (linear→PQ encoding),
-       * so the display (HDR10/PQ mode) gets wrong transfer function.
-       * Override g_2_l with gamma→PQ curve so c2d produces
-       * PQ-encoded YCbCr that the display can decode correctly.
-       * pq_sdr_to_pq is normalized 0..65535 where 65535 = PQ(100nit).
-       * Scale to g2l_max * PQ(100nit) so the display sees correct
-       * absolute PQ levels (100 nit peak, not 10000 nit). */
-      u32 g2l_orig = p_core2_lut[1279];
-      u32 g2l_max = (u32)((u64)g2l_orig * 508 / 1000);
+      /* VP: g_2_l converts SDR gamma OSD to PQ for HDR10 display.
+       * Core3 mode 0x00 passes 12-bit values through directly,
+       * so g_2_l must output 12-bit PQ codes (not 103M-range).
+       * pq_sdr_to_pq[0..255] = gamma 2.2 → PQ at 100 nits,
+       * normalized 0..65535.  Scale to 12-bit: PQ(100 nit) ≈ 0.508,
+       * so max = 0.508 * 4095 ≈ 2080 in full-range 12-bit PQ. */
       int j;
       for (j = 0; j < 256; j++)
         p_core2_lut[1024 + j] =
-          (u32)(((u64)pq_sdr_to_pq[j] * g2l_max) >> 16);
+          (u32)((u64)pq_sdr_to_pq[j] * 2080 >> 16);
 
       /* DIAG: log overridden g_2_l values + confirm set_lut state */
       if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
-        pr_info("DV_DIAG LUT_WRITE set_lut=%d g2l_orig=%u g2l_max=%u\n", set_lut, g2l_orig, g2l_max);
-        pr_info("DV_DIAG OVR g_2_l[0]=%08x [64]=%08x [128]=%08x [192]=%08x [255]=%08x\n",
+        pr_info("DV_DIAG LUT_WRITE set_lut=%d\n", set_lut);
+        pr_info("DV_DIAG OVR g_2_l[0]=%u [64]=%u [128]=%u [192]=%u [255]=%u\n",
           p_core2_lut[1024], p_core2_lut[1088], p_core2_lut[1152],
           p_core2_lut[1216], p_core2_lut[1279]);
       }
