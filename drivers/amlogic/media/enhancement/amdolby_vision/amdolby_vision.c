@@ -1743,15 +1743,15 @@ static int dolby_core2_set
     p_core2_dm_regs[14] = 0x40000000;
     p_core2_dm_regs[15] = 0x00004000;
     p_core2_dm_regs[16] = 0x000e0000;
-    /* c2d: BT.2020 RGB→YCrCb (scale=12, matching y2rgb's BT.2020)
+    /* c2d: BT.2020 RGB→YCbCr (scale=12, matching y2rgb's BT.2020)
      * Row0 = Y:   0.2627*R + 0.6780*G + 0.0593*B
-     * Row1 = Cr:  0.5000*R - 0.4598*G - 0.0402*B
-     * Row2 = Cb: -0.1396*R - 0.3604*G + 0.5000*B */
+     * Row1 = Cb: -0.1396*R - 0.3604*G + 0.5000*B
+     * Row2 = Cr:  0.5000*R - 0.4598*G - 0.0402*B */
     p_core2_dm_regs[17] = 0x043400F3; /* (Y:M00=1076)<<16 | (Y:M02=243) */
-    p_core2_dm_regs[18] = 0xFF5C0AD9; /* (Cr:M12=-164)<<16 | (Y:M01=2777) */
-    p_core2_dm_regs[19] = 0xF8A40800; /* (Cr:M11=-1884)<<16 | (Cr:M10=2048) */
-    p_core2_dm_regs[20] = 0xFDC40800; /* (Cb:M20=-572)<<16 | (Cb:M22=2048) */
-    p_core2_dm_regs[21] = 0x000CFA3C; /* (scale=12)<<16 | (Cb:M21=-1476) */
+    p_core2_dm_regs[18] = 0x08000AD9; /* (Cb:M12=2048)<<16 | (Y:M01=2777) */
+    p_core2_dm_regs[19] = 0xFA3CFDC4; /* (Cb:M11=-1476)<<16 | (Cb:M10=-572) */
+    p_core2_dm_regs[20] = 0x0800FF5C; /* (Cr:M20=2048)<<16 | (Cr:M22=-164) */
+    p_core2_dm_regs[21] = 0x000CF8A4; /* (scale=12)<<16 | (Cr:M21=-1884) */
     p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
   }
 
@@ -1946,9 +1946,11 @@ static int dolby_core3_set
   /* flush post matrix table when ll mode or HDR10 output mode and setting changed */
   /* Core3 HDR10 mode outputs RGB, needs POST matrix for RGB->YUV conversion */
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: Core2 c2d already outputs YCbCr, disable POST RGB→YCbCr.
-     * Direct register write — enable_rgb_to_yuv_matrix_for_dvll(0)
-     * is guarded by restore_post_table which may be false. */
+    /* VP: Core2 c2d already outputs YCbCr, disable POST matrix.
+     * Must clear BOTH the routing (VPP_DOLBY_CTRL bits 6-7) AND the
+     * enable (VPP_MATRIX_CTRL bit 0). HDR10 mode sets DOLBY_CTRL=3
+     * which keeps routing active even when MATRIX_CTRL is cleared. */
+    VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 0, 6, 2);
     VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL, 0, 0, 1);
   } else if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
