@@ -1743,15 +1743,16 @@ static int dolby_core2_set
     p_core2_dm_regs[14] = 0x40000000;
     p_core2_dm_regs[15] = 0x00004000;
     p_core2_dm_regs[16] = 0x000e0000;
-    /* c2d: BT.2020 RGB→YCbCr (scale=12, matching y2rgb's BT.2020)
+    /* c2d: BT.2020 RGB→YCrCb (scale=12, matching y2rgb's BT.2020)
+     * Row order [Y, Cr, Cb] matches Core3 mode 0x00 channel mapping.
      * Row0 = Y:   0.2627*R + 0.6780*G + 0.0593*B
-     * Row1 = Cb: -0.1396*R - 0.3604*G + 0.5000*B
-     * Row2 = Cr:  0.5000*R - 0.4598*G - 0.0402*B */
+     * Row1 = Cr:  0.5000*R - 0.4598*G - 0.0402*B
+     * Row2 = Cb: -0.1396*R - 0.3604*G + 0.5000*B */
     p_core2_dm_regs[17] = 0x043400F3; /* (Y:M00=1076)<<16 | (Y:M02=243) */
-    p_core2_dm_regs[18] = 0x08000AD9; /* (Cb:M12=2048)<<16 | (Y:M01=2777) */
-    p_core2_dm_regs[19] = 0xFA3CFDC4; /* (Cb:M11=-1476)<<16 | (Cb:M10=-572) */
-    p_core2_dm_regs[20] = 0x0800FF5C; /* (Cr:M20=2048)<<16 | (Cr:M22=-164) */
-    p_core2_dm_regs[21] = 0x000CF8A4; /* (scale=12)<<16 | (Cr:M21=-1884) */
+    p_core2_dm_regs[18] = 0xFF5C0AD9; /* (Cr:M12=-164)<<16 | (Y:M01=2777) */
+    p_core2_dm_regs[19] = 0xF8A40800; /* (Cr:M11=-1884)<<16 | (Cr:M10=2048) */
+    p_core2_dm_regs[20] = 0xFDC40800; /* (Cb:M20=-572)<<16 | (Cb:M22=2048) */
+    p_core2_dm_regs[21] = 0x000CFA3C; /* (scale=12)<<16 | (Cb:M21=-1476) */
     p_core2_dm_regs[22] = 0x00000000; /* c2d_off=0 */
   }
 
