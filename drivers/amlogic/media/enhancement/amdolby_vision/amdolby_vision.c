@@ -1823,12 +1823,9 @@ static int dolby_core2_set
   /* DIAG: log buffer state after all processing (LUT may or may not have been written) */
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
     if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
-      u32 hw_dm12 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 12);
-      u32 hw_dm17 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 17);
-      u32 hw_dm18 = READ_VPP_REG(DOLBY_CORE2A_REG_START + 6 + 18);
-      pr_info("DV_DIAG HW_RD a2b[0]=%08x c2d[0]=%08x c2d[1]=%08x\n",
-        hw_dm12, hw_dm17, hw_dm18);
-      pr_info("DV_DIAG BUF g_2_l[128]=%08x (buffer state, set_lut=%d reset=%d)\n",
+      pr_info("DV_DIAG POST a2b[0]=%08x c2d[0]=%08x c2d[1]=%08x (buffer)\n",
+        p_core2_dm_regs[12], p_core2_dm_regs[17], p_core2_dm_regs[18]);
+      pr_info("DV_DIAG POST g_2_l[128]=%08x (buffer, set_lut=%d reset=%d)\n",
         p_core2_lut[1152], set_lut, reset);
     }
   }
@@ -1999,7 +1996,6 @@ static int dolby_core3_set
       static int c3_diag;
       c3_diag++;
       if (c3_diag <= 3 || c3_diag == 60) {
-        u32 mtx_ctrl = READ_VPP_REG(VPP_MATRIX_CTRL);
         pr_info("DV_DIAG C3 frame=%d cur_dv_mode=%d\n", c3_diag, cur_dv_mode);
         pr_info("DV_DIAG C3 ipt_scale=%08x off=[%08x %08x %08x]\n",
           p_core3_dm_regs[12], p_core3_dm_regs[13],
@@ -2017,7 +2013,7 @@ static int dolby_core3_set
           p_core3_dm_regs[18], p_core3_dm_regs[19], p_core3_dm_regs[20],
           p_core3_dm_regs[21], p_core3_dm_regs[22],
           p_core3_dm_regs[23], p_core3_dm_regs[24], p_core3_dm_regs[25]);
-        pr_info("DV_DIAG C3 VPP_MATRIX_CTRL=%08x\n", mtx_ctrl);
+        pr_info("DV_DIAG C3 reset_post_table=%d\n", reset_post_table);
       }
     }
   } else {
