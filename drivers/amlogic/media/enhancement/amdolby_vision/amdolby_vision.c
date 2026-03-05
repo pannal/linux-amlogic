@@ -1433,7 +1433,10 @@ static int dolby_core1_set
   if (dolby_vision_flags & FLAG_BYPASS_CVM) bypass_flag |= 1 << 2;
   if (need_skip_cvm(0)) bypass_flag |= 1 << 2;
   if (el_41_mode) bypass_flag |= 1 << 3;
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 2) bypass_flag |= 1 << 1; /* VP: bypass CSC */
+  /* VP: bypass CSC at TM>2, but keep CSC active at TM>3 — Core3 mode 0x02
+   * needs proper IPT input for the OSD color fix (g_2_l degamma).
+   * CVM bypass is always active at TM>1 (skips tone mapping LUTs). */
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 2 && xbmc_dv_vp_tm <= 3) bypass_flag |= 1 << 1;
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 1) bypass_flag |= 1 << 2; /* VP: bypass CVM */
 
   VSYNC_WR_DV_REG(DOLBY_CORE1_REG_START + 1, 0x70 | bypass_flag); /* bypass CVM and/or CSC */
