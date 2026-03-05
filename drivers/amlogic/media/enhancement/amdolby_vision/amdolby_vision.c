@@ -1788,8 +1788,11 @@ static int dolby_core2_set
        * so the display (HDR10/PQ mode) gets wrong transfer function.
        * Override g_2_l with gamma→PQ curve so c2d produces
        * PQ-encoded YCbCr that the display can decode correctly.
-       * Table is normalized 0..65535, scaled to original g_2_l max. */
-      u32 g2l_max = p_core2_lut[1279];
+       * pq_sdr_to_pq is normalized 0..65535 where 65535 = PQ(100nit).
+       * Scale to g2l_max * PQ(100nit) so the display sees correct
+       * absolute PQ levels (100 nit peak, not 10000 nit). */
+      u32 g2l_orig = p_core2_lut[1279];
+      u32 g2l_max = (u32)((u64)g2l_orig * 508 / 1000);
       int j;
       for (j = 0; j < 256; j++)
         p_core2_lut[1024 + j] =
@@ -1797,7 +1800,7 @@ static int dolby_core2_set
 
       /* DIAG: log overridden g_2_l values + confirm set_lut state */
       if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
-        pr_info("DV_DIAG LUT_WRITE set_lut=%d g2l_max=%u\n", set_lut, g2l_max);
+        pr_info("DV_DIAG LUT_WRITE set_lut=%d g2l_orig=%u g2l_max=%u\n", set_lut, g2l_orig, g2l_max);
         pr_info("DV_DIAG OVR g_2_l[0]=%08x [64]=%08x [128]=%08x [192]=%08x [255]=%08x\n",
           p_core2_lut[1024], p_core2_lut[1088], p_core2_lut[1152],
           p_core2_lut[1216], p_core2_lut[1279]);
