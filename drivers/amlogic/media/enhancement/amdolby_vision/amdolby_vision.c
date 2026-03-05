@@ -1784,15 +1784,16 @@ static int dolby_core2_set
 
     if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
       /* VP: g_2_l converts SDR gamma OSD to PQ for HDR10 display.
-       * Core3 mode 0x00 passes 12-bit values through directly,
-       * so g_2_l must output 12-bit PQ codes (not 103M-range).
-       * pq_sdr_to_pq[0..255] = gamma 2.2 → PQ at 100 nits,
-       * normalized 0..65535.  Scale to 12-bit: PQ(100 nit) ≈ 0.508,
-       * so max = 0.508 * 4095 ≈ 2080 in full-range 12-bit PQ. */
+       * Core3 mode 0x00 divides by ipt_scale (confirmed: zero→black,
+       * 103M and 52M both clip to 4095, 2080→invisible).
+       * Formula: output = g_2_l / ipt_scale.
+       * Target: PQ(100 nit SDR white) ≈ 0.508 → 2080 in 12-bit.
+       * So g_2_l_max = 2080 * ipt_scale = 2080 * 3504 = 7,288,320. */
+      u32 g2l_target = 7288320;
       int j;
       for (j = 0; j < 256; j++)
         p_core2_lut[1024 + j] =
-          (u32)((u64)pq_sdr_to_pq[j] * 2080 >> 16);
+          (u32)((u64)pq_sdr_to_pq[j] * g2l_target >> 16);
 
       /* DIAG: log overridden g_2_l values + confirm set_lut state */
       if (diag_frame <= 3 || diag_frame == 60 || diag_frame == 120) {
