@@ -1573,6 +1573,49 @@ static int dolby_core1_set
   return 0;
 }
 
+/* SDR gamma 2.2 -> linear light, scaled to match the DV library's
+ * g_2_l output range (max = 103,813,904).  Core3 mode 0x02 then
+ * applies OETF (linear→PQ) and POST matrix (RGB→YCbCr).
+ * The library's own g_2_l is a DV-specific tone-map curve that
+ * produces pink OSD on non-DV displays; this replaces it with a
+ * straightforward gamma 2.2 degamma so the standard pipeline
+ * converts SDR OSD to correct HDR10 output.
+ * Values: round((i/255)^2.2 * 103813904) for i=0..255. */
+static const u32 sdr_degamma[256] = {
+	         0,        527,       2422,       5909,      11128,      18180,      27152,      38114,
+	     51129,      66252,      83535,     103022,     124757,     148779,     175125,     203830,
+	    234926,     268445,     304415,     342866,     383825,     427316,     473366,     521997,
+	    573234,     627098,     683610,     742792,     804664,     869246,     936556,    1006614,
+	   1079436,    1155042,    1233448,    1314670,    1398726,    1485631,    1575401,    1668051,
+	   1763596,    1862051,    1963431,    2067749,    2175019,    2285255,    2398470,    2514678,
+	   2633891,    2756122,    2881384,    3009688,    3141047,    3275473,    3412977,    3553571,
+	   3697267,    3844075,    3994006,    4147072,    4303283,    4462649,    4625182,    4790891,
+	   4959787,    5131880,    5307180,    5485695,    5667437,    5852415,    6040638,    6232116,
+	   6426857,    6624871,    6826167,    7030754,    7238641,    7449836,    7664349,    7882187,
+	   8103359,    8327874,    8555740,    8786966,    9021558,    9259526,    9500878,    9745620,
+	   9993762,   10245311,   10500274,   10758660,   11020476,   11285729,   11554427,   11826577,
+	  12102186,   12381263,   12663813,   12949845,   13239364,   13532379,   13828896,   14128922,
+	  14432464,   14739528,   15050122,   15364253,   15681926,   16003148,   16327926,   16656267,
+	  16988177,   17323662,   17662729,   18005383,   18351632,   18701482,   19054938,   19412007,
+	  19772695,   20137008,   20504952,   20876533,   21251757,   21630629,   22013157,   22399345,
+	  22789199,   23182725,   23579929,   23980817,   24385394,   24793665,   25205637,   25621315,
+	  26040704,   26463810,   26890639,   27321195,   27755484,   28193512,   28635283,   29080804,
+	  29530079,   29983114,   30439913,   30900483,   31364827,   31832952,   32304862,   32780563,
+	  33260059,   33743356,   34230458,   34721371,   35216099,   35714647,   36217020,   36723224,
+	  37233262,   37747140,   38264863,   38786434,   39311860,   39841144,   40374292,   40911308,
+	  41452196,   41996962,   42545610,   43098144,   43654569,   44214890,   44779112,   45347237,
+	  45919272,   46495221,   47075087,   47658876,   48246592,   48838238,   49433821,   50033343,
+	  50636810,   51244225,   51855593,   52470918,   53090204,   53713456,   54340677,   54971873,
+	  55607047,   56246203,   56889345,   57536478,   58187605,   58842731,   59501860,   60164996,
+	  60832143,   61503305,   62178485,   62857689,   63540919,   64228181,   64919477,   65614812,
+	  66314189,   67017613,   67725087,   68436616,   69152203,   69871852,   70595567,   71323351,
+	  72055208,   72791143,   73531159,   74275260,   75023449,   75775730,   76532107,   77292584,
+	  78057164,   78825851,   79598648,   80375560,   81156590,   81941741,   82731017,   83524423,
+	  84321960,   85123633,   85929446,   86739402,   87553504,   88371757,   89194162,   90020725,
+	  90851449,   91686337,   92525392,   93368617,   94216018,   95067596,   95923355,   96783299,
+	  97647432,   98515755,   99388273,  100264990,  101145908,  102031030,  102920361,  103813904,
+};
+
 static int dolby_core2_set
   (u32 *p_core2_dm_regs,
    u32 *p_core2_lut,
@@ -1688,6 +1731,17 @@ static int dolby_core2_set
     if (is_meson_gxm() && (dolby_vision_flags & FLAG_CLKGATE_WHEN_LOAD_LUT))
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
+    if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+      /* VP: Replace the library's DV tone-map g_2_l with standard
+       * gamma 2.2 → linear degamma.  The library's curve causes pink
+       * OSD on non-DV displays.  sdr_degamma is pre-scaled to the
+       * library's 103.8M output range so a2b/c2d/Core3 work unchanged.
+       * Core3 mode 0x02 OETF then applies linear→PQ correctly. */
+      int j;
+      for (j = 0; j < 256; j++)
+        p_core2_lut[1024 + j] = sdr_degamma[j];
+    }
+
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
 
     for (i = 0; i < (256 * 5); i += 4) {
@@ -1707,6 +1761,7 @@ static int dolby_core2_set
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
+
   return 0;
 }
 
@@ -1853,14 +1908,8 @@ static int dolby_core3_set
   /*   02- HDR10 output, RGB 10 bit 444 PQ*/
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: force IPT 12-bit 444 bypass */
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
-  } else {
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
-  }
+  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
+  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
 
   /* for delay */
 
