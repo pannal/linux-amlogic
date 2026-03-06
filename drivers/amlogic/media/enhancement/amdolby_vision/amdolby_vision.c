@@ -1743,10 +1743,20 @@ static int dolby_core2_set
        * gamma 2.2 → linear degamma.  The library's curve causes pink
        * OSD on non-DV displays.  sdr_degamma is pre-scaled to the
        * library's 103.8M output range so a2b/c2d/Core3 work unchanged.
-       * Core3 mode 0x02 OETF then applies linear→PQ correctly. */
+       * Core3 mode 0x02 OETF then applies linear→PQ correctly.
+       *
+       * Match the library's OSD brightness: read the library's g_2_l
+       * peak (entry 255) before overriding — it already reflects the
+       * current graphic_max/target_max configuration.  Scale our
+       * gamma 2.2 curve to that same peak so VP brightness tracks
+       * the DV OSD Brightness slider consistently with Player-led. */
+      u32 lib_peak = p_core2_lut[1024 + 255];
       int j;
+      if (lib_peak == 0)
+        lib_peak = sdr_degamma[255];
       for (j = 0; j < 256; j++)
-        p_core2_lut[1024 + j] = sdr_degamma[j];
+        p_core2_lut[1024 + j] =
+          (u32)((u64)sdr_degamma[j] * lib_peak / sdr_degamma[255]);
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
