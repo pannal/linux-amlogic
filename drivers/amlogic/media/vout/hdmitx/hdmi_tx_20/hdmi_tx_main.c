@@ -76,6 +76,7 @@
 
 static struct class *hdmitx_class;
 extern bool xbmc_aml_linux_force_422;
+extern bool xbmc_dv_non_ipt;
 extern unsigned int xbmc_dv_vp;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
@@ -680,14 +681,20 @@ static int set_disp_mode_auto(void)
 	hdev->para = para;
 	vic = hdmitx_edid_get_VIC(hdev, mode, 1);
 
-	if (xbmc_aml_linux_force_422) para->cs = COLORSPACE_YUV422;
-
-	pr_info("set_disp_mode_auto - eotf type [%d] tunnel mode [%d] vic [%d] cd [%d] cs [%s]\n",
+	pr_info("set_disp_mode_auto - eotf type [%d] tunnel mode [%d] vic [%d] cd [%d] cs [%s] force_422 [%d] dv_non_ipt [%d]\n",
 		hdev->hdmi_current_eotf_type, hdev->hdmi_current_tunnel_mode, vic,
-		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs]);
+		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs],
+		xbmc_aml_linux_force_422, xbmc_dv_non_ipt);
+
+	// When DV is active but outputting non-IPT (HDR10/SDR), the EOTF may
+	// still reflect the previous IPT mode (stale).  Treat it as non-DV so
+	// the switch statements below apply normal colour params instead of
+	// DV tunnel mode overrides.
+	int effective_eotf = (xbmc_dv_non_ipt) ?
+		EOTF_T_NULL : hdev->hdmi_current_eotf_type;
 
 	// force colour subsampling when DV mode
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (effective_eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
@@ -716,11 +723,9 @@ static int set_disp_mode_auto(void)
 			break;
 	}
 
-	if (xbmc_aml_linux_force_422 && (para->cs == COLORSPACE_YUV422)) para->cd = COLORDEPTH_36B;
-
 	// parse and set maximum colourdepth given by edid
 	// check for colour subsampling limit
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (effective_eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
@@ -802,6 +807,14 @@ static int set_disp_mode_auto(void)
 				pr_info("hdmitx: display colourdepth is auto set to %d bits (VIC: %d)\n",
 					colour_depths[para->cd - COLORDEPTH_24B], vic);
 		}
+	}
+
+	// Explicit 422 forcing takes priority over DV tunnel mode override.
+	// This handles VS10 HDR10 output where the DV module is active but
+	// outputs HDR10 format — the stale EOTF would otherwise force 444/8bit.
+	if (xbmc_aml_linux_force_422) {
+		para->cs = COLORSPACE_YUV422;
+		para->cd = COLORDEPTH_36B;
 	}
 
 	pr_info("set_disp_mode_auto - cd [%d] cs [%s]\n",

@@ -376,6 +376,10 @@ bool xbmc_aml_linux_force_422; // extern
 module_param(xbmc_aml_linux_force_422, bool, 0664);
 MODULE_PARM_DESC(xbmc_aml_linux_force_422, "\n xbmc_aml_linux_force_422\n");
 
+bool xbmc_dv_non_ipt; // extern
+module_param(xbmc_dv_non_ipt, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_non_ipt, "\n xbmc_dv_non_ipt\n");
+
 static bool xbmc_dv_hdr10_for_dv_ll = false;
 module_param(xbmc_dv_hdr10_for_dv_ll, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_for_dv_ll, "\n xbmc_dv_hdr10_for_dv_ll\n");
