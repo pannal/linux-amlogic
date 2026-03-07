@@ -919,7 +919,7 @@ ssize_t store_attr(struct device *dev,
 	else if (!memcmp(hdmitx_device.fmt_attr, "420", 3))
 		hdmitx_device.para->cs = COLORSPACE_YUV420;
 	else
-		hdmitx_device.para->cs = COLORSPACE_YUV444;
+		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
 		set_disp_mode_auto();
