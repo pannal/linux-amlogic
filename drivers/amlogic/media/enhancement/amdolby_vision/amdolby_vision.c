@@ -404,6 +404,16 @@ static u16 xbmc_dv_md_source_min_pq = 0;
 module_param(xbmc_dv_md_source_min_pq, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_md_source_min_pq, "\n xbmc_dv_md_source_min_pq\n");
 
+/* VS10 SDR metadata override mode:
+ * 0 = clear extension blocks only (current default)
+ * 1 = no metadata modification (keep original ext blocks + L1)
+ * 2 = clear ext blocks + force source_max_PQ to target (100 nits = PQ 2851)
+ * 3 = clear ext blocks + force source to SDR range (min=62/0.005nit, max=2851/100nit)
+ */
+static unsigned int xbmc_dv_vs10_sdr_mode = 0;
+module_param(xbmc_dv_vs10_sdr_mode, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_vs10_sdr_mode, "\n xbmc_dv_vs10_sdr_mode\n");
+
 static u16 xbmc_dv_md_level_6_max_lum = 0;
 module_param(xbmc_dv_md_level_6_max_lum, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_md_level_6_max_lum, "\n xbmc_dv_md_level_6_max_lum\n");
@@ -6124,13 +6134,44 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		}
 	}
 
-	/* VS10 DV→SDR: clear extension block count so the DV engine uses
-	 * default tone mapping instead of being influenced by source L1/L2
-	 * metadata, which can cause incorrect brightness in SDR output. */
+	/* VS10 DV→SDR: metadata override controlled by xbmc_dv_vs10_sdr_mode.
+	 * Mode 0: clear extension blocks (default, forces library default tone map)
+	 * Mode 1: no modification (use content's original metadata including trim)
+	 * Mode 2: clear ext blocks + force source_max to SDR 100 nits
+	 * Mode 3: clear ext blocks + force source range to SDR (0.005-100 nits)
+	 */
 	if ((xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
-	    (dst_format == FORMAT_SDR))
-		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
+	    (dst_format == FORMAT_SDR)) {
+		if (xbmc_dv_vs10_sdr_mode != 1)
+			md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
+		if (xbmc_dv_vs10_sdr_mode == 2) {
+			/* Force source_max_PQ = 2851 (~100 nits) */
+			md_buf[current_id][66] = (2851 >> 8) & 0xFF;
+			md_buf[current_id][67] = 2851 & 0xFF;
+		} else if (xbmc_dv_vs10_sdr_mode == 3) {
+			/* Force SDR range: min=62 (~0.005 nits), max=2851 (~100 nits) */
+			md_buf[current_id][64] = (62 >> 8) & 0xFF;
+			md_buf[current_id][65] = 62 & 0xFF;
+			md_buf[current_id][66] = (2851 >> 8) & 0xFF;
+			md_buf[current_id][67] = 2851 & 0xFF;
+		}
+	}
+
+	/* Always update source PQ params so they can be read via sysfs */
+	if (total_md_size >= 68) {
+		xbmc_dv_md_source_min_pq = (md_buf[current_id][64] << 8) | md_buf[current_id][65];
+		xbmc_dv_md_source_max_pq = (md_buf[current_id][66] << 8) | md_buf[current_id][67];
+	}
+
+	if ((debug_dolby & 1) && (dst_format == FORMAT_SDR)) {
+		pr_info("DOLBY: SDR pre-cp: src_pq[%u-%u] target[%u-%u] ext_blocks=%u md_size=%u\n",
+			xbmc_dv_md_source_min_pq, xbmc_dv_md_source_max_pq,
+			dolby_vision_target_min,
+			dolby_vision_target_max[src_format][dst_format] * 10000,
+			md_buf[current_id][ETSI_META_OFFSET-1],
+			total_md_size);
+	}
 
 	if (debug_dolby & 0x400)
 		do_gettimeofday(&start);
@@ -6168,6 +6209,14 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	if (flag >= 0) {
 
 		stb_core_setting_update_flag |= flag;
+
+		if ((debug_dolby & 1) && (dst_format == FORMAT_SDR)) {
+			u32 *c3 = (u32 *)&new_dovi_setting.dm_reg3;
+			pr_info("DOLBY: SDR post-cp: eotf[0x%08x,0x%08x] ipt_scale=0x%08x out_range[0x%08x,0x%08x] rgb2yuv_off[0x%08x,0x%08x,0x%08x]\n",
+				c3[10], c3[11], c3[12],
+				c3[16], c3[17],
+				c3[23], c3[24], c3[25]);
+		}
 
 		if ((dolby_vision_flags & FLAG_FORCE_DOVI_LL) &&
 		    dst_format == FORMAT_DOVI)
