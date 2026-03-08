@@ -5621,6 +5621,11 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 					 &total_md_size,
 					 &src_format,
 					  &ret_flags, drop_flag);
+				/* T35 SEI falsely detected as DV RPU but
+				 * parser failed — not actual DV content */
+				if (meta_flag_bl && src_format == FORMAT_DOVI &&
+				    total_md_size == 0 && total_comp_size == 0)
+					src_format = FORMAT_SDR;
 			}
 
 			if (force_mel) ret_flags = 1;
