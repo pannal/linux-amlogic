@@ -1769,6 +1769,16 @@ static int dolby_core2_set
           (u32)((u64)sdr_degamma[j] * lib_peak / sdr_degamma[255]);
     }
 
+    if (debug_dolby & 0x2) {
+      pr_info("DOLBY: g_2_l[0]=%u [32]=%u [64]=%u [128]=%u [192]=%u [255]=%u "
+              "g_fmt=%d g_bd=%d gmax=%u\n",
+              p_core2_lut[1024], p_core2_lut[1024+32],
+              p_core2_lut[1024+64], p_core2_lut[1024+128],
+              p_core2_lut[1024+192], p_core2_lut[1024+255],
+              new_dovi_setting.g_format, new_dovi_setting.g_bitdepth,
+              dolby_vision_graphic_max);
+    }
+
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
 
     for (i = 0; i < (256 * 5); i += 4) {
