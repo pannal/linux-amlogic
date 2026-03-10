@@ -1777,6 +1777,22 @@ static int dolby_core2_set
               p_core2_lut[1024+192], p_core2_lut[1024+255],
               new_dovi_setting.g_format, new_dovi_setting.g_bitdepth,
               dolby_vision_graphic_max);
+      pr_info("DOLBY: core2 DM: s_range=%u/%u y2rgb=[%u %u %u %u %u] "
+              "off=[%u %u %u] frame_fmt=%u eotf=%u\n",
+              p_core2_dm_regs[0], p_core2_dm_regs[1],
+              p_core2_dm_regs[2], p_core2_dm_regs[3],
+              p_core2_dm_regs[4], p_core2_dm_regs[5],
+              p_core2_dm_regs[6], p_core2_dm_regs[7],
+              p_core2_dm_regs[8], p_core2_dm_regs[9],
+              p_core2_dm_regs[10], p_core2_dm_regs[11]);
+      pr_info("DOLBY: core2 DM: a2b=[%u %u %u %u %u] "
+              "c2d=[%u %u %u %u %u] c2d_off=%u\n",
+              p_core2_dm_regs[12], p_core2_dm_regs[13],
+              p_core2_dm_regs[14], p_core2_dm_regs[15],
+              p_core2_dm_regs[16], p_core2_dm_regs[17],
+              p_core2_dm_regs[18], p_core2_dm_regs[19],
+              p_core2_dm_regs[20], p_core2_dm_regs[21],
+              p_core2_dm_regs[22]);
     }
 
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
