@@ -6078,9 +6078,21 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	else
 		new_dovi_setting.dovi2hdr10_nomapping = 0;
 
-	/* always use rgb setting */
-	new_dovi_setting.g_bitdepth = 8;
-	new_dovi_setting.g_format = G_SDR_RGB;
+	/* OSD graphic format: use G_HDR_RGB for non-SDR output so the DV
+	 * library processes PQ-encoded OSD (e.g. PGS subtitles) correctly.
+	 * Exception: VP mode with sdr_degamma active — keep G_SDR_RGB since
+	 * sdr_degamma provides gamma 2.2->linear which requires SDR mode. */
+	if (dst_format == FORMAT_SDR ||
+	    (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3))
+	{
+		new_dovi_setting.g_bitdepth = 8;
+		new_dovi_setting.g_format = G_SDR_RGB;
+	}
+	else
+	{
+		new_dovi_setting.g_bitdepth = 10;
+		new_dovi_setting.g_format = G_HDR_RGB;
+	}
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;
