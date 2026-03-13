@@ -376,6 +376,12 @@ bool xbmc_aml_linux_force_422; // extern
 module_param(xbmc_aml_linux_force_422, bool, 0664);
 MODULE_PARM_DESC(xbmc_aml_linux_force_422, "\n xbmc_aml_linux_force_422\n");
 
+/* Keep 12-bit precision through VPP and enable HDMI TX dithering
+ * during DV to reduce banding in color gradients. */
+static bool xbmc_dv_dither;
+module_param(xbmc_dv_dither, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_dither, "\n xbmc_dv_dither\n");
+
 bool xbmc_dv_non_ipt; // extern
 module_param(xbmc_dv_non_ipt, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_non_ipt, "\n xbmc_dv_non_ipt\n");
@@ -2488,8 +2494,19 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
 				} else {
 					if (dolby_vision_flags & FLAG_BYPASS_VPP) video_effect_bypass(1);
-					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x20002000);	// 12->10 before vadj1 10->12 before post blend
-					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
+					if (xbmc_dv_dither) {
+						/* Preserve 12-bit precision through VPP to
+						 * reduce banding in color gradients.  The
+						 * final 12→10 conversion happens at the
+						 * HDMI TX with dithering instead of plain
+						 * truncation in the VPP. */
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x08000800);	// u12↔s12 (preserve 12-bit)
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x08000800);	// u12↔s12 (preserve 12-bit)
+						VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 0, 12, 1);	// disable VPP 12→10 truncation
+					} else {
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x20002000);	// 12->10 before vadj1 10->12 before post blend
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
+					}
 				}
 
 				VSYNC_WR_DV_REG(VPP_MATRIX_CTRL, 0);
@@ -2519,6 +2536,11 @@ void enable_dolby_vision(int enable)
 				} else {
 					enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
 				}
+
+				if (xbmc_dv_dither &&
+				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
+				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT)
+					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 1, 4, 1);
 
 				last_dolby_vision_ll_policy = dolby_vision_ll_policy;
 				pr_dolby_dbg("Dolby Vision G12a turn on%s\n", dolby_vision_core1_on ? ", core1 on" : "");
@@ -2695,6 +2717,11 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(DOLBY_TV_CLKGATE_CTRL, 0x55555555);
 					hdr_vd1_off(); // hdr core
 					dv_mem_power_off(VPU_DOLBY0);
+				}
+
+				if (xbmc_dv_dither) {
+					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 12, 1);
+					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 0, 4, 1);
 				}
 
 				pr_dolby_dbg("Dolby Vision G12a turn off\n");
