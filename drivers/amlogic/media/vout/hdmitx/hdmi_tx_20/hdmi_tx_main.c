@@ -2656,7 +2656,7 @@ static ssize_t show_config(struct device *dev,
 
 		if (hdmitx_hdr10p_en())
 			eotf = eotf_hdr10p[hdmitx_get_cur_hdr10p_st() & ~HDMI_HDR10P_TYPE];
-		else if (hdmitx_dv_en())
+		else if (!xbmc_dv_non_ipt && hdmitx_dv_en())
 			eotf = eotf_DV[hdmitx_get_cur_dv_st() & ~HDMI_DV_TYPE];
 		else if (hdmitx_hdr_en())
 			eotf = eotf_hdr[hdmitx_get_cur_hdr_st() & ~HDMI_HDR_TYPE];
