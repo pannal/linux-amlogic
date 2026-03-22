@@ -115,6 +115,7 @@ static bool dovi_tv_led_no_colorimetry = false;
  * when switch DV(LL)->HLG
  */
 static int hdr_mute_frame = 20;
+static bool hdr10plus_vsif_hold;
 
 struct vout_device_s hdmitx_vdev = {
 	.dv_info = &hdmitx_device.rxcap.dv_info,
@@ -2281,6 +2282,14 @@ static void hdmitx_set_hdr10plus_pkt(unsigned int flag,
 		hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020,
 			CLR_AVI_BT2020);
 		hdev->hdr10plus_feature = 0;
+		return;
+	}
+
+	if (hdr10plus_vsif_hold) {
+		if (hdev->hdr10plus_feature != 1)
+			pr_info("hdmitx_set_hdr10plus_pkt: held (mode switch)\n");
+		hdev->hdr10plus_feature = 1;
+		hdr_status_pos = 3;
 		return;
 	}
 
@@ -7557,3 +7566,6 @@ module_param(dovi_tv_led_bt2020, bool, 0644);
 
 MODULE_PARM_DESC(dovi_tv_led_no_colorimetry, "\n dovi_tv_led_no_colorimetry\n");
 module_param(dovi_tv_led_no_colorimetry, bool, 0644);
+
+MODULE_PARM_DESC(hdr10plus_vsif_hold, "\n hdr10plus_vsif_hold\n");
+module_param(hdr10plus_vsif_hold, bool, 0644);
