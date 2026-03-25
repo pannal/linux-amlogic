@@ -6152,12 +6152,87 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		}
 	}
 
+	/* VP with tm > 1: clear extension blocks and set target max for
+	 * CVM bypass mode where the DV engine skips tone mapping. */
+	if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL))) {
+		new_dovi_setting.use_ll_flag = 0;
+		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
+		dolby_vision_target_max[FORMAT_DOVI][FORMAT_DOVI] = 10000;
+	}
+
+	/* DV-LL (Player-Led) pre-processing: ensure per-frame metadata
+	 * levels are properly formatted before control_path processes them.
+	 * Clamps L1 min_pq to at least 17 and filters levels for SDR output
+	 * based on source luminance. Without this, control_path may produce
+	 * static output, losing HDR10+ per-scene dynamic tonemapping. */
+	if ((xbmc_dv_vp == 0) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
+	    is_dv_ll()) {
+		unsigned char *temp_index = md_buf[current_id] + ETSI_META_OFFSET;
+		unsigned char *md_index = md_buf[current_id] + ETSI_META_OFFSET;
+		unsigned char *md_end_index = md_buf[current_id] + total_md_size;
+		size_t remaining_input = total_md_size - ETSI_META_OFFSET;
+		size_t remaining_space = total_md_size - ETSI_META_OFFSET;
+		uint8_t num_levels = 0;
+		const bool in_scope = (dst_format == FORMAT_SDR);
+
+		while ((md_index < md_end_index) &&
+		       (remaining_input >= 5) &&
+		       (remaining_space >= 5)) {
+			size_t level_size = be32_to_cpup(
+				(__be32 *)md_index);
+			uint8_t level = md_index[4];
+
+			level_size += 5;
+			if (level_size > remaining_space ||
+			    level_size > remaining_input) {
+				pr_err("source_meta_dtm - invalid metadata\n");
+				break;
+			}
+			if ((level == 1) &&
+			    (((temp_index[5] << 8) | temp_index[6]) < 17) &&
+			    !in_scope) {
+				temp_index[5] = 0x00;
+				temp_index[6] = 0x11;
+				memcpy(md_index, temp_index, level_size);
+				temp_index += level_size;
+				remaining_space -= level_size;
+				num_levels++;
+			} else if ((level >= 1) && !in_scope) {
+				temp_index += level_size;
+				remaining_space -= level_size;
+				num_levels++;
+			} else if ((level == 1) && in_scope &&
+				   ((((md_buf[current_id][66] << 8) |
+				      md_buf[current_id][67]) > 3079) ||
+				    (((temp_index[7] << 8) |
+				      temp_index[8]) >
+				     ((md_buf[current_id][66] << 8) |
+				      md_buf[current_id][67])))) {
+				if (((temp_index[5] << 8) |
+				     temp_index[6]) < 17) {
+					temp_index[5] = 0x00;
+					temp_index[6] = 0x11;
+					memcpy(md_index, temp_index,
+					       level_size);
+				}
+				temp_index += level_size;
+				remaining_space -= level_size;
+				num_levels++;
+			}
+			md_index += level_size;
+			remaining_input -= level_size;
+		}
+		md_buf[current_id][ETSI_META_OFFSET-1] = num_levels;
+	}
+
 	/* VS10 DV→SDR: clear extension block count so the DV engine uses
 	 * default tone mapping instead of being influenced by source L1/L2
 	 * metadata, which can cause incorrect brightness in SDR output. */
 	if ((xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
-	    (dst_format == FORMAT_SDR))
+	    (dst_format == FORMAT_SDR) && !is_dv_ll())
 		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
 
 	if (debug_dolby & 0x400)
