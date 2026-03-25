@@ -282,14 +282,23 @@ static int aml_wtd_reboot_notify(struct notifier_block *nb,
 	struct aml_wdt_dev *wdev;
 
 	wdev = container_of(nb, struct aml_wdt_dev, reboot_notifier);
-	if (event == SYS_DOWN || event == SYS_HALT) {
-		disable_watchdog(wdev);
-		dev_info(wdev->dev,
-			"reboot_notify: disable watchdog (event = %lu)\n",
-			event);
-	}
 	if (wdev->reset_watchdog_method == 1)
 		hrtimer_cancel(&wdev->timer);
+	if (event == SYS_HALT) {
+		disable_watchdog(wdev);
+		dev_info(wdev->dev,
+			"reboot_notify: disable watchdog (halt)\n");
+	} else if (event == SYS_DOWN) {
+		/* Keep watchdog running during reboot with shutdown_timeout
+		 * so it can recover from hangs in kernel driver teardown.
+		 */
+		set_watchdog_cnt(wdev, wdev->shutdown_timeout *
+					wdev->one_second);
+		reset_watchdog(wdev);
+		dev_info(wdev->dev,
+			"reboot_notify: watchdog armed for reboot (%us)\n",
+			wdev->shutdown_timeout);
+	}
 	return NOTIFY_OK;
 }
 
@@ -378,7 +387,12 @@ static void aml_wdt_shutdown(struct platform_device *pdev)
 
 	if (wdev->reset_watchdog_method == 1)
 		hrtimer_cancel(&wdev->timer);
-	disable_watchdog(wdev);
+	/* Watchdog handling is done in the reboot notifier;
+	 * on reboot it stays armed, on halt it is disabled.
+	 */
+	if (!system_state || system_state == SYSTEM_HALT ||
+	    system_state == SYSTEM_POWER_OFF)
+		disable_watchdog(wdev);
 }
 
 static int aml_wdt_remove(struct platform_device *pdev)
