@@ -4174,6 +4174,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 	u32 max_lum = 1000 * 10000;
 	u32 min_lum = 50;
 	int primaries_type = 0;
+	u32 max_lum_alt = 9997 * 10000;
 
 	if (get_primary_policy() == PRIMARIES_NATIVE ||
 		primary_debug == 1 ||
@@ -4222,7 +4223,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 		    p_hdr10_param->w_x != p_mdc->white_point[0] ||
 		    p_hdr10_param->w_y != p_mdc->white_point[1]) {
 			flag |= 1;
-			p_hdr10_param->max_display_mastering_lum = p_mdc->luminance[0];
+			p_hdr10_param->max_display_mastering_lum = (p_mdc->luminance[0] > max_lum_alt) ? max_lum_alt : p_mdc->luminance[0];
 			p_hdr10_param->min_display_mastering_lum = p_mdc->luminance[1];
 			p_hdr10_param->r_x = p_mdc->primaries[2][0];
 			p_hdr10_param->r_y = p_mdc->primaries[2][1];
@@ -4246,7 +4247,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 		    p_hdr10_param->w_x != p_mdc->white_point[0] ||
 		    p_hdr10_param->w_y != p_mdc->white_point[1]) {
 			flag |= 1;
-			p_hdr10_param->max_display_mastering_lum = p_mdc->luminance[0];
+			p_hdr10_param->max_display_mastering_lum = (p_mdc->luminance[0] > max_lum_alt) ? max_lum_alt : p_mdc->luminance[0];
 			p_hdr10_param->min_display_mastering_lum = p_mdc->luminance[1];
 			p_hdr10_param->r_x = p_mdc->primaries[0][0];
 			p_hdr10_param->r_y = p_mdc->primaries[0][1];
