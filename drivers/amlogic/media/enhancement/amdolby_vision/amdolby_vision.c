@@ -6055,9 +6055,93 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	if (xbmc_dv_vsvdb_inject_num < 24)
 		load_dolby_vsvdb(vinfo->vout_device->dv_info, src_format);
 
-	// For DV-LL apply limits to the VSVDB min and max, when we have source metadata.
-	// Skip in VP mode - VP handles its own tone mapping.
-	if (total_md_size > 0 && xbmc_dv_vp == 0) limit_dolby_vsvdb_to_source_lum_for_lldv();
+	/* DV-LL (non-VP): clamp VSVDB luminance to source content's max PQ.
+	 * This tells the DV library the effective display range matches the
+	 * source, which can trigger per-frame L2 generation for backlight
+	 * control in the LL VSIF. Also injects HDR10 metadata for DV-LL. */
+	if ((xbmc_dv_vp == 0) && is_dv_ll() &&
+	    (xbmc_dv_vsvdb_source_lum_limit_num < 24)) {
+		unsigned char *x = &new_dovi_setting.vsvdb_tbl[5];
+		const unsigned char version = (x[0] >> 5) & 0x07;
+		u16 vsvdb_min = 0;
+		u16 vsvdb_max = 0;
+
+		switch (version) {
+		case 0:
+			vsvdb_min = (x[14] << 4) | (x[13] >> 4);
+			vsvdb_max = (x[15] << 4) | (x[13] & 0x0F);
+			break;
+		case 1:
+			vsvdb_min = min_direct_to_pq_lut[(x[2] >> 1)];
+			vsvdb_max = xbmc_max_direct_to_pq_lut[(x[1] >> 1)];
+			break;
+		case 2:
+			vsvdb_min = 20 * (x[1] >> 3);
+			vsvdb_max = 2055 + 65 * (x[2] >> 3);
+			break;
+		}
+
+		if ((src_format == FORMAT_DOVI) ||
+		    (src_format == FORMAT_DOVI_LL))
+			xbmc_dv_md_source_max_pq =
+				(md_buf[current_id][66] << 8) |
+				 md_buf[current_id][67];
+		else
+			xbmc_dv_md_source_max_pq = vsvdb_max;
+
+		{
+			u16 calc_vsvdb_max = min_t(unsigned short,
+				xbmc_dv_md_source_max_pq, vsvdb_max);
+			u16 new_min = vsvdb_min;
+			u16 new_max = vsvdb_max;
+
+			if ((vsvdb_min != 0) ||
+			    (vsvdb_max != calc_vsvdb_max)) {
+				new_min = 0;
+				new_max = calc_vsvdb_max;
+				switch (version) {
+				case 0:
+					x[13] = ((new_min & 0x0F) << 4) |
+						 (new_max & 0x0F);
+					x[14] = (new_min >> 4) & 0xFF;
+					x[15] = (new_max >> 4) & 0xFF;
+					break;
+				case 1:
+				{
+					u8 min_idx = 0;
+					u8 max_idx;
+					if ((xbmc_dv_md_source_max_pq == 3388) &&
+					    (new_max > 3377))
+						new_max = 3377;
+					else if ((xbmc_dv_md_source_max_pq == 3696) &&
+						 (new_max > 3690))
+						new_max = 3690;
+					max_idx = xbmc_find_closest_lut_index(
+						new_max,
+						xbmc_max_direct_to_pq_lut,
+						128);
+					x[1] = (max_idx << 1) |
+					       (x[1] & 0x01);
+					x[2] = (min_idx << 1) |
+					       (x[2] & 0x01);
+					break;
+				}
+				case 2:
+					x[1] = (x[1] & 0x07) |
+					       (((new_min / 20) & 0x1F) << 3);
+					x[2] = (x[2] & 0x07) |
+					       ((((new_max - 2055) / 65) &
+						 0x1F) << 3);
+					break;
+				}
+				if (xbmc_dv_hdr10_for_dv_ll &&
+				    (xbmc_dv_hdr10_for_dv_ll_inject_num < 24) &&
+				    (xbmc_dv_vp == 0))
+					set_hdr10_data_for_dv_ll();
+			}
+			xbmc_dv_vsvdb_source_lum_limit_num += 1;
+		}
+	}
 
 	/* check video/graphics priority on the fly */
 	/* cert: some graphic test also need video pri 5223,5243,5253,5263 */
