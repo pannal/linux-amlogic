@@ -387,14 +387,17 @@ static int hdmitx_reboot_notifier(struct notifier_block *nb,
 	cancel_delayed_work_sync(&hdev->work_hpd_plugin);
 	cancel_delayed_work_sync(&hdev->work_hpd_plugout);
 	cancel_work_sync(&hdev->work_hdr);
-	hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
-	if (hdev->debug_param.avmute_frame > 0)
-		msleep(mute_us / 1000);
-	else
-		msleep(100);
-	hdev->hwop.cntlmisc(hdev, MISC_TMDS_PHY_OP, TMDS_PHY_DISABLE);
-	hdev->hwop.cntl(hdev, HDMITX_EARLY_SUSPEND_RESUME_CNTL,
-		HDMITX_EARLY_SUSPEND);
+	if (action == SYS_HALT || action == SYS_POWER_OFF) {
+		hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
+		if (hdev->debug_param.avmute_frame > 0)
+			msleep(mute_us / 1000);
+		else
+			msleep(100);
+		hdev->hwop.cntlmisc(hdev, MISC_TMDS_PHY_OP,
+			TMDS_PHY_DISABLE);
+		hdev->hwop.cntl(hdev, HDMITX_EARLY_SUSPEND_RESUME_CNTL,
+			HDMITX_EARLY_SUSPEND);
+	}
 
 	return NOTIFY_OK;
 }
