@@ -6217,10 +6217,14 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			                &hdr10_param,
 			                &new_dovi_setting);
 
-		// Copy original source metadata for standard DV (non-LL) output
+		// Copy original source metadata to preserve per-frame dynamic levels.
+		// For standard DV (non-LL): always copy.
+		// For DV-LL (Player-Led): copy during HDR10+ conversion where the
+		// synthetic RPU carries per-frame L1 that must reach core3.
 		if ((src_format == FORMAT_DOVI) && (dst_format == FORMAT_DOVI) &&
-		    !((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
-		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422))
+		    (!((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
+		       dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422) ||
+		     xbmc_dv_hdr10plus_conv))
 			source_meta_copy(md_buf[current_id], total_md_size, &new_dovi_setting.md_reg3);
 
 		if (debug_dolby & 4) {
