@@ -5466,45 +5466,15 @@ static inline void source_meta_copy(
     remaining_input -= level_size;
   }
 
-  convert_to_hdr10plus = (level_1_done && xbmc_dv_hdr10plus_conv);
+  // CMv4.0 injection via xbmc_dv_hdr10plus_conv is no longer needed:
+  // the RPU writer includes L3/L9/L11/L254 directly (Kodi-side).
+  // convert_to_hdr10plus = (level_1_done && xbmc_dv_hdr10plus_conv);
 
   if (!level_5_done && level_1_done)
   {
     memcpy(combo_index, LEVEL_5_DATA, LEVEL_5_LENGTH);
     combo_index += LEVEL_5_LENGTH;
     combo_meta_size += LEVEL_5_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_3_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_3_DATA, LEVEL_3_LENGTH);
-    combo_index += LEVEL_3_LENGTH;
-    combo_meta_size += LEVEL_3_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_9_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_9_DATA, LEVEL_9_LENGTH);
-    combo_index += LEVEL_9_LENGTH;
-    combo_meta_size += LEVEL_9_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_11_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_11_DATA, LEVEL_11_LENGTH);
-    combo_index += LEVEL_11_LENGTH;
-    combo_meta_size += LEVEL_11_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_254_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_254_DATA, LEVEL_254_LENGTH);
-    combo_index += LEVEL_254_LENGTH;
-    combo_meta_size += LEVEL_254_LENGTH;
     num_levels++;
   }
 
@@ -6301,14 +6271,10 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			                &hdr10_param,
 			                &new_dovi_setting);
 
-		// Copy original source metadata to preserve per-frame dynamic levels.
-		// For standard DV (non-LL): always copy.
-		// For DV-LL (Player-Led): copy during HDR10+ conversion where the
-		// synthetic RPU carries per-frame L1 that must reach core3.
+		// Copy original source metadata for standard DV (non-LL) output
 		if ((src_format == FORMAT_DOVI) && (dst_format == FORMAT_DOVI) &&
-		    (!((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
-		       dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422) ||
-		     xbmc_dv_hdr10plus_conv))
+		    !((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
+		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422))
 			source_meta_copy(md_buf[current_id], total_md_size, &new_dovi_setting.md_reg3);
 
 		if (debug_dolby & 4) {
