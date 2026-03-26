@@ -6114,44 +6114,6 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	new_dovi_setting.video_width = w << 16;
 	new_dovi_setting.video_height = h << 16;
 
-	/* VP mode: force standard DV processing, override LL */
-	if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1) &&
-	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL))) {
-		new_dovi_setting.use_ll_flag = 0;
-		dolby_vision_target_max[FORMAT_DOVI][FORMAT_DOVI] = 10000;
-	}
-
-	/* Level 1 min luminance clamping for DV-LL (non-VP) */
-	if ((xbmc_dv_vp == 0) && is_dv_ll() &&
-	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL))) {
-		unsigned char* temp_index = md_buf[current_id] + ETSI_META_OFFSET;
-		unsigned char* md_index = md_buf[current_id] + ETSI_META_OFFSET;
-		unsigned char* md_end_index = md_buf[current_id] + total_md_size;
-		size_t l1_remaining_input = total_md_size - ETSI_META_OFFSET;
-		size_t l1_remaining_space = total_md_size - ETSI_META_OFFSET;
-		while ((md_index < md_end_index) &&
-		       (l1_remaining_input >= 5) &&
-		       (l1_remaining_space >= 5)) {
-			size_t level_size = be32_to_cpup((__be32 *)md_index);
-			uint8_t level = md_index[4];
-			level_size += 5;
-			if (level_size > l1_remaining_space || level_size > l1_remaining_input)
-				break;
-			if ((level == 1) && (((temp_index[5] << 8) | temp_index[6]) < 17)) {
-				temp_index[5] = 0x00;
-				temp_index[6] = 0x11;
-				memcpy(md_index, temp_index, level_size);
-				temp_index += level_size;
-				l1_remaining_space -= level_size;
-			} else {
-				temp_index += level_size;
-				l1_remaining_space -= level_size;
-			}
-			md_index += level_size;
-			l1_remaining_input -= level_size;
-		}
-	}
-
 	/* VP with tm > 1: clear extension blocks and set target max for
 	 * CVM bypass mode where the DV engine skips tone mapping. */
 	if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1) &&
