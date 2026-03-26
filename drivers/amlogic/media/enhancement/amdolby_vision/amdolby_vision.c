@@ -6222,6 +6222,24 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		    !((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
 		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422))
 			source_meta_copy(md_buf[current_id], total_md_size, &new_dovi_setting.md_reg3);
+
+		if (debug_dolby & 4) {
+			u16 src_L1_min = (md_buf[current_id][ETSI_META_OFFSET + 5] << 4) |
+					 (md_buf[current_id][ETSI_META_OFFSET + 6] >> 4);
+			u16 src_L1_max = ((md_buf[current_id][ETSI_META_OFFSET + 6] & 0xF) << 8) |
+					  md_buf[current_id][ETSI_META_OFFSET + 7];
+			u16 src_L1_avg = (md_buf[current_id][ETSI_META_OFFSET + 8] << 4) |
+					 (md_buf[current_id][ETSI_META_OFFSET + 9] >> 4);
+			pr_info("DOLBY: cp flag=%d ll=%d src_fmt=%d dst_fmt=%d "
+				"L1[min=%u,max=%u,avg=%u] ext_md_mask=0x%x "
+				"L2[avail=%d,tmax_h=%u,tmax_l=%u]\n",
+				flag, is_dv_ll(), src_format, dst_format,
+				src_L1_min, src_L1_max, src_L1_avg,
+				new_dovi_setting.ext_md.avail_level_mask,
+				(new_dovi_setting.ext_md.avail_level_mask & EXT_MD_LEVEL_2) ? 1 : 0,
+				new_dovi_setting.ext_md.level_2.target_max_pq_h,
+				new_dovi_setting.ext_md.level_2.target_max_pq_l);
+		}
 	}
 
 	if (debug_dolby & 0x400) {
