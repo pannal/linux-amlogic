@@ -379,6 +379,14 @@ static int hdmitx_reboot_notifier(struct notifier_block *nb,
 		hdev->debug_param.avmute_frame * hdmitx_get_frame_duration();
 
 	hdev->ready = 0;
+	/* Suppress HPD events during reboot/shutdown to prevent the
+	 * plugin handler from starting a mode reinitialization that
+	 * races with driver teardown and causes a deadlock.
+	 */
+	hdev->hpd_lock = 1;
+	cancel_delayed_work_sync(&hdev->work_hpd_plugin);
+	cancel_delayed_work_sync(&hdev->work_hpd_plugout);
+	cancel_work_sync(&hdev->work_hdr);
 	hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
 	if (hdev->debug_param.avmute_frame > 0)
 		msleep(mute_us / 1000);
