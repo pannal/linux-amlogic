@@ -336,9 +336,16 @@ static bool xbmc_meta_level_5 = false;
 module_param(xbmc_meta_level_5, bool, 0664);
 MODULE_PARM_DESC(xbmc_meta_level_5, "\n xbmc_meta_level_5\n");
 
+// "osdst" originally gated both OSD and subtitles, now OSD only.
+// Name kept for sysfs compatibility. Subtitle gating moved to subt.
 static bool xbmc_meta_level_5_osdst = false;
 module_param(xbmc_meta_level_5_osdst, bool, 0664);
 MODULE_PARM_DESC(xbmc_meta_level_5_osdst, "\n xbmc_meta_level_5_osdst\n");
+
+// Subtitle L5 gating, independent of OSD (split from osdst)
+static bool xbmc_meta_level_5_subt = false;
+module_param(xbmc_meta_level_5_subt, bool, 0664);
+MODULE_PARM_DESC(xbmc_meta_level_5_subt, "\n xbmc_meta_level_5_subt\n");
 
 // 0 (integer value for false) - subtitles OFF
 // 1 (integer value for true) - subtitles ON
@@ -5404,7 +5411,9 @@ static inline void source_meta_copy(
   bool level_11_done = false;
   bool level_254_done = false;
   bool convert_to_hdr10plus = false;
-  bool allow_level_5_source = (xbmc_meta_level_5 && !(xbmc_meta_level_5_osdst && (dolby_vision_xbmc_osd || dolby_vision_subtitles)));
+  bool allow_level_5_source = (xbmc_meta_level_5
+      && !(xbmc_meta_level_5_osdst && dolby_vision_xbmc_osd)
+      && !(xbmc_meta_level_5_subt && dolby_vision_subtitles));
 
   while ((orig_index < orig_end_index) &&
          (remaining_input >= 5) &&
