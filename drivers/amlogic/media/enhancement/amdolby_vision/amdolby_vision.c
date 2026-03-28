@@ -5407,6 +5407,8 @@ static inline void source_meta_copy(
   bool level_1_done = false;
   bool level_3_done = false;
   bool level_5_done = false;
+  bool level_8_done = false;
+  size_t level_8_size = 0;
   bool level_9_done = false;
   bool level_11_done = false;
   bool level_254_done = false;
@@ -5440,7 +5442,17 @@ static inline void source_meta_copy(
       level_5_done = true;
     }
 
-    if ((level != 5 || (level == 5 && allow_level_5_source)) && level != 6)
+    /* Skip L8 blocks whose size differs from the first L8 seen —
+     * variable-length L8 sequences corrupt some TV DV parsers,
+     * causing screen blackout (e.g. Super Mario Bros Movie 2023,
+     * Marty Supreme). */
+    level_8_done = (level == 8) && (level_8_size != 0) && (level_8_size != level_size);
+
+    if (((level >= 1) && (level <= 4)) ||
+        (allow_level_5_source && (level == 5)) ||
+        (level == 7) ||
+        (!level_8_done && (level == 8)) ||
+        (level > 8))
     {
       if (level == 5)
         level_5_done = true;
@@ -5456,6 +5468,9 @@ static inline void source_meta_copy(
           break;
         case 3:
           level_3_done = true;
+          break;
+        case 8:
+          level_8_size = level_size;
           break;
         case 9:
           level_9_done = true;
