@@ -2867,6 +2867,8 @@ static struct vframe_s *dv_vf[16][2];
 static void *metadata_parser;
 static bool metadata_parser_reset_flag;
 static char meta_buf[1024];
+static bool dv_provider_is_dvbldec = true;
+static bool dvel_provider_is_dveldec;
 
 static int dvel_receiver_event_fun(int type, void *data, void *arg)
 {
@@ -2876,6 +2878,7 @@ static int dvel_receiver_event_fun(int type, void *data, void *arg)
 
 	if (type == VFRAME_EVENT_PROVIDER_UNREG) {
 		pr_info("%s, provider %s unregistered\n", __func__, provider_name);
+		dvel_provider_is_dveldec = false;
 		spin_lock_irqsave(&dovi_lock, flags);
 		for (i = 0; i < 16; i++) {
 			if (dv_vf[i][0]) {
@@ -2899,6 +2902,8 @@ static int dvel_receiver_event_fun(int type, void *data, void *arg)
 		return RECEIVER_ACTIVE;
 	} else if (type == VFRAME_EVENT_PROVIDER_REG) {
 		pr_info("%s, provider %s registered\n", __func__, provider_name);
+		dvel_provider_is_dveldec =
+			provider_name && !strcmp(provider_name, "dveldec");
 		spin_lock_irqsave(&dovi_lock, flags);
 		for (i = 0; i < 16; i++)
 			dv_vf[i][0] = dv_vf[i][1] = NULL;
@@ -3371,6 +3376,7 @@ void dolby_vision_set_provider(char *prov_name)
 	if (prov_name && strlen(prov_name) < 32) {
 		if (strcmp(dv_provider, prov_name)) {
 			strcpy(dv_provider, prov_name);
+			dv_provider_is_dvbldec = !strcmp(prov_name, "dvbldec");
 			pr_dolby_dbg("provider changed to %s\n", dv_provider);
 		}
 	}
@@ -3401,7 +3407,7 @@ int is_dovi_frame(struct vframe_s *vf)
 	req.low_latency = 0;
 
 	if (vf->source_type == VFRAME_SOURCE_TYPE_OTHERS) {
-		if (!strcmp(dv_provider, "dvbldec"))
+		if (dv_provider_is_dvbldec)
 			vf_notify_provider_by_name
 				(dv_provider,
 				 VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
@@ -3449,7 +3455,7 @@ bool is_dovi_dual_layer_frame(struct vframe_s *vf)
 	req.dv_enhance_exist = 0;
 
 	if (vf->source_type == VFRAME_SOURCE_TYPE_OTHERS) {
-		if (!strcmp(dv_provider, "dvbldec"))
+		if (dv_provider_is_dvbldec)
 			vf_notify_provider_by_name(dv_provider,
 			 VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
 			 (void *)&req);
@@ -5554,8 +5560,6 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	unsigned long time_use = 0;
 	struct timeval start;
 	struct timeval end;
-	char *dvel_provider = NULL;
-
 	memset(&req, 0, (sizeof(struct provider_aux_req_s)));
 	memset(&el_req, 0, (sizeof(struct provider_aux_req_s)));
 
@@ -5654,7 +5658,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 			if (ret_flags && req.dv_enhance_exist) {
 
-				if (!strcmp(dv_provider, "dvbldec"))
+				if (dv_provider_is_dvbldec)
 					vf_notify_provider_by_name(
 						dv_provider,
 					 	VFRAME_EVENT_RECEIVER_DOLBY_BYPASS_EL,
@@ -5733,10 +5737,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 		/* check dvel decoder is active, if active, should */
 		/* get/put el data, otherwise, dvbl is stuck */
-		dvel_provider = vf_get_provider_name(DVEL_RECV_NAME);
-
 		if (req.dv_enhance_exist && toggle_mode == 1 &&
-		    dvel_provider && !strcmp(dvel_provider, "dveldec")) 
+		    dvel_provider_is_dveldec)
 		{
 			el_vf = dvel_vf_get();
 			if (el_vf && ((el_vf->pts_us64 == vf->pts_us64) ||
@@ -5755,7 +5757,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 					el_req.aux_buf = NULL;
 					el_req.aux_size = 0;
 
-					if (!strcmp(dv_provider, "dvbldec"))
+					if (dv_provider_is_dvbldec)
 						vf_notify_provider_by_name(
 						   "dveldec",
 						   VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
