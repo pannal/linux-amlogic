@@ -5389,12 +5389,20 @@ static inline size_t reverse_dv_meta(
 
 /* Build an L5 metadata block. Uses detected active area offsets when
  * detection is enabled and Kodi has written non-zero values, otherwise zeros. */
+/* Build an L5 metadata block. Uses detected active area offsets when
+ * detection is enabled and values are available, but respects the same
+ * OSD/subtitle gating as source L5 — detected L5 is suppressed when
+ * the OSD is active or subtitles are signaled, so the TV doesn't crop
+ * the OSD overlay. */
 static inline void build_level_5_data(unsigned char *dst)
 {
   dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x08;
   dst[4] = 0x05;
 
-  if (xbmc_detect_active_area &&
+  bool suppress = (xbmc_meta_level_5_osdst && dolby_vision_xbmc_osd) ||
+                  (xbmc_meta_level_5_subt && dolby_vision_subtitles);
+
+  if (!suppress && xbmc_detect_active_area &&
       (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
        xbmc_detected_l5_left || xbmc_detected_l5_right)) {
     dst[5]  = (xbmc_detected_l5_left >> 8) & 0xFF;
