@@ -449,6 +449,29 @@ static u16 xbmc_dv_hdr10_max_fall = 0;
 module_param(xbmc_dv_hdr10_max_fall, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_max_fall, "\n xbmc_dv_hdr10_max_fall\n");
 
+/* Active area detection: Kodi detects black borders via FFmpeg software
+ * decode and writes the detected offsets here. The kernel injects them
+ * as L5 metadata when the source L5 is absent or all-zero. */
+static bool xbmc_detect_active_area;
+module_param(xbmc_detect_active_area, bool, 0664);
+MODULE_PARM_DESC(xbmc_detect_active_area, "\n xbmc_detect_active_area\n");
+
+static u16 xbmc_detected_l5_top;
+module_param(xbmc_detected_l5_top, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_top, "\n xbmc_detected_l5_top\n");
+
+static u16 xbmc_detected_l5_bottom;
+module_param(xbmc_detected_l5_bottom, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_bottom, "\n xbmc_detected_l5_bottom\n");
+
+static u16 xbmc_detected_l5_left;
+module_param(xbmc_detected_l5_left, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_left, "\n xbmc_detected_l5_left\n");
+
+static u16 xbmc_detected_l5_right;
+module_param(xbmc_detected_l5_right, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_right, "\n xbmc_detected_l5_right\n");
+
 /*bit0:reset core1 reg; bit1:reset core2 reg;bit2:reset core3 reg*/
 /*bit3: reset core1 lut; bit4: reset core2 lut*/
 static unsigned int force_update_reg;
@@ -5364,6 +5387,40 @@ static inline size_t reverse_dv_meta(
   return byte_size;
 }
 
+/* Build an L5 metadata block. Uses detected active area offsets when
+ * detection is enabled and Kodi has written non-zero values, otherwise zeros. */
+static inline void build_level_5_data(unsigned char *dst)
+{
+  dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x08;
+  dst[4] = 0x05;
+
+  if (xbmc_detect_active_area &&
+      (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+       xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+    dst[5]  = (xbmc_detected_l5_left >> 8) & 0xFF;
+    dst[6]  = xbmc_detected_l5_left & 0xFF;
+    dst[7]  = (xbmc_detected_l5_right >> 8) & 0xFF;
+    dst[8]  = xbmc_detected_l5_right & 0xFF;
+    dst[9]  = (xbmc_detected_l5_top >> 8) & 0xFF;
+    dst[10] = xbmc_detected_l5_top & 0xFF;
+    dst[11] = (xbmc_detected_l5_bottom >> 8) & 0xFF;
+    dst[12] = xbmc_detected_l5_bottom & 0xFF;
+  } else {
+    memset(dst + 5, 0, 8);
+  }
+}
+
+/* Check if an L5 block in the metadata has all-zero offsets */
+static inline bool is_level_5_all_zero(const unsigned char *l5_block)
+{
+  int i;
+  for (i = 5; i < 13; i++) {
+    if (l5_block[i] != 0)
+      return false;
+  }
+  return true;
+}
+
 // replace core register format meta levels in core_meta with orig meta from source.
 static inline void source_meta_copy(
   unsigned char* orig_meta_buffer, 
@@ -5440,7 +5497,7 @@ static inline void source_meta_copy(
 
     if ((level > 5) && !level_5_done && level_1_done)
     {
-      memcpy(combo_index, LEVEL_5_DATA, LEVEL_5_LENGTH);
+      build_level_5_data(combo_index);
       combo_index += LEVEL_5_LENGTH;
       combo_meta_size += LEVEL_5_LENGTH;
       remaining_space -= LEVEL_5_LENGTH;
@@ -5460,8 +5517,22 @@ static inline void source_meta_copy(
         (!level_8_done && (level == 8)) ||
         (level > 8))
     {
-      if (level == 5)
+      if (level == 5) {
         level_5_done = true;
+        /* If source L5 is all-zero and we have detected values, substitute */
+        if (is_level_5_all_zero(orig_index) && xbmc_detect_active_area &&
+            (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+             xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+          build_level_5_data(combo_index);
+          combo_index += LEVEL_5_LENGTH;
+          combo_meta_size += LEVEL_5_LENGTH;
+          remaining_space -= LEVEL_5_LENGTH;
+          num_levels++;
+          orig_index += level_size;
+          remaining_input -= level_size;
+          continue;
+        }
+      }
       memcpy(combo_index, orig_index, level_size);
       combo_index += level_size;
       combo_meta_size += level_size;
@@ -5502,7 +5573,7 @@ static inline void source_meta_copy(
 
   if (!level_5_done && level_1_done)
   {
-    memcpy(combo_index, LEVEL_5_DATA, LEVEL_5_LENGTH);
+    build_level_5_data(combo_index);
     combo_index += LEVEL_5_LENGTH;
     combo_meta_size += LEVEL_5_LENGTH;
     num_levels++;
