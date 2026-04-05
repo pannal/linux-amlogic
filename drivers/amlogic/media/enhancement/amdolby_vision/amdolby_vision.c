@@ -7826,6 +7826,52 @@ static ssize_t amdolby_vision_debug_store
 	} else if (!strcmp(parm[0], "ko_info")) {
 		if (ko_info)
 			pr_info("ko info: %s\n", ko_info);
+	} else if (!strcmp(parm[0], "hw_dump")) {
+		int i;
+		u32 v;
+
+		pr_info("=== DV HW REGISTER DUMP ===\n");
+		pr_info("dolby_vision_on=%d core1_on=%d core1_on_cnt=%d\n",
+			dolby_vision_on, dolby_vision_core1_on,
+			dolby_vision_core1_on_cnt);
+		pr_info("dv_mode=%d target_mode=%d status=%d flags=0x%x\n",
+			dolby_vision_mode, dolby_vision_target_mode,
+			dolby_vision_status, dolby_vision_flags);
+		pr_info("frame_count=%d on_count=%d src_format=%d\n",
+			frame_count, dolby_vision_on_count,
+			dolby_vision_src_format);
+
+		/* Core3 DM registers (0x06-0x1f) — includes mute regs */
+		pr_info("--- Core3 DM regs (hw readback) ---\n");
+		for (i = 0; i < 26; i++) {
+			v = VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i);
+			pr_info("  core3_dm[%2d] (0x%04x) = 0x%08x%s\n",
+				i, 0x3606 + i, v,
+				is_core3_mute_reg(i) ? " [MUTE]" : "");
+		}
+		/* Core3 control regs */
+		pr_info("  core3_ctrl+1 = 0x%08x (output mode)\n",
+			VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 1));
+		pr_info("  core3_ctrl+2 = 0x%08x\n",
+			VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 2));
+
+		/* VPP path and clip regs */
+		pr_info("--- VPP / path regs ---\n");
+		pr_info("  DOLBY_PATH_CTRL   = 0x%08x\n",
+			VSYNC_RD_DV_REG(DOLBY_PATH_CTRL));
+		pr_info("  VIU_MISC_CTRL1    = 0x%08x\n",
+			VSYNC_RD_DV_REG(VIU_MISC_CTRL1));
+		pr_info("  VPP_DOLBY_CTRL    = 0x%08x\n",
+			VSYNC_RD_DV_REG(VPP_DOLBY_CTRL));
+		pr_info("  VPP_CLIP_MISC0    = 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_CLIP_MISC0));
+		pr_info("  VPP_CLIP_MISC1    = 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_CLIP_MISC1));
+		pr_info("  VPP_VD1_CLIP_MISC0= 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_VD1_CLIP_MISC0));
+		pr_info("  VPP_VD1_CLIP_MISC1= 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_VD1_CLIP_MISC1));
+		pr_info("=== END HW DUMP ===\n");
 	} else {
 		pr_info("unsupport cmd\n");
 	}
