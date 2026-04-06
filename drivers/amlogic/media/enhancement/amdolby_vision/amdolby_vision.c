@@ -44,6 +44,7 @@
 #include <linux/amlogic/media/amdolbyvision/dolby_vision.h>
 #include <linux/cma.h>
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
+#include <linux/amlogic/media/codec_mm/codec_mm_scatter.h>
 #include <linux/amlogic/media/vpu/vpu.h>
 #include <linux/dma-contiguous.h>
 #include <linux/amlogic/iomap.h>
@@ -6725,6 +6726,102 @@ int dolby_vision_wait_metadata(struct vframe_s *vf)
 	return ret;
 }
 
+/* Debug: dump vframe memory layout for AFBC PoC. Write 1 to trigger. */
+static bool xbmc_afbc_dump;
+module_param(xbmc_afbc_dump, bool, 0664);
+MODULE_PARM_DESC(xbmc_afbc_dump, "\n xbmc_afbc_dump\n");
+
+static void afbc_dump_frame(struct vframe_s *vf)
+{
+	u32 w, h;
+
+	if (!vf)
+		return;
+
+	w = (vf->type & VIDTYPE_COMPRESS) ? vf->compWidth : vf->width;
+	h = (vf->type & VIDTYPE_COMPRESS) ? vf->compHeight : vf->height;
+
+	pr_info("AFBC dump: type=0x%x %ux%u bitdepth=0x%x\n",
+		vf->type, w, h, vf->bitdepth);
+	pr_info("AFBC dump: compHead=0x%x compBody=0x%x\n",
+		vf->compHeadAddr, vf->compBodyAddr);
+	pr_info("AFBC dump: dwHead=0x%x dwBody=0x%x\n",
+		vf->dwHeadAddr, vf->dwBodyAddr);
+	pr_info("AFBC dump: mem_handle=%p mem_head_handle=%p mem_dw_handle=%p\n",
+		vf->mem_handle, vf->mem_head_handle, vf->mem_dw_handle);
+	pr_info("AFBC dump: v4l_mem_handle=0x%lx\n", vf->v4l_mem_handle);
+	pr_info("AFBC dump: canvas0Addr=0x%x canvas1Addr=0x%x\n",
+		vf->canvas0Addr, vf->canvas1Addr);
+	pr_info("AFBC dump: canvas0_config[0] phy=0x%x w=%u h=%u blk=%u\n",
+		vf->canvas0_config[0].phy_addr,
+		vf->canvas0_config[0].width,
+		vf->canvas0_config[0].height,
+		vf->canvas0_config[0].block_mode);
+	pr_info("AFBC dump: canvas0_config[1] phy=0x%x w=%u h=%u blk=%u\n",
+		vf->canvas0_config[1].phy_addr,
+		vf->canvas0_config[1].width,
+		vf->canvas0_config[1].height,
+		vf->canvas0_config[1].block_mode);
+	pr_info("AFBC dump: canvas1_config[0] phy=0x%x w=%u h=%u blk=%u\n",
+		vf->canvas1_config[0].phy_addr,
+		vf->canvas1_config[0].width,
+		vf->canvas1_config[0].height,
+		vf->canvas1_config[0].block_mode);
+
+	/* For SCATTER frames, mem_head_handle is a struct codec_mm_scatter *
+	 * containing an array of physical page addresses for the AFBC header. */
+	if (vf->mem_head_handle && (vf->type & VIDTYPE_SCATTER)) {
+		struct codec_mm_scatter *sc = (struct codec_mm_scatter *)vf->mem_head_handle;
+		pr_info("AFBC dump: head scatter pages=%d max=%d used=%d\n",
+			sc->page_cnt, sc->page_max_cnt, sc->page_used);
+		if (sc->pages_list && sc->page_cnt > 0) {
+			pr_info("AFBC dump: head page[0]=0x%x page[1]=0x%x\n",
+				(u32)sc->pages_list[0],
+				sc->page_cnt > 1 ? (u32)sc->pages_list[1] : 0);
+			/* Map first page of header and read superblock offsets */
+			u8 *hdr = codec_mm_vmap(sc->pages_list[0], PAGE_SIZE);
+			if (hdr) {
+				u32 *offsets = (u32 *)hdr;
+				pr_info("AFBC dump: header page[0] first 8 words: "
+					"0x%08x 0x%08x 0x%08x 0x%08x "
+					"0x%08x 0x%08x 0x%08x 0x%08x\n",
+					offsets[0], offsets[1], offsets[2], offsets[3],
+					offsets[4], offsets[5], offsets[6], offsets[7]);
+				codec_mm_unmap_phyaddr(hdr);
+			} else {
+				pr_info("AFBC dump: failed to map head page[0]\n");
+			}
+		}
+	}
+
+	if (vf->mem_handle && (vf->type & VIDTYPE_SCATTER)) {
+		struct codec_mm_scatter *sc = (struct codec_mm_scatter *)vf->mem_handle;
+		pr_info("AFBC dump: body scatter pages=%d max=%d used=%d\n",
+			sc->page_cnt, sc->page_max_cnt, sc->page_used);
+		if (sc->pages_list && sc->page_cnt > 0) {
+			pr_info("AFBC dump: body page[0]=0x%x page[1]=0x%x\n",
+				(u32)sc->pages_list[0],
+				sc->page_cnt > 1 ? (u32)sc->pages_list[1] : 0);
+			/* Map first page of body and read first bytes */
+			u8 *body = codec_mm_vmap(sc->pages_list[0], PAGE_SIZE);
+			if (body) {
+				pr_info("AFBC dump: body page[0] first 16 bytes: "
+					"%02x %02x %02x %02x %02x %02x %02x %02x "
+					"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+					body[0], body[1], body[2], body[3],
+					body[4], body[5], body[6], body[7],
+					body[8], body[9], body[10], body[11],
+					body[12], body[13], body[14], body[15]);
+				codec_mm_unmap_phyaddr(body);
+			} else {
+				pr_info("AFBC dump: failed to map body page[0]\n");
+			}
+		}
+	}
+
+	xbmc_afbc_dump = false;
+}
+
 int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 {
 	int ret = -1;
@@ -6739,6 +6836,9 @@ int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 	if (vf && dolby_vision_vf_check(vf)) {
 		ret = dolby_vision_parse_metadata(vf, 1, false, drop_flag);
 		frame_count++;
+
+		if (xbmc_afbc_dump)
+			afbc_dump_frame(vf);
 	}
 
 	return ret;
