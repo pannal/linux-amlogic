@@ -6725,6 +6725,71 @@ int dolby_vision_wait_metadata(struct vframe_s *vf)
 	return ret;
 }
 
+/* Debug: dump AFBC header bytes from next frame. Write 1 to trigger. */
+static bool xbmc_afbc_dump;
+module_param(xbmc_afbc_dump, bool, 0664);
+MODULE_PARM_DESC(xbmc_afbc_dump, "\n xbmc_afbc_dump\n");
+
+static void afbc_dump_header(struct vframe_s *vf)
+{
+	u8 *hdr;
+	u32 head_size;
+	u32 sb_w, sb_h, sb_count;
+	int i;
+
+	if (!vf || !(vf->type & VIDTYPE_COMPRESS))
+		return;
+
+	u32 w = vf->compWidth;
+	u32 h = vf->compHeight;
+
+	/* Superblocks: 32x8 for AFBC v2 (G12), 16x16 for v1 */
+	sb_w = (w + 31) / 32;
+	sb_h = (h + 7) / 8;
+	sb_count = sb_w * sb_h;
+	head_size = sb_count * 4; /* 4 bytes per superblock header entry */
+
+	pr_info("AFBC dump: type=0x%x %ux%u compHead=0x%x compBody=0x%x\n",
+		vf->type, w, h, vf->compHeadAddr, vf->compBodyAddr);
+	pr_info("AFBC dump: canvas0_config[0] phy=0x%x w=%u h=%u blk=%u\n",
+		vf->canvas0_config[0].phy_addr,
+		vf->canvas0_config[0].width,
+		vf->canvas0_config[0].height,
+		vf->canvas0_config[0].block_mode);
+	pr_info("AFBC dump: superblocks %ux%u = %u, header size %u bytes\n",
+		sb_w, sb_h, sb_count, head_size);
+
+	if (!vf->compHeadAddr)
+		return;
+
+	hdr = codec_mm_vmap(vf->compHeadAddr, min(head_size, (u32)256));
+	if (!hdr) {
+		pr_info("AFBC dump: failed to map compHeadAddr\n");
+		return;
+	}
+
+	pr_info("AFBC header (first 64 bytes):\n");
+	for (i = 0; i < 64 && i < head_size; i += 16)
+		pr_info("  %02x %02x %02x %02x %02x %02x %02x %02x  "
+			"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+			hdr[i+0], hdr[i+1], hdr[i+2], hdr[i+3],
+			hdr[i+4], hdr[i+5], hdr[i+6], hdr[i+7],
+			hdr[i+8], hdr[i+9], hdr[i+10], hdr[i+11],
+			hdr[i+12], hdr[i+13], hdr[i+14], hdr[i+15]);
+
+	/* Interpret as 32-bit body offsets (ARM AFBC v1/v2 spec) */
+	{
+		u32 *offsets = (u32 *)hdr;
+		pr_info("AFBC first 8 superblock body offsets:\n");
+		for (i = 0; i < 8 && i < sb_count; i++)
+			pr_info("  sb[%d]: offset=0x%08x (%u bytes)\n",
+				i, le32_to_cpu(offsets[i]), le32_to_cpu(offsets[i]));
+	}
+
+	codec_mm_unmap_phyaddr(hdr);
+	xbmc_afbc_dump = false;
+}
+
 int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 {
 	int ret = -1;
@@ -6739,6 +6804,9 @@ int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 	if (vf && dolby_vision_vf_check(vf)) {
 		ret = dolby_vision_parse_metadata(vf, 1, false, drop_flag);
 		frame_count++;
+
+		if (xbmc_afbc_dump)
+			afbc_dump_header(vf);
 	}
 
 	return ret;
