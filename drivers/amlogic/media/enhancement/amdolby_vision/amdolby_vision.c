@@ -336,9 +336,16 @@ static bool xbmc_meta_level_5 = false;
 module_param(xbmc_meta_level_5, bool, 0664);
 MODULE_PARM_DESC(xbmc_meta_level_5, "\n xbmc_meta_level_5\n");
 
+// "osdst" originally gated both OSD and subtitles, now OSD only.
+// Name kept for sysfs compatibility. Subtitle gating moved to subt.
 static bool xbmc_meta_level_5_osdst = false;
 module_param(xbmc_meta_level_5_osdst, bool, 0664);
 MODULE_PARM_DESC(xbmc_meta_level_5_osdst, "\n xbmc_meta_level_5_osdst\n");
+
+// Subtitle L5 gating, independent of OSD (split from osdst)
+static bool xbmc_meta_level_5_subt = false;
+module_param(xbmc_meta_level_5_subt, bool, 0664);
+MODULE_PARM_DESC(xbmc_meta_level_5_subt, "\n xbmc_meta_level_5_subt\n");
 
 // 0 (integer value for false) - subtitles OFF
 // 1 (integer value for true) - subtitles ON
@@ -375,6 +382,16 @@ MODULE_PARM_DESC(xbmc_dv_vp, "\n xbmc_dv_vp\n");
 bool xbmc_aml_linux_force_422; // extern
 module_param(xbmc_aml_linux_force_422, bool, 0664);
 MODULE_PARM_DESC(xbmc_aml_linux_force_422, "\n xbmc_aml_linux_force_422\n");
+
+/* Keep 12-bit precision through VPP and enable HDMI TX dithering
+ * during DV to reduce banding in color gradients. */
+static bool xbmc_dv_dither;
+module_param(xbmc_dv_dither, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_dither, "\n xbmc_dv_dither\n");
+
+bool xbmc_dv_non_ipt; // extern
+module_param(xbmc_dv_non_ipt, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_non_ipt, "\n xbmc_dv_non_ipt\n");
 
 static bool xbmc_dv_hdr10_for_dv_ll = false;
 module_param(xbmc_dv_hdr10_for_dv_ll, bool, 0664);
@@ -431,6 +448,29 @@ MODULE_PARM_DESC(xbmc_dv_hdr10_max_cll, "\n xbmc_dv_hdr10_max_cll\n");
 static u16 xbmc_dv_hdr10_max_fall = 0;
 module_param(xbmc_dv_hdr10_max_fall, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_max_fall, "\n xbmc_dv_hdr10_max_fall\n");
+
+/* Active area detection: Kodi detects black borders via FFmpeg software
+ * decode and writes the detected offsets here. The kernel injects them
+ * as L5 metadata when the source L5 is absent or all-zero. */
+static bool xbmc_detect_active_area;
+module_param(xbmc_detect_active_area, bool, 0664);
+MODULE_PARM_DESC(xbmc_detect_active_area, "\n xbmc_detect_active_area\n");
+
+static u16 xbmc_detected_l5_top;
+module_param(xbmc_detected_l5_top, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_top, "\n xbmc_detected_l5_top\n");
+
+static u16 xbmc_detected_l5_bottom;
+module_param(xbmc_detected_l5_bottom, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_bottom, "\n xbmc_detected_l5_bottom\n");
+
+static u16 xbmc_detected_l5_left;
+module_param(xbmc_detected_l5_left, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_left, "\n xbmc_detected_l5_left\n");
+
+static u16 xbmc_detected_l5_right;
+module_param(xbmc_detected_l5_right, ushort, 0664);
+MODULE_PARM_DESC(xbmc_detected_l5_right, "\n xbmc_detected_l5_right\n");
 
 /*bit0:reset core1 reg; bit1:reset core2 reg;bit2:reset core3 reg*/
 /*bit3: reset core1 lut; bit4: reset core2 lut*/
@@ -1433,7 +1473,10 @@ static int dolby_core1_set
   if (dolby_vision_flags & FLAG_BYPASS_CVM) bypass_flag |= 1 << 2;
   if (need_skip_cvm(0)) bypass_flag |= 1 << 2;
   if (el_41_mode) bypass_flag |= 1 << 3;
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 2) bypass_flag |= 1 << 1; /* VP: bypass CSC */
+  /* VP: bypass CSC at TM>2, but keep CSC active at TM>3 — Core3 mode 0x02
+   * needs proper IPT input for the OSD color fix (g_2_l degamma).
+   * CVM bypass is always active at TM>1 (skips tone mapping LUTs). */
+  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 2 && xbmc_dv_vp_tm <= 3) bypass_flag |= 1 << 1;
   if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 1) bypass_flag |= 1 << 2; /* VP: bypass CVM */
 
   VSYNC_WR_DV_REG(DOLBY_CORE1_REG_START + 1, 0x70 | bypass_flag); /* bypass CVM and/or CSC */
@@ -1573,6 +1616,49 @@ static int dolby_core1_set
   return 0;
 }
 
+/* SDR gamma 2.2 -> linear light, scaled to match the DV library's
+ * g_2_l output range (max = 103,813,904).  Core3 mode 0x02 then
+ * applies OETF (linear→PQ) and POST matrix (RGB→YCbCr).
+ * The library's own g_2_l is a DV-specific tone-map curve that
+ * produces pink OSD on non-DV displays; this replaces it with a
+ * straightforward gamma 2.2 degamma so the standard pipeline
+ * converts SDR OSD to correct HDR10 output.
+ * Values: round((i/255)^2.2 * 103813904) for i=0..255. */
+static const u32 sdr_degamma[256] = {
+	         0,        527,       2422,       5909,      11128,      18180,      27152,      38114,
+	     51129,      66252,      83535,     103022,     124757,     148779,     175125,     203830,
+	    234926,     268445,     304415,     342866,     383825,     427316,     473366,     521997,
+	    573234,     627098,     683610,     742792,     804664,     869246,     936556,    1006614,
+	   1079436,    1155042,    1233448,    1314670,    1398726,    1485631,    1575401,    1668051,
+	   1763596,    1862051,    1963431,    2067749,    2175019,    2285255,    2398470,    2514678,
+	   2633891,    2756122,    2881384,    3009688,    3141047,    3275473,    3412977,    3553571,
+	   3697267,    3844075,    3994006,    4147072,    4303283,    4462649,    4625182,    4790891,
+	   4959787,    5131880,    5307180,    5485695,    5667437,    5852415,    6040638,    6232116,
+	   6426857,    6624871,    6826167,    7030754,    7238641,    7449836,    7664349,    7882187,
+	   8103359,    8327874,    8555740,    8786966,    9021558,    9259526,    9500878,    9745620,
+	   9993762,   10245311,   10500274,   10758660,   11020476,   11285729,   11554427,   11826577,
+	  12102186,   12381263,   12663813,   12949845,   13239364,   13532379,   13828896,   14128922,
+	  14432464,   14739528,   15050122,   15364253,   15681926,   16003148,   16327926,   16656267,
+	  16988177,   17323662,   17662729,   18005383,   18351632,   18701482,   19054938,   19412007,
+	  19772695,   20137008,   20504952,   20876533,   21251757,   21630629,   22013157,   22399345,
+	  22789199,   23182725,   23579929,   23980817,   24385394,   24793665,   25205637,   25621315,
+	  26040704,   26463810,   26890639,   27321195,   27755484,   28193512,   28635283,   29080804,
+	  29530079,   29983114,   30439913,   30900483,   31364827,   31832952,   32304862,   32780563,
+	  33260059,   33743356,   34230458,   34721371,   35216099,   35714647,   36217020,   36723224,
+	  37233262,   37747140,   38264863,   38786434,   39311860,   39841144,   40374292,   40911308,
+	  41452196,   41996962,   42545610,   43098144,   43654569,   44214890,   44779112,   45347237,
+	  45919272,   46495221,   47075087,   47658876,   48246592,   48838238,   49433821,   50033343,
+	  50636810,   51244225,   51855593,   52470918,   53090204,   53713456,   54340677,   54971873,
+	  55607047,   56246203,   56889345,   57536478,   58187605,   58842731,   59501860,   60164996,
+	  60832143,   61503305,   62178485,   62857689,   63540919,   64228181,   64919477,   65614812,
+	  66314189,   67017613,   67725087,   68436616,   69152203,   69871852,   70595567,   71323351,
+	  72055208,   72791143,   73531159,   74275260,   75023449,   75775730,   76532107,   77292584,
+	  78057164,   78825851,   79598648,   80375560,   81156590,   81941741,   82731017,   83524423,
+	  84321960,   85123633,   85929446,   86739402,   87553504,   88371757,   89194162,   90020725,
+	  90851449,   91686337,   92525392,   93368617,   94216018,   95067596,   95923355,   96783299,
+	  97647432,   98515755,   99388273,  100264990,  101145908,  102031030,  102920361,  103813904,
+};
+
 static int dolby_core2_set
   (u32 *p_core2_dm_regs,
    u32 *p_core2_lut,
@@ -1688,6 +1774,27 @@ static int dolby_core2_set
     if (is_meson_gxm() && (dolby_vision_flags & FLAG_CLKGATE_WHEN_LOAD_LUT))
       VSYNC_WR_DV_REG_BITS(DOLBY_CORE2A_CLKGATE_CTRL, 2, 2, 2);
 
+    if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
+      /* VP: Replace the library's DV tone-map g_2_l with standard
+       * gamma 2.2 → linear degamma.  The library's curve causes pink
+       * OSD on non-DV displays.  sdr_degamma is pre-scaled to the
+       * library's 103.8M output range so a2b/c2d/Core3 work unchanged.
+       * Core3 mode 0x02 OETF then applies linear→PQ correctly.
+       *
+       * Match the library's OSD brightness: read the library's g_2_l
+       * peak (entry 255) before overriding — it already reflects the
+       * current graphic_max/target_max configuration.  Scale our
+       * gamma 2.2 curve to that same peak so VP brightness tracks
+       * the DV OSD Brightness slider consistently with Player-led. */
+      u32 lib_peak = p_core2_lut[1024 + 255];
+      int j;
+      if (lib_peak == 0)
+        lib_peak = sdr_degamma[255];
+      for (j = 0; j < 256; j++)
+        p_core2_lut[1024 + j] =
+          (u32)((u64)sdr_degamma[j] * lib_peak / sdr_degamma[255]);
+    }
+
     VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_CTRL, 0x1401);
 
     for (i = 0; i < (256 * 5); i += 4) {
@@ -1707,6 +1814,7 @@ static int dolby_core2_set
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
+
   return 0;
 }
 
@@ -1779,7 +1887,9 @@ static int dolby_core3_set
     if (is_meson_box() || is_meson_tm2_stbmode() || is_meson_sc2()) {
 
       if ((new_dovi_setting.dovi_ll_enable && new_dovi_setting.diagnostic_enable == 0) ||
-          cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) {
+          cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10 ||
+          cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_SDR10 ||
+          cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_SDR8) {
         VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 3, 6, 2); /* post matrix */
         VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL, 1, 0, 1); /* post matrix */
       } else {
@@ -1815,10 +1925,12 @@ static int dolby_core3_set
     reset_post_table = true;
   }
 
-  /* flush post matrix table when ll mode or HDR10 output mode and setting changed */
-  /* Core3 HDR10 mode outputs RGB, needs POST matrix for RGB->YUV conversion */
+  /* flush post matrix table when ll mode or HDR10/SDR output mode and setting changed */
+  /* Core3 HDR10/SDR modes output RGB, needs POST matrix for RGB->YUV conversion */
   if ((new_dovi_setting.dovi_ll_enable ||
-       cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10) &&
+       cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10 ||
+       cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_SDR10 ||
+       cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_SDR8) &&
       new_dovi_setting.diagnostic_enable == 0 &&
       dolby_vision_on && (reset_post_table || reset || memcmp(&p_core3_dm_regs[18], &last_dm[18], 32)))
     enable_rgb_to_yuv_matrix_for_dvll(1, &p_core3_dm_regs[18], 12);
@@ -1853,14 +1965,8 @@ static int dolby_core3_set
   /*   02- HDR10 output, RGB 10 bit 444 PQ*/
   /*   03- Deep color SDR, RGB 10 bit 444 Gamma*/
   /*   04- SDR, RGB 8 bit 444 Gamma*/
-  if (xbmc_dv_vp != 0 && xbmc_dv_vp_tm > 3) {
-    /* VP: force IPT 12-bit 444 bypass */
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, 0x00);
-  } else {
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
-    VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
-  }
+  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
+  VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 1, cur_dv_mode);
 
   /* for delay */
 
@@ -2418,8 +2524,19 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
 				} else {
 					if (dolby_vision_flags & FLAG_BYPASS_VPP) video_effect_bypass(1);
-					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x20002000);	// 12->10 before vadj1 10->12 before post blend
-					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
+					if (xbmc_dv_dither) {
+						/* Preserve 12-bit precision through VPP to
+						 * reduce banding in color gradients.  The
+						 * final 12→10 conversion happens at the
+						 * HDMI TX with dithering instead of plain
+						 * truncation in the VPP. */
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x08000800);	// u12↔s12 (preserve 12-bit)
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x08000800);	// u12↔s12 (preserve 12-bit)
+						VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 0, 12, 1);	// disable VPP 12→10 truncation
+					} else {
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x20002000);	// 12->10 before vadj1 10->12 before post blend
+						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
+					}
 				}
 
 				VSYNC_WR_DV_REG(VPP_MATRIX_CTRL, 0);
@@ -2433,9 +2550,13 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 1, 2);	// enable wm tp vks - bypass gainoff to vks
 					enable_rgb_to_yuv_matrix_for_dvll(1, &reg[18], (dv_ll_output_mode >> 8) & 0xff);
 				} else if (dolby_vision_mode ==
-					   DOLBY_VISION_OUTPUT_MODE_HDR10) {
+					   DOLBY_VISION_OUTPUT_MODE_HDR10 ||
+					   dolby_vision_mode ==
+					   DOLBY_VISION_OUTPUT_MODE_SDR10 ||
+					   dolby_vision_mode ==
+					   DOLBY_VISION_OUTPUT_MODE_SDR8) {
 					u32 *reg = (u32 *)&dovi_setting.dm_reg3;
-					/* Core3 HDR10 outputs RGB, needs POST matrix */
+					/* Core3 HDR10/SDR outputs RGB, needs POST matrix */
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL,
 						3, 6, 2); /* post matrix */
 					VSYNC_WR_DV_REG_BITS(VPP_MATRIX_CTRL,
@@ -2445,6 +2566,11 @@ void enable_dolby_vision(int enable)
 				} else {
 					enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
 				}
+
+				if (xbmc_dv_dither &&
+				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
+				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT)
+					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 1, 4, 1);
 
 				last_dolby_vision_ll_policy = dolby_vision_ll_policy;
 				pr_dolby_dbg("Dolby Vision G12a turn on%s\n", dolby_vision_core1_on ? ", core1 on" : "");
@@ -2503,7 +2629,11 @@ void enable_dolby_vision(int enable)
 			if (is_meson_box() || is_meson_tm2_stbmode() ||
 			    is_meson_sc2()) {
 				if (dvll || dolby_vision_mode ==
-				    DOLBY_VISION_OUTPUT_MODE_HDR10) {
+				    DOLBY_VISION_OUTPUT_MODE_HDR10 ||
+				    dolby_vision_mode ==
+				    DOLBY_VISION_OUTPUT_MODE_SDR10 ||
+				    dolby_vision_mode ==
+				    DOLBY_VISION_OUTPUT_MODE_SDR8) {
 					VSYNC_WR_DV_REG_BITS(
 						VPP_DOLBY_CTRL,
 						3, 6, 2); /* post matrix */
@@ -2617,6 +2747,11 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(DOLBY_TV_CLKGATE_CTRL, 0x55555555);
 					hdr_vd1_off(); // hdr core
 					dv_mem_power_off(VPU_DOLBY0);
+				}
+
+				if (xbmc_dv_dither) {
+					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 12, 1);
+					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 0, 4, 1);
 				}
 
 				pr_dolby_dbg("Dolby Vision G12a turn off\n");
@@ -2755,6 +2890,8 @@ static struct vframe_s *dv_vf[16][2];
 static void *metadata_parser;
 static bool metadata_parser_reset_flag;
 static char meta_buf[1024];
+static bool dv_provider_is_dvbldec = true;
+static bool dvel_provider_is_dveldec;
 
 static int dvel_receiver_event_fun(int type, void *data, void *arg)
 {
@@ -2764,6 +2901,7 @@ static int dvel_receiver_event_fun(int type, void *data, void *arg)
 
 	if (type == VFRAME_EVENT_PROVIDER_UNREG) {
 		pr_info("%s, provider %s unregistered\n", __func__, provider_name);
+		dvel_provider_is_dveldec = false;
 		spin_lock_irqsave(&dovi_lock, flags);
 		for (i = 0; i < 16; i++) {
 			if (dv_vf[i][0]) {
@@ -2787,6 +2925,8 @@ static int dvel_receiver_event_fun(int type, void *data, void *arg)
 		return RECEIVER_ACTIVE;
 	} else if (type == VFRAME_EVENT_PROVIDER_REG) {
 		pr_info("%s, provider %s registered\n", __func__, provider_name);
+		dvel_provider_is_dveldec =
+			provider_name && !strcmp(provider_name, "dveldec");
 		spin_lock_irqsave(&dovi_lock, flags);
 		for (i = 0; i < 16; i++)
 			dv_vf[i][0] = dv_vf[i][1] = NULL;
@@ -3259,6 +3399,7 @@ void dolby_vision_set_provider(char *prov_name)
 	if (prov_name && strlen(prov_name) < 32) {
 		if (strcmp(dv_provider, prov_name)) {
 			strcpy(dv_provider, prov_name);
+			dv_provider_is_dvbldec = !strcmp(prov_name, "dvbldec");
 			pr_dolby_dbg("provider changed to %s\n", dv_provider);
 		}
 	}
@@ -3289,7 +3430,7 @@ int is_dovi_frame(struct vframe_s *vf)
 	req.low_latency = 0;
 
 	if (vf->source_type == VFRAME_SOURCE_TYPE_OTHERS) {
-		if (!strcmp(dv_provider, "dvbldec"))
+		if (dv_provider_is_dvbldec)
 			vf_notify_provider_by_name
 				(dv_provider,
 				 VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
@@ -3337,7 +3478,7 @@ bool is_dovi_dual_layer_frame(struct vframe_s *vf)
 	req.dv_enhance_exist = 0;
 
 	if (vf->source_type == VFRAME_SOURCE_TYPE_OTHERS) {
-		if (!strcmp(dv_provider, "dvbldec"))
+		if (dv_provider_is_dvbldec)
 			vf_notify_provider_by_name(dv_provider,
 			 VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
 			 (void *)&req);
@@ -4069,6 +4210,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 	u32 max_lum = 1000 * 10000;
 	u32 min_lum = 50;
 	int primaries_type = 0;
+	u32 max_lum_alt = 9997 * 10000;
 
 	if (get_primary_policy() == PRIMARIES_NATIVE ||
 		primary_debug == 1 ||
@@ -4117,7 +4259,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 		    p_hdr10_param->w_x != p_mdc->white_point[0] ||
 		    p_hdr10_param->w_y != p_mdc->white_point[1]) {
 			flag |= 1;
-			p_hdr10_param->max_display_mastering_lum = p_mdc->luminance[0];
+			p_hdr10_param->max_display_mastering_lum = (p_mdc->luminance[0] > max_lum_alt) ? max_lum_alt : p_mdc->luminance[0];
 			p_hdr10_param->min_display_mastering_lum = p_mdc->luminance[1];
 			p_hdr10_param->r_x = p_mdc->primaries[2][0];
 			p_hdr10_param->r_y = p_mdc->primaries[2][1];
@@ -4141,7 +4283,7 @@ void prepare_hdr10_param(struct vframe_master_display_colour_s *p_mdc,
 		    p_hdr10_param->w_x != p_mdc->white_point[0] ||
 		    p_hdr10_param->w_y != p_mdc->white_point[1]) {
 			flag |= 1;
-			p_hdr10_param->max_display_mastering_lum = p_mdc->luminance[0];
+			p_hdr10_param->max_display_mastering_lum = (p_mdc->luminance[0] > max_lum_alt) ? max_lum_alt : p_mdc->luminance[0];
 			p_hdr10_param->min_display_mastering_lum = p_mdc->luminance[1];
 			p_hdr10_param->r_x = p_mdc->primaries[0][0];
 			p_hdr10_param->r_y = p_mdc->primaries[0][1];
@@ -5245,6 +5387,48 @@ static inline size_t reverse_dv_meta(
   return byte_size;
 }
 
+/* Build an L5 metadata block. Uses detected active area offsets when
+ * detection is enabled and Kodi has written non-zero values, otherwise zeros. */
+/* Build an L5 metadata block. Uses detected active area offsets when
+ * detection is enabled and values are available, but respects the same
+ * OSD/subtitle gating as source L5 — detected L5 is suppressed when
+ * the OSD is active or subtitles are signaled, so the TV doesn't crop
+ * the OSD overlay. */
+static inline void build_level_5_data(unsigned char *dst)
+{
+  dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x08;
+  dst[4] = 0x05;
+
+  bool suppress = (xbmc_meta_level_5_osdst && dolby_vision_xbmc_osd) ||
+                  (xbmc_meta_level_5_subt && dolby_vision_subtitles);
+
+  if (!suppress && xbmc_detect_active_area &&
+      (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+       xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+    dst[5]  = (xbmc_detected_l5_left >> 8) & 0xFF;
+    dst[6]  = xbmc_detected_l5_left & 0xFF;
+    dst[7]  = (xbmc_detected_l5_right >> 8) & 0xFF;
+    dst[8]  = xbmc_detected_l5_right & 0xFF;
+    dst[9]  = (xbmc_detected_l5_top >> 8) & 0xFF;
+    dst[10] = xbmc_detected_l5_top & 0xFF;
+    dst[11] = (xbmc_detected_l5_bottom >> 8) & 0xFF;
+    dst[12] = xbmc_detected_l5_bottom & 0xFF;
+  } else {
+    memset(dst + 5, 0, 8);
+  }
+}
+
+/* Check if an L5 block in the metadata has all-zero offsets */
+static inline bool is_level_5_all_zero(const unsigned char *l5_block)
+{
+  int i;
+  for (i = 5; i < 13; i++) {
+    if (l5_block[i] != 0)
+      return false;
+  }
+  return true;
+}
+
 // replace core register format meta levels in core_meta with orig meta from source.
 static inline void source_meta_copy(
   unsigned char* orig_meta_buffer, 
@@ -5294,11 +5478,15 @@ static inline void source_meta_copy(
   bool level_1_done = false;
   bool level_3_done = false;
   bool level_5_done = false;
+  bool level_8_done = false;
+  size_t level_8_size = 0;
   bool level_9_done = false;
   bool level_11_done = false;
   bool level_254_done = false;
   bool convert_to_hdr10plus = false;
-  bool allow_level_5_source = (xbmc_meta_level_5 && !(xbmc_meta_level_5_osdst && (dolby_vision_xbmc_osd || dolby_vision_subtitles)));
+  bool allow_level_5_source = (xbmc_meta_level_5
+      && !(xbmc_meta_level_5_osdst && dolby_vision_xbmc_osd)
+      && !(xbmc_meta_level_5_subt && dolby_vision_subtitles));
 
   while ((orig_index < orig_end_index) &&
          (remaining_input >= 5) &&
@@ -5317,7 +5505,7 @@ static inline void source_meta_copy(
 
     if ((level > 5) && !level_5_done && level_1_done)
     {
-      memcpy(combo_index, LEVEL_5_DATA, LEVEL_5_LENGTH);
+      build_level_5_data(combo_index);
       combo_index += LEVEL_5_LENGTH;
       combo_meta_size += LEVEL_5_LENGTH;
       remaining_space -= LEVEL_5_LENGTH;
@@ -5325,10 +5513,34 @@ static inline void source_meta_copy(
       level_5_done = true;
     }
 
-    if ((level != 5 || (level == 5 && allow_level_5_source)) && level != 6)
+    /* Skip L8 blocks whose size differs from the first L8 seen —
+     * variable-length L8 sequences corrupt some TV DV parsers,
+     * causing screen blackout (e.g. Super Mario Bros Movie 2023,
+     * Marty Supreme). */
+    level_8_done = (level == 8) && (level_8_size != 0) && (level_8_size != level_size);
+
+    if (((level >= 1) && (level <= 4)) ||
+        (allow_level_5_source && (level == 5)) ||
+        (level == 7) ||
+        (!level_8_done && (level == 8)) ||
+        (level > 8))
     {
-      if (level == 5)
+      if (level == 5) {
         level_5_done = true;
+        /* If source L5 is all-zero and we have detected values, substitute */
+        if (is_level_5_all_zero(orig_index) && xbmc_detect_active_area &&
+            (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+             xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+          build_level_5_data(combo_index);
+          combo_index += LEVEL_5_LENGTH;
+          combo_meta_size += LEVEL_5_LENGTH;
+          remaining_space -= LEVEL_5_LENGTH;
+          num_levels++;
+          orig_index += level_size;
+          remaining_input -= level_size;
+          continue;
+        }
+      }
       memcpy(combo_index, orig_index, level_size);
       combo_index += level_size;
       combo_meta_size += level_size;
@@ -5341,6 +5553,9 @@ static inline void source_meta_copy(
           break;
         case 3:
           level_3_done = true;
+          break;
+        case 8:
+          level_8_size = level_size;
           break;
         case 9:
           level_9_done = true;
@@ -5360,45 +5575,15 @@ static inline void source_meta_copy(
     remaining_input -= level_size;
   }
 
-  convert_to_hdr10plus = (level_1_done && xbmc_dv_hdr10plus_conv);
+  // CMv4.0 injection via xbmc_dv_hdr10plus_conv is no longer needed:
+  // the RPU writer includes L3/L9/L11/L254 directly (Kodi-side).
+  // convert_to_hdr10plus = (level_1_done && xbmc_dv_hdr10plus_conv);
 
   if (!level_5_done && level_1_done)
   {
-    memcpy(combo_index, LEVEL_5_DATA, LEVEL_5_LENGTH);
+    build_level_5_data(combo_index);
     combo_index += LEVEL_5_LENGTH;
     combo_meta_size += LEVEL_5_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_3_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_3_DATA, LEVEL_3_LENGTH);
-    combo_index += LEVEL_3_LENGTH;
-    combo_meta_size += LEVEL_3_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_9_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_9_DATA, LEVEL_9_LENGTH);
-    combo_index += LEVEL_9_LENGTH;
-    combo_meta_size += LEVEL_9_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_11_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_11_DATA, LEVEL_11_LENGTH);
-    combo_index += LEVEL_11_LENGTH;
-    combo_meta_size += LEVEL_11_LENGTH;
-    num_levels++;
-  }
-
-  if (!level_254_done && convert_to_hdr10plus)
-  {
-    memcpy(combo_index, LEVEL_254_DATA, LEVEL_254_LENGTH);
-    combo_index += LEVEL_254_LENGTH;
-    combo_meta_size += LEVEL_254_LENGTH;
     num_levels++;
   }
 
@@ -5454,8 +5639,6 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	unsigned long time_use = 0;
 	struct timeval start;
 	struct timeval end;
-	char *dvel_provider = NULL;
-
 	memset(&req, 0, (sizeof(struct provider_aux_req_s)));
 	memset(&el_req, 0, (sizeof(struct provider_aux_req_s)));
 
@@ -5543,13 +5726,18 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 					 &total_md_size,
 					 &src_format,
 					  &ret_flags, drop_flag);
+				/* T35 SEI falsely detected as DV RPU but
+				 * parser failed — not actual DV content */
+				if (meta_flag_bl && src_format == FORMAT_DOVI &&
+				    total_md_size == 0 && total_comp_size == 0)
+					src_format = FORMAT_SDR;
 			}
 
 			if (force_mel) ret_flags = 1;
 
 			if (ret_flags && req.dv_enhance_exist) {
 
-				if (!strcmp(dv_provider, "dvbldec"))
+				if (dv_provider_is_dvbldec)
 					vf_notify_provider_by_name(
 						dv_provider,
 					 	VFRAME_EVENT_RECEIVER_DOLBY_BYPASS_EL,
@@ -5628,10 +5816,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 		/* check dvel decoder is active, if active, should */
 		/* get/put el data, otherwise, dvbl is stuck */
-		dvel_provider = vf_get_provider_name(DVEL_RECV_NAME);
-
 		if (req.dv_enhance_exist && toggle_mode == 1 &&
-		    dvel_provider && !strcmp(dvel_provider, "dveldec")) 
+		    dvel_provider_is_dveldec)
 		{
 			el_vf = dvel_vf_get();
 			if (el_vf && ((el_vf->pts_us64 == vf->pts_us64) ||
@@ -5650,7 +5836,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 					el_req.aux_buf = NULL;
 					el_req.aux_size = 0;
 
-					if (!strcmp(dv_provider, "dvbldec"))
+					if (dv_provider_is_dvbldec)
 						vf_notify_provider_by_name(
 						   "dveldec",
 						   VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
@@ -5944,9 +6130,93 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	if (xbmc_dv_vsvdb_inject_num < 24)
 		load_dolby_vsvdb(vinfo->vout_device->dv_info, src_format);
 
-	// For DV-LL apply limits to the VSVDB min and max, when we have source metadata.
-	// Skip in VP mode - VP handles its own tone mapping.
-	if (total_md_size > 0 && xbmc_dv_vp == 0) limit_dolby_vsvdb_to_source_lum_for_lldv();
+	/* DV-LL (non-VP): clamp VSVDB luminance to source content's max PQ.
+	 * This tells the DV library the effective display range matches the
+	 * source, which can trigger per-frame L2 generation for backlight
+	 * control in the LL VSIF. Also injects HDR10 metadata for DV-LL. */
+	if ((xbmc_dv_vp == 0) && is_dv_ll() &&
+	    (xbmc_dv_vsvdb_source_lum_limit_num < 24)) {
+		unsigned char *x = &new_dovi_setting.vsvdb_tbl[5];
+		const unsigned char version = (x[0] >> 5) & 0x07;
+		u16 vsvdb_min = 0;
+		u16 vsvdb_max = 0;
+
+		switch (version) {
+		case 0:
+			vsvdb_min = (x[14] << 4) | (x[13] >> 4);
+			vsvdb_max = (x[15] << 4) | (x[13] & 0x0F);
+			break;
+		case 1:
+			vsvdb_min = min_direct_to_pq_lut[(x[2] >> 1)];
+			vsvdb_max = xbmc_max_direct_to_pq_lut[(x[1] >> 1)];
+			break;
+		case 2:
+			vsvdb_min = 20 * (x[1] >> 3);
+			vsvdb_max = 2055 + 65 * (x[2] >> 3);
+			break;
+		}
+
+		if ((src_format == FORMAT_DOVI) ||
+		    (src_format == FORMAT_DOVI_LL))
+			xbmc_dv_md_source_max_pq =
+				(md_buf[current_id][66] << 8) |
+				 md_buf[current_id][67];
+		else
+			xbmc_dv_md_source_max_pq = vsvdb_max;
+
+		{
+			u16 calc_vsvdb_max = min_t(unsigned short,
+				xbmc_dv_md_source_max_pq, vsvdb_max);
+			u16 new_min = vsvdb_min;
+			u16 new_max = vsvdb_max;
+
+			if ((vsvdb_min != 0) ||
+			    (vsvdb_max != calc_vsvdb_max)) {
+				new_min = 0;
+				new_max = calc_vsvdb_max;
+				switch (version) {
+				case 0:
+					x[13] = ((new_min & 0x0F) << 4) |
+						 (new_max & 0x0F);
+					x[14] = (new_min >> 4) & 0xFF;
+					x[15] = (new_max >> 4) & 0xFF;
+					break;
+				case 1:
+				{
+					u8 min_idx = 0;
+					u8 max_idx;
+					if ((xbmc_dv_md_source_max_pq == 3388) &&
+					    (new_max > 3377))
+						new_max = 3377;
+					else if ((xbmc_dv_md_source_max_pq == 3696) &&
+						 (new_max > 3690))
+						new_max = 3690;
+					max_idx = xbmc_find_closest_lut_index(
+						new_max,
+						xbmc_max_direct_to_pq_lut,
+						128);
+					x[1] = (max_idx << 1) |
+					       (x[1] & 0x01);
+					x[2] = (min_idx << 1) |
+					       (x[2] & 0x01);
+					break;
+				}
+				case 2:
+					x[1] = (x[1] & 0x07) |
+					       (((new_min / 20) & 0x1F) << 3);
+					x[2] = (x[2] & 0x07) |
+					       ((((new_max - 2055) / 65) &
+						 0x1F) << 3);
+					break;
+				}
+				if (xbmc_dv_hdr10_for_dv_ll &&
+				    (xbmc_dv_hdr10_for_dv_ll_inject_num < 24) &&
+				    (xbmc_dv_vp == 0))
+					set_hdr10_data_for_dv_ll();
+			}
+			xbmc_dv_vsvdb_source_lum_limit_num += 1;
+		}
+	}
 
 	/* check video/graphics priority on the fly */
 	/* cert: some graphic test also need video pri 5223,5243,5253,5263 */
@@ -6003,43 +6273,88 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	new_dovi_setting.video_width = w << 16;
 	new_dovi_setting.video_height = h << 16;
 
-	/* VP mode: force standard DV processing, override LL */
+	/* VP with tm > 1: clear extension blocks and set target max for
+	 * CVM bypass mode where the DV engine skips tone mapping. */
 	if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL))) {
 		new_dovi_setting.use_ll_flag = 0;
+		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
 		dolby_vision_target_max[FORMAT_DOVI][FORMAT_DOVI] = 10000;
 	}
 
-	/* Level 1 min luminance clamping for DV-LL (non-VP) */
-	if ((xbmc_dv_vp == 0) && is_dv_ll() &&
-	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL))) {
-		unsigned char* temp_index = md_buf[current_id] + ETSI_META_OFFSET;
-		unsigned char* md_index = md_buf[current_id] + ETSI_META_OFFSET;
-		unsigned char* md_end_index = md_buf[current_id] + total_md_size;
-		size_t l1_remaining_input = total_md_size - ETSI_META_OFFSET;
-		size_t l1_remaining_space = total_md_size - ETSI_META_OFFSET;
+	/* DV-LL (Player-Led) pre-processing: ensure per-frame metadata
+	 * levels are properly formatted before control_path processes them.
+	 * Clamps L1 min_pq to at least 17 and filters levels for SDR output
+	 * based on source luminance. Without this, control_path may produce
+	 * static output, losing HDR10+ per-scene dynamic tonemapping. */
+	if ((xbmc_dv_vp == 0) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
+	    is_dv_ll()) {
+		unsigned char *temp_index = md_buf[current_id] + ETSI_META_OFFSET;
+		unsigned char *md_index = md_buf[current_id] + ETSI_META_OFFSET;
+		unsigned char *md_end_index = md_buf[current_id] + total_md_size;
+		size_t remaining_input = total_md_size - ETSI_META_OFFSET;
+		size_t remaining_space = total_md_size - ETSI_META_OFFSET;
+		uint8_t num_levels = 0;
+		const bool in_scope = (dst_format == FORMAT_SDR);
+
 		while ((md_index < md_end_index) &&
-		       (l1_remaining_input >= 5) &&
-		       (l1_remaining_space >= 5)) {
-			size_t level_size = be32_to_cpup((__be32 *)md_index);
+		       (remaining_input >= 5) &&
+		       (remaining_space >= 5)) {
+			size_t level_size = be32_to_cpup(
+				(__be32 *)md_index);
 			uint8_t level = md_index[4];
+
 			level_size += 5;
-			if (level_size > l1_remaining_space || level_size > l1_remaining_input)
+			if (level_size > remaining_space ||
+			    level_size > remaining_input) {
+				pr_err("source_meta_dtm - invalid metadata\n");
 				break;
-			if ((level == 1) && (((temp_index[5] << 8) | temp_index[6]) < 17)) {
+			}
+			if ((level == 1) &&
+			    (((temp_index[5] << 8) | temp_index[6]) < 17) &&
+			    !in_scope) {
 				temp_index[5] = 0x00;
 				temp_index[6] = 0x11;
 				memcpy(md_index, temp_index, level_size);
 				temp_index += level_size;
-				l1_remaining_space -= level_size;
-			} else {
+				remaining_space -= level_size;
+				num_levels++;
+			} else if ((level >= 1) && !in_scope) {
 				temp_index += level_size;
-				l1_remaining_space -= level_size;
+				remaining_space -= level_size;
+				num_levels++;
+			} else if ((level == 1) && in_scope &&
+				   ((((md_buf[current_id][66] << 8) |
+				      md_buf[current_id][67]) > 3079) ||
+				    (((temp_index[7] << 8) |
+				      temp_index[8]) >
+				     ((md_buf[current_id][66] << 8) |
+				      md_buf[current_id][67])))) {
+				if (((temp_index[5] << 8) |
+				     temp_index[6]) < 17) {
+					temp_index[5] = 0x00;
+					temp_index[6] = 0x11;
+					memcpy(md_index, temp_index,
+					       level_size);
+				}
+				temp_index += level_size;
+				remaining_space -= level_size;
+				num_levels++;
 			}
 			md_index += level_size;
-			l1_remaining_input -= level_size;
+			remaining_input -= level_size;
 		}
+		md_buf[current_id][ETSI_META_OFFSET-1] = num_levels;
 	}
+
+	/* VS10 DV→SDR: clear extension block count so the DV engine uses
+	 * default tone mapping instead of being influenced by source L1/L2
+	 * metadata, which can cause incorrect brightness in SDR output. */
+	if ((xbmc_dv_vp == 0) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
+	    (dst_format == FORMAT_SDR) && !is_dv_ll())
+		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
 
 	if (debug_dolby & 0x400)
 		do_gettimeofday(&start);
@@ -6066,6 +6381,24 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		    !((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
 		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422))
 			source_meta_copy(md_buf[current_id], total_md_size, &new_dovi_setting.md_reg3);
+
+		if (debug_dolby & 4) {
+			u16 src_L1_min = (md_buf[current_id][ETSI_META_OFFSET + 5] << 4) |
+					 (md_buf[current_id][ETSI_META_OFFSET + 6] >> 4);
+			u16 src_L1_max = ((md_buf[current_id][ETSI_META_OFFSET + 6] & 0xF) << 8) |
+					  md_buf[current_id][ETSI_META_OFFSET + 7];
+			u16 src_L1_avg = (md_buf[current_id][ETSI_META_OFFSET + 8] << 4) |
+					 (md_buf[current_id][ETSI_META_OFFSET + 9] >> 4);
+			pr_info("DOLBY: cp flag=%d ll=%d src_fmt=%d dst_fmt=%d "
+				"L1[min=%u,max=%u,avg=%u] ext_md_mask=0x%x "
+				"L2[avail=%d,tmax_h=%u,tmax_l=%u]\n",
+				flag, is_dv_ll(), src_format, dst_format,
+				src_L1_min, src_L1_max, src_L1_avg,
+				new_dovi_setting.ext_md.avail_level_mask,
+				(new_dovi_setting.ext_md.avail_level_mask & EXT_MD_LEVEL_2) ? 1 : 0,
+				new_dovi_setting.ext_md.level_2.target_max_pq_h,
+				new_dovi_setting.ext_md.level_2.target_max_pq_l);
+		}
 	}
 
 	if (debug_dolby & 0x400) {
@@ -6392,6 +6725,71 @@ int dolby_vision_wait_metadata(struct vframe_s *vf)
 	return ret;
 }
 
+/* Debug: dump AFBC header bytes from next frame. Write 1 to trigger. */
+static bool xbmc_afbc_dump;
+module_param(xbmc_afbc_dump, bool, 0664);
+MODULE_PARM_DESC(xbmc_afbc_dump, "\n xbmc_afbc_dump\n");
+
+static void afbc_dump_header(struct vframe_s *vf)
+{
+	u8 *hdr;
+	u32 head_size;
+	u32 sb_w, sb_h, sb_count;
+	int i;
+
+	if (!vf || !(vf->type & VIDTYPE_COMPRESS))
+		return;
+
+	u32 w = vf->compWidth;
+	u32 h = vf->compHeight;
+
+	/* Superblocks: 32x8 for AFBC v2 (G12), 16x16 for v1 */
+	sb_w = (w + 31) / 32;
+	sb_h = (h + 7) / 8;
+	sb_count = sb_w * sb_h;
+	head_size = sb_count * 4; /* 4 bytes per superblock header entry */
+
+	pr_info("AFBC dump: type=0x%x %ux%u compHead=0x%x compBody=0x%x\n",
+		vf->type, w, h, vf->compHeadAddr, vf->compBodyAddr);
+	pr_info("AFBC dump: canvas0_config[0] phy=0x%x w=%u h=%u blk=%u\n",
+		vf->canvas0_config[0].phy_addr,
+		vf->canvas0_config[0].width,
+		vf->canvas0_config[0].height,
+		vf->canvas0_config[0].block_mode);
+	pr_info("AFBC dump: superblocks %ux%u = %u, header size %u bytes\n",
+		sb_w, sb_h, sb_count, head_size);
+
+	if (!vf->compHeadAddr)
+		return;
+
+	hdr = codec_mm_vmap(vf->compHeadAddr, min(head_size, (u32)256));
+	if (!hdr) {
+		pr_info("AFBC dump: failed to map compHeadAddr\n");
+		return;
+	}
+
+	pr_info("AFBC header (first 64 bytes):\n");
+	for (i = 0; i < 64 && i < head_size; i += 16)
+		pr_info("  %02x %02x %02x %02x %02x %02x %02x %02x  "
+			"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+			hdr[i+0], hdr[i+1], hdr[i+2], hdr[i+3],
+			hdr[i+4], hdr[i+5], hdr[i+6], hdr[i+7],
+			hdr[i+8], hdr[i+9], hdr[i+10], hdr[i+11],
+			hdr[i+12], hdr[i+13], hdr[i+14], hdr[i+15]);
+
+	/* Interpret as 32-bit body offsets (ARM AFBC v1/v2 spec) */
+	{
+		u32 *offsets = (u32 *)hdr;
+		pr_info("AFBC first 8 superblock body offsets:\n");
+		for (i = 0; i < 8 && i < sb_count; i++)
+			pr_info("  sb[%d]: offset=0x%08x (%u bytes)\n",
+				i, le32_to_cpu(offsets[i]), le32_to_cpu(offsets[i]));
+	}
+
+	codec_mm_unmap_phyaddr(hdr);
+	xbmc_afbc_dump = false;
+}
+
 int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 {
 	int ret = -1;
@@ -6406,6 +6804,9 @@ int dolby_vision_update_metadata(struct vframe_s *vf, bool drop_flag)
 	if (vf && dolby_vision_vf_check(vf)) {
 		ret = dolby_vision_parse_metadata(vf, 1, false, drop_flag);
 		frame_count++;
+
+		if (xbmc_afbc_dump)
+			afbc_dump_header(vf);
 	}
 
 	return ret;
@@ -7493,6 +7894,52 @@ static ssize_t amdolby_vision_debug_store
 	} else if (!strcmp(parm[0], "ko_info")) {
 		if (ko_info)
 			pr_info("ko info: %s\n", ko_info);
+	} else if (!strcmp(parm[0], "hw_dump")) {
+		int i;
+		u32 v;
+
+		pr_info("=== DV HW REGISTER DUMP ===\n");
+		pr_info("dolby_vision_on=%d core1_on=%d core1_on_cnt=%d\n",
+			dolby_vision_on, dolby_vision_core1_on,
+			dolby_vision_core1_on_cnt);
+		pr_info("dv_mode=%d target_mode=%d status=%d flags=0x%x\n",
+			dolby_vision_mode, dolby_vision_target_mode,
+			dolby_vision_status, dolby_vision_flags);
+		pr_info("frame_count=%d on_count=%d src_format=%d\n",
+			frame_count, dolby_vision_on_count,
+			dolby_vision_src_format);
+
+		/* Core3 DM registers (0x06-0x1f) — includes mute regs */
+		pr_info("--- Core3 DM regs (hw readback) ---\n");
+		for (i = 0; i < 26; i++) {
+			v = VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i);
+			pr_info("  core3_dm[%2d] (0x%04x) = 0x%08x%s\n",
+				i, 0x3606 + i, v,
+				is_core3_mute_reg(i) ? " [MUTE]" : "");
+		}
+		/* Core3 control regs */
+		pr_info("  core3_ctrl+1 = 0x%08x (output mode)\n",
+			VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 1));
+		pr_info("  core3_ctrl+2 = 0x%08x\n",
+			VSYNC_RD_DV_REG(DOLBY_CORE3_REG_START + 2));
+
+		/* VPP path and clip regs */
+		pr_info("--- VPP / path regs ---\n");
+		pr_info("  DOLBY_PATH_CTRL   = 0x%08x\n",
+			VSYNC_RD_DV_REG(DOLBY_PATH_CTRL));
+		pr_info("  VIU_MISC_CTRL1    = 0x%08x\n",
+			VSYNC_RD_DV_REG(VIU_MISC_CTRL1));
+		pr_info("  VPP_DOLBY_CTRL    = 0x%08x\n",
+			VSYNC_RD_DV_REG(VPP_DOLBY_CTRL));
+		pr_info("  VPP_CLIP_MISC0    = 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_CLIP_MISC0));
+		pr_info("  VPP_CLIP_MISC1    = 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_CLIP_MISC1));
+		pr_info("  VPP_VD1_CLIP_MISC0= 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_VD1_CLIP_MISC0));
+		pr_info("  VPP_VD1_CLIP_MISC1= 0x%08x\n",
+			VSYNC_RD_MPEG_REG(VPP_VD1_CLIP_MISC1));
+		pr_info("=== END HW DUMP ===\n");
 	} else {
 		pr_info("unsupport cmd\n");
 	}

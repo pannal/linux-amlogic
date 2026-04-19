@@ -51,6 +51,7 @@ struct aml_wdt_dev {
 	struct mutex lock;
 	unsigned int reset_watchdog_method;
 	struct hrtimer timer;
+	bool hrtimer_running;
 	void __iomem *reg_base;
 	struct notifier_block pm_notifier;
 	struct notifier_block reboot_notifier;
@@ -97,6 +98,15 @@ static int aml_wdt_start(struct watchdog_device *wdog)
 {
 	struct aml_wdt_dev *wdev = watchdog_get_drvdata(wdog);
 
+	/* When userspace (e.g. systemd) opens /dev/watchdog, it takes over
+	 * pinging responsibility. Cancel the kernel hrtimer auto-ping so
+	 * the hardware watchdog actually fires if userspace stops pinging.
+	 */
+	if (wdev->hrtimer_running) {
+		hrtimer_cancel(&wdev->timer);
+		wdev->hrtimer_running = false;
+		dev_info(wdev->dev, "hrtimer cancelled, userspace takes over\n");
+	}
 	mutex_lock(&wdev->lock);
 	if (wdog->timeout == 0xffffffff)
 		set_watchdog_cnt(wdev, wdev->default_timeout *
@@ -282,14 +292,25 @@ static int aml_wtd_reboot_notify(struct notifier_block *nb,
 	struct aml_wdt_dev *wdev;
 
 	wdev = container_of(nb, struct aml_wdt_dev, reboot_notifier);
-	if (event == SYS_DOWN || event == SYS_HALT) {
+	if (wdev->hrtimer_running) {
+		hrtimer_cancel(&wdev->timer);
+		wdev->hrtimer_running = false;
+	}
+	if (event == SYS_HALT) {
 		disable_watchdog(wdev);
 		dev_info(wdev->dev,
-			"reboot_notify: disable watchdog (event = %lu)\n",
-			event);
+			"reboot_notify: disable watchdog (halt)\n");
+	} else if (event == SYS_DOWN) {
+		/* Keep watchdog running during reboot with shutdown_timeout
+		 * so it can recover from hangs in kernel driver teardown.
+		 */
+		set_watchdog_cnt(wdev, wdev->shutdown_timeout *
+					wdev->one_second);
+		reset_watchdog(wdev);
+		dev_info(wdev->dev,
+			"reboot_notify: watchdog armed for reboot (%us)\n",
+			wdev->shutdown_timeout);
 	}
-	if (wdev->reset_watchdog_method == 1)
-		hrtimer_cancel(&wdev->timer);
 	return NOTIFY_OK;
 }
 
@@ -347,13 +368,15 @@ static int aml_wdt_probe(struct platform_device *pdev)
 	watchdog_set_drvdata(aml_wdt, wdev);
 	platform_set_drvdata(pdev, aml_wdt);
 	wdev->is_running = false;
+	wdev->hrtimer_running = false;
 	if (wdev->reset_watchdog_method == 1) {
+		aml_wdt_start(aml_wdt);
 		hrtimer_init(&wdev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		wdev->timer.function = boot_hrtimer_monitor;
 		hrtimer_start(&wdev->timer,
 			      ktime_set(wdev->reset_watchdog_time, 0),
 			      HRTIMER_MODE_REL);
-		aml_wdt_start(aml_wdt);
+		wdev->hrtimer_running = true;
 		dev_info(wdev->dev, "create hrtimer for watch dog\n");
 	}
 	ret = watchdog_register_device(aml_wdt);
@@ -376,9 +399,16 @@ static void aml_wdt_shutdown(struct platform_device *pdev)
 	struct watchdog_device *wdog = platform_get_drvdata(pdev);
 	struct aml_wdt_dev *wdev = watchdog_get_drvdata(wdog);
 
-	if (wdev->reset_watchdog_method == 1)
+	if (wdev->hrtimer_running) {
 		hrtimer_cancel(&wdev->timer);
-	disable_watchdog(wdev);
+		wdev->hrtimer_running = false;
+	}
+	/* Watchdog handling is done in the reboot notifier;
+	 * on reboot it stays armed, on halt it is disabled.
+	 */
+	if (!system_state || system_state == SYSTEM_HALT ||
+	    system_state == SYSTEM_POWER_OFF)
+		disable_watchdog(wdev);
 }
 
 static int aml_wdt_remove(struct platform_device *pdev)

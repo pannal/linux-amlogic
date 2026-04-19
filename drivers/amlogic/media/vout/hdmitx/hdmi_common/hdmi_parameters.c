@@ -3324,7 +3324,7 @@ static void hdmi_parse_attr(struct hdmi_format_para *para, char const *name)
 	}
 	/* set default value */
 	if (i == sizeof(parse_cs_) / sizeof(struct parse_cs))
-		para->cs = COLORSPACE_YUV444;
+		para->cs = COLORSPACE_YUV422;
 
 	/* parse color range */
 	for (i = 0; i < sizeof(parse_cr_) / sizeof(struct parse_cr); i++) {

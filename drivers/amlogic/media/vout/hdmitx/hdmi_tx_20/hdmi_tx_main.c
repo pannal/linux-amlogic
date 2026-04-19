@@ -76,6 +76,7 @@
 
 static struct class *hdmitx_class;
 extern bool xbmc_aml_linux_force_422;
+extern bool xbmc_dv_non_ipt;
 extern unsigned int xbmc_dv_vp;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
@@ -114,6 +115,7 @@ static bool dovi_tv_led_no_colorimetry = false;
  * when switch DV(LL)->HLG
  */
 static int hdr_mute_frame = 20;
+static bool hdr10plus_vsif_hold;
 
 struct vout_device_s hdmitx_vdev = {
 	.dv_info = &hdmitx_device.rxcap.dv_info,
@@ -377,6 +379,14 @@ static int hdmitx_reboot_notifier(struct notifier_block *nb,
 		hdev->debug_param.avmute_frame * hdmitx_get_frame_duration();
 
 	hdev->ready = 0;
+	/* Suppress HPD events during reboot/shutdown to prevent the
+	 * plugin handler from starting a mode reinitialization that
+	 * races with driver teardown and causes a deadlock.
+	 */
+	hdev->hpd_lock = 1;
+	cancel_delayed_work_sync(&hdev->work_hpd_plugin);
+	cancel_delayed_work_sync(&hdev->work_hpd_plugout);
+	cancel_work_sync(&hdev->work_hdr);
 	hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
 	if (hdev->debug_param.avmute_frame > 0)
 		msleep(mute_us / 1000);
@@ -680,14 +690,20 @@ static int set_disp_mode_auto(void)
 	hdev->para = para;
 	vic = hdmitx_edid_get_VIC(hdev, mode, 1);
 
-	if (xbmc_aml_linux_force_422) para->cs = COLORSPACE_YUV422;
-
-	pr_info("set_disp_mode_auto - eotf type [%d] tunnel mode [%d] vic [%d] cd [%d] cs [%s]\n",
+	pr_info("set_disp_mode_auto - eotf type [%d] tunnel mode [%d] vic [%d] cd [%d] cs [%s] force_422 [%d] dv_non_ipt [%d]\n",
 		hdev->hdmi_current_eotf_type, hdev->hdmi_current_tunnel_mode, vic,
-		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs]);
+		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs],
+		xbmc_aml_linux_force_422, xbmc_dv_non_ipt);
+
+	// When DV is active but outputting non-IPT (HDR10/SDR), the EOTF may
+	// still reflect the previous IPT mode (stale).  Treat it as non-DV so
+	// the switch statements below apply normal colour params instead of
+	// DV tunnel mode overrides.
+	int effective_eotf = (xbmc_dv_non_ipt) ?
+		EOTF_T_NULL : hdev->hdmi_current_eotf_type;
 
 	// force colour subsampling when DV mode
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (effective_eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
@@ -716,11 +732,9 @@ static int set_disp_mode_auto(void)
 			break;
 	}
 
-	if (xbmc_aml_linux_force_422 && (para->cs == COLORSPACE_YUV422)) para->cd = COLORDEPTH_36B;
-
 	// parse and set maximum colourdepth given by edid
 	// check for colour subsampling limit
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (effective_eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
@@ -802,6 +816,14 @@ static int set_disp_mode_auto(void)
 				pr_info("hdmitx: display colourdepth is auto set to %d bits (VIC: %d)\n",
 					colour_depths[para->cd - COLORDEPTH_24B], vic);
 		}
+	}
+
+	// Explicit 422 forcing takes priority over DV tunnel mode override.
+	// This handles VS10 HDR10 output where the DV module is active but
+	// outputs HDR10 format — the stale EOTF would otherwise force 444/8bit.
+	if (xbmc_aml_linux_force_422) {
+		para->cs = COLORSPACE_YUV422;
+		para->cd = COLORDEPTH_36B;
 	}
 
 	pr_info("set_disp_mode_auto - cd [%d] cs [%s]\n",
@@ -906,7 +928,7 @@ ssize_t store_attr(struct device *dev,
 	else if (!memcmp(hdmitx_device.fmt_attr, "420", 3))
 		hdmitx_device.para->cs = COLORSPACE_YUV420;
 	else
-		hdmitx_device.para->cs = COLORSPACE_YUV444;
+		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
 		set_disp_mode_auto();
@@ -2271,6 +2293,14 @@ static void hdmitx_set_hdr10plus_pkt(unsigned int flag,
 		return;
 	}
 
+	if (hdr10plus_vsif_hold && flag == 1) {
+		if (hdev->hdr10plus_feature != 1)
+			pr_info("hdmitx_set_hdr10plus_pkt: held (mode switch)\n");
+		hdev->hdr10plus_feature = 1;
+		hdr_status_pos = 3;
+		return;
+	}
+
 	if (hdev->hdr10plus_feature != 1)
 		pr_info("hdmitx_set_hdr10plus_pkt: flag = %d\n", flag);
 	hdev->hdr10plus_feature = 1;
@@ -2634,7 +2664,7 @@ static ssize_t show_config(struct device *dev,
 
 		if (hdmitx_hdr10p_en())
 			eotf = eotf_hdr10p[hdmitx_get_cur_hdr10p_st() & ~HDMI_HDR10P_TYPE];
-		else if (hdmitx_dv_en())
+		else if (!xbmc_dv_non_ipt && hdmitx_dv_en())
 			eotf = eotf_DV[hdmitx_get_cur_dv_st() & ~HDMI_DV_TYPE];
 		else if (hdmitx_hdr_en())
 			eotf = eotf_hdr[hdmitx_get_cur_hdr_st() & ~HDMI_HDR_TYPE];
@@ -7544,3 +7574,6 @@ module_param(dovi_tv_led_bt2020, bool, 0644);
 
 MODULE_PARM_DESC(dovi_tv_led_no_colorimetry, "\n dovi_tv_led_no_colorimetry\n");
 module_param(dovi_tv_led_no_colorimetry, bool, 0644);
+
+MODULE_PARM_DESC(hdr10plus_vsif_hold, "\n hdr10plus_vsif_hold\n");
+module_param(hdr10plus_vsif_hold, bool, 0644);
