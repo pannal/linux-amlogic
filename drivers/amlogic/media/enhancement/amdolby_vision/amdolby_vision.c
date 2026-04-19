@@ -841,6 +841,8 @@ static unsigned int amdolby_vision_poll(struct file *file, poll_table *wait)
 static void dump_buffer(const char *prefix, const unsigned char *buffer, const size_t size)
 {
   size_t i;
+  if (!debug_dolby)
+    return;
   if (!buffer) {
     pr_info("%s: null buffer\n", prefix);
     return;
