@@ -1141,6 +1141,7 @@ bool snd_usb_get_sample_rate_quirk(struct snd_usb_audio *chip)
 	switch (chip->usb_id) {
 	case USB_ID(0x041E, 0x4080): /* Creative Live Cam VF0610 */
 	case USB_ID(0x045E, 0x075D): /* MS Lifecam Cinema  */
+	case USB_ID(0x0951, 0x16a4): /* Kingston HyperX Cloud II dongle */
 	case USB_ID(0x045E, 0x076D): /* MS Lifecam HD-5000 */
 	case USB_ID(0x045E, 0x076E): /* MS Lifecam HD-5001 */
 	case USB_ID(0x045E, 0x076F): /* MS Lifecam HD-6000 */
@@ -1333,11 +1334,13 @@ void snd_usb_ctl_msg_quirk(struct usb_device *dev, unsigned int pipe,
 	/* Zoom R16/24, Logitech H650e/H570e, Jabra 550a, Kingston HyperX
 	 *  needs a tiny delay here, otherwise requests like get/set
 	 *  frequency return as failed despite actually succeeding.
+	 * HyperX Cloud II dongle (16a4) has the same timing requirement.
 	 */
 	if ((chip->usb_id == USB_ID(0x1686, 0x00dd) ||
 	     chip->usb_id == USB_ID(0x046d, 0x0a46) ||
 	     chip->usb_id == USB_ID(0x046d, 0x0a56) ||
 	     chip->usb_id == USB_ID(0x0b0e, 0x0349) ||
+	     chip->usb_id == USB_ID(0x0951, 0x16a4) ||
 	     chip->usb_id == USB_ID(0x0951, 0x16ad)) &&
 	    (requesttype & USB_TYPE_MASK) == USB_TYPE_CLASS)
 		mdelay(1);
