@@ -383,11 +383,14 @@ bool xbmc_aml_linux_force_422; // extern
 module_param(xbmc_aml_linux_force_422, bool, 0664);
 MODULE_PARM_DESC(xbmc_aml_linux_force_422, "\n xbmc_aml_linux_force_422\n");
 
-/* Keep 12-bit precision through VPP and enable HDMI TX dithering
- * during DV to reduce banding in color gradients. */
-static bool xbmc_dv_dither;
-module_param(xbmc_dv_dither, bool, 0664);
-MODULE_PARM_DESC(xbmc_dv_dither, "\n xbmc_dv_dither\n");
+/* Keep 12-bit precision through the VPP DV pipeline (DAT_CONV + DOLBY_CTRL).
+ * For VS10 non-IPT output the HDMI TX 12->10 dither bit is additionally
+ * enabled so the kernel dithers instead of plain-truncating; for DV tunnel
+ * modes (IPT/IPT_TUNNEL) that bit is skipped and only the VPP precision
+ * change applies. */
+static bool xbmc_dv_deep_color;
+module_param(xbmc_dv_deep_color, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_deep_color, "\n xbmc_dv_deep_color\n");
 
 bool xbmc_dv_non_ipt; // extern
 module_param(xbmc_dv_non_ipt, bool, 0664);
@@ -2526,12 +2529,17 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000);	// 12->10 before vadj2 10->12 after gainoff
 				} else {
 					if (dolby_vision_flags & FLAG_BYPASS_VPP) video_effect_bypass(1);
-					if (xbmc_dv_dither) {
-						/* Preserve 12-bit precision through VPP to
-						 * reduce banding in color gradients.  The
-						 * final 12→10 conversion happens at the
-						 * HDMI TX with dithering instead of plain
-						 * truncation in the VPP. */
+					if (xbmc_dv_deep_color) {
+						/* Preserve 12-bit precision through the VPP
+						 * pipeline (skip the internal 12→10→12
+						 * truncations around vadj1/vadj2) to reduce
+						 * banding in colour gradients.  For VS10
+						 * non-IPT output the HDMI TX dither block
+						 * below handles the final 12→10 step; for
+						 * DV tunnel modes (IPT/IPT_TUNNEL) no 12→10
+						 * runs at the HDMI TX (gated off ~40 lines
+						 * down), so the extra VPP precision reaches
+						 * the DV container pack step. */
 						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x08000800);	// u12↔s12 (preserve 12-bit)
 						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x08000800);	// u12↔s12 (preserve 12-bit)
 						VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 0, 12, 1);	// disable VPP 12→10 truncation
@@ -2569,7 +2577,7 @@ void enable_dolby_vision(int enable)
 					enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
 				}
 
-				if (xbmc_dv_dither &&
+				if (xbmc_dv_deep_color &&
 				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
 				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT)
 					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 1, 4, 1);
@@ -2751,7 +2759,7 @@ void enable_dolby_vision(int enable)
 					dv_mem_power_off(VPU_DOLBY0);
 				}
 
-				if (xbmc_dv_dither) {
+				if (xbmc_dv_deep_color) {
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 12, 1);
 					VSYNC_WR_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 0, 4, 1);
 				}
