@@ -6020,9 +6020,19 @@ static int hdmitx_notify_callback_a(struct notifier_block *block,
 
 		pr_info(AUD "aout notify channel num: %d\n", ch_num);
 		audio_param->channel_num = ch_num - 1;
-		if ((cmd == CT_PCM) && ch_num && (ch_num % 2 == 0))
+		/*
+		 * aud_output_ch != 0 forces tx_aud_src = 1 (I2S 8ch-in / 2ch-out
+		 * mode). That's only meaningful for I2S-to-HDMI paths with real
+		 * multi-channel PCM. Setting it for 2-ch stereo PCM strands the
+		 * HDMI audio source on SPDIF-B and mutes sysdefault/SPDIF-A
+		 * output after a TrueHD (CT_MAT, ch 8 -> CT_PCM, ch 2) teardown.
+		 * For 2-ch PCM, let hdmitx_ext_set_i2s_mask() (called only by
+		 * TDM drivers with i2s2hdmitx set) own aud_output_ch; otherwise
+		 * leave it at 0.
+		 */
+		if ((cmd == CT_PCM) && ch_num > 2 && (ch_num % 2 == 0))
 			hdev->aud_output_ch = ((ch_num << 4) & 0xf0) | (ch_msk & 0xf);
-		else
+		else if (cmd != CT_PCM)
 			hdev->aud_output_ch = 0;
 		hdev->audio_param_update_flag = 1;
 	}
