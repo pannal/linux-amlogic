@@ -1,25 +1,34 @@
 /* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
 /*
- * drivers/amlogic/cec/hdmi_ao_cec.h
- *
- * Copyright (C) 2017 Amlogic, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+ * Copyright (c) 2019 Amlogic, Inc. All rights reserved.
  */
 
 #ifndef __AO_CEC_H__
 #define __AO_CEC_H__
+#ifdef CONFIG_AMLOGIC_HDMITX
+#include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
+#endif
+#include <linux/clk.h>
+#include "hdmi_tx_cec_20.h"
 
-#define CEC_DRIVER_VERSION     "2021/12/28: rm sw check of bus & add dbg"
+/* 4.9 compat shim: wrap get_hdmitx_device() in 515-style accessor */
+#ifdef CONFIG_AMLOGIC_HDMITX
+static inline struct vsdb_phyaddr *get_hdmitx_phy_addr(void)
+{
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+
+	if (!hdev)
+		return NULL;
+	return &hdev->hdmi_info.vsdb_phy_addr;
+}
+#else
+static inline struct vsdb_phyaddr *get_hdmitx_phy_addr(void)
+{
+	return NULL;
+}
+#endif
+
+#define CEC_DRIVER_VERSION     "2025/07/02: modify freeze&wakeup reason"
 
 #define CEC_DEV_NAME		"aocec"
 
@@ -29,14 +38,14 @@
 #define CEC_CHK_BUS_CNT		20
 
 #define CEC_PHY_PORT_NUM	4
-#define HR_DELAY(n)		(ktime_set(0, n * 1000 * 1000))
+#define HR_DELAY(n)		(ktime_set(0, (n) * 1000 * 1000))
 
 #define MAX_INT				0x7ffffff
-#define PHY_ADDR_LEN 4
 
-#define SIGNAL_FREE_TIME_RETRY 3
-#define SIGNAL_FREE_TIME_NEW_INITIATOR 5
-#define SIGNAL_FREE_TIME_NEXT_XFER 7
+/* CEC_FREEZE_WAKE_UP and CEC_MAIL_BOX intentionally NOT defined:
+ * 4.9 kernel uses scpi_protocol instead of aml_mbox; freeze/s2idle
+ * not supported on ng hardware.
+ */
 
 enum cec_chip_ver {
 	CEC_CHIP_GXL = 0,
@@ -49,32 +58,49 @@ enum cec_chip_ver {
 	CEC_CHIP_SM1,
 	CEC_CHIP_TL1,
 	CEC_CHIP_TM2,
-	CEC_CHIP_A1,
+	CEC_CHIP_A1 = 10,
 	CEC_CHIP_SC2,
+	CEC_CHIP_T5,	/*only have cecb, first bringup at 4.9-dev*/
+	CEC_CHIP_T5D,	/*only have cecb, first bringup at 4.9-dev*/
+	CEC_CHIP_T7,
+	CEC_CHIP_S4,/*base on sc2*/
+	CEC_CHIP_T3,	/* only have cecb */
+	CEC_CHIP_T5W,	/* from T5D */
+	CEC_CHIP_T5M, /* base on T3, only have cec_b */
+	CEC_CHIP_S5,
+	CEC_CHIP_T3X, /* base on T3, only have cec_b */
+	CEC_CHIP_TXHD2, /* base on T5M, only have cec_b */
+	CEC_CHIP_S1A,
+	CEC_CHIP_S7,
+	CEC_CHIP_S7D,
+	CEC_CHIP_S6,
 };
 
 enum cecaver {
+	CECA_NONE,
 	/*
 	 * first version, only support one logical addr
 	 * "0xf" broadcast addr is default on
 	 */
-	CECA_VER_0 = 0,
+	CECA_VER_0,
 
 	/*
 	 * support multi logical address, "0xf" broadcast
 	 * addr is default on
 	 */
-	CECA_VER_1 = 1,
+	CECA_VER_1,
 };
 
 enum cecbver {
+	CECB_NONE,
+
 	/* first version
 	 * support multi logical address, "0xf" broadcast
 	 * addr is default on
 	 */
-	CECB_VER_0 = 0,
+	CECB_VER_0,
 	/*ee to ao */
-	CECB_VER_1 = 1,
+	CECB_VER_1,
 	/*
 	 * 1.fix bug: cts 7-1
 	 * 2.fix bug: Do not signal initiator error, when it's
@@ -82,11 +108,11 @@ enum cecbver {
 	 * 3.fix bug: Receive messages are ignored and not acknowledge
 	 * 4.add status reg
 	 */
-	CECB_VER_2 = 2,
+	CECB_VER_2,
 	/*
 	 * After and equal A1, register read/write changed
 	 */
-	CECB_VER_3 = 3,
+	CECB_VER_3,
 };
 
 /* from android cec hal */
@@ -114,6 +140,11 @@ enum {
 #define CEC_B_ARB_TIME 8
 
 #define CEC_MSG_BUFF_MAX	30
+#define PHY_ADDR_LEN 4
+
+#define SIGNAL_FREE_TIME_RETRY 3
+#define SIGNAL_FREE_TIME_NEW_INITIATOR 5
+#define SIGNAL_FREE_TIME_NEXT_XFER 7
 
 struct cec_platform_data_s {
 	enum cec_chip_ver chip_id;
@@ -121,9 +152,10 @@ struct cec_platform_data_s {
 	unsigned int line_bit;/*cec gpio position in reg*/
 	bool ee_to_ao;/*ee cec hw module mv to ao;ao cec delete*/
 	bool ceca_sts_reg;/*add new internal status register*/
-	enum cecbver cecb_ver;/* detail discription ref enum cecbver */
+	enum cecbver cecb_ver;/* detail description ref enum cecbver */
 	enum cecaver ceca_ver;
 	bool share_io;
+	unsigned int reg_tab_group;
 };
 
 struct cec_wakeup_t {
@@ -149,11 +181,15 @@ struct st_cec_mailbox_data {
 	unsigned char osd_name[16];
 } __packed;
 
-struct cec_dev_info_t {
-	unsigned char devtype;
-	unsigned char vendorid[16];
-	unsigned char osd_name[16];
-	unsigned int phyaddr;
+struct vendor_info {
+	unsigned char *vendor_name; /* Max Chars: 8 */
+	/* vendor_id, 3 Bytes, Refer to
+	 * http://standards.ieee.org/develop/regauth/oui/oui.txt
+	 */
+	unsigned char *product_desc; /* Max Chars: 16 */
+	unsigned char *cec_osd_string; /* Max Chars: 14 */
+	unsigned int cec_config; /* 4 bytes: use to control cec switch on/off */
+	unsigned int vendor_id;
 };
 
 /* global struct for tx and rx */
@@ -168,7 +204,7 @@ struct ao_cec_dev {
 	unsigned int hal_flag;
 	unsigned int phy_addr;
 	unsigned int port_seq;
-	/* unsigned int cpu_type; */
+	unsigned int cpu_type;
 	unsigned int irq_ceca;
 	unsigned int irq_cecb;
 	void __iomem *exit_reg;
@@ -177,24 +213,26 @@ struct ao_cec_dev {
 	void __iomem *hhi_reg;
 	void __iomem *periphs_reg;
 	void __iomem *clk_reg;
-	struct hdmitx_dev *tx_dev;
+	void __iomem *pad_reg;
+	/* struct hdmitx_dev *tx_dev; */
 	struct workqueue_struct *cec_thread;
 	struct workqueue_struct *hdmi_plug_wq;
+	struct workqueue_struct *cec_tx_event_wq;
 	struct workqueue_struct *cec_rx_event_wq;
+	struct workqueue_struct *cec_wakeup_wq;
 	struct device *dbg_dev;
 	const char *pin_name;
 	struct delayed_work cec_work;
 	struct delayed_work work_hdmi_plug;
 	struct delayed_work work_cec_rx;
+	struct delayed_work work_cec_wakeup;
 	struct completion rx_ok;
 	struct completion tx_ok;
-	struct completion msg_feedback;
-	unsigned int msg_feedbackmd;
 	spinlock_t cec_reg_lock;/*cec register access*/
-	struct mutex cec_tx_mutex;/*pretect tx cec msg*/
+	struct mutex cec_tx_mutex;/*protect tx cec msg*/
 	struct mutex cec_ioctl_mutex;
 	struct mutex cec_uevent_mutex; /* cec uevent */
-	struct cec_wakeup_t wakup_data;
+	struct cec_wakeup_t wakeup_data;
 	/* msg_len + maximum msg len */
 	unsigned char cec_wk_otp_msg[17];
 	unsigned char cec_wk_as_msg[17];
@@ -202,7 +240,7 @@ struct ao_cec_dev {
 #ifdef CONFIG_PM
 	int cec_suspend;
 #endif
-	struct vendor_info_data v_data;
+	struct vendor_info v_data;
 	struct cec_global_info_t cec_info;
 	struct cec_platform_data_s *plat_data;
 
@@ -215,13 +253,11 @@ struct ao_cec_dev {
 
 	struct clk *ceca_clk;
 	struct clk *cecb_clk;
-	unsigned char devlist[16];
-	unsigned char devexist_num;
-	struct cec_dev_info_t devinfo[16];
 	bool framework_on;
 	bool chk_sig_free_time;
-	/* enable SW check, for debug */
+	/* default not enable SW check, for debug */
 	bool sw_chk_bus;
+	u32 cec_log_en;
 };
 
 struct cec_msg_last {
@@ -238,7 +274,30 @@ struct cec_msg_last {
 #define CEC_FUNC_CFG_ALL			0x2f
 #define CEC_FUNC_CFG_NONE			0x0
 
-#define PREG_PAD_GPIO3_I			(0x01b << 2)
+/* T5/T5D/T5W (0xff634400 + (0x01b << 2)) */
+#define PREG_PAD_GPIO3_I (0x01b << 2)
+/* S4/SC2 0xfe004140 */
+#define PADCTRL_GPIOH_I 0x140
+/* S5 */
+#define PADCTRL_GPIOH_I_S5 (0x00d0 << 2)
+
+/* T3 0xfe004240 */
+#define PADCTRL_GPIOW_I 0x240
+
+/* T5M #define PADCTRL_GPIOW_I ((0x0090 << 2) + 0xfe004000) */
+#define PADCTRL_GPIOW_I_T5M (0x0090 << 2)
+
+/* T3X #define PADCTRL_GPIOW_I ((0x0090 << 2) + 0xfe004000) */
+#define PADCTRL_GPIOW_I_T3X (0x0090 << 2)
+
+/* T3X #define PADCTRL_GPIOA_I ((0x0005 << 2) + 0xff800000) */
+#define PADCTRL_GPIOAO_I_TXHD2 (0x0005 << 2)
+
+enum cec_reg_group {
+	cec_reg_group_old = 0,
+	cec_reg_group_a1,
+	cec_reg_group_max,
+};
 
 enum {
 	AO_CEC_CLK_CNTL_REG0 = 0,
@@ -257,6 +316,7 @@ enum {
 	AO_CECB_INTR_CLR,	/*0xc*/
 	AO_CECB_INTR_STAT,	/*0xd*/
 
+	/* only for old chip CECA clk */
 	AO_RTI_STATUS_REG1,
 	AO_RTI_PWR_CNTL_REG0,
 	AO_CRT_CLK_CNTL1,
@@ -270,7 +330,7 @@ enum {
 	AO_REG_DEF_END
 };
 
-#define REG_MASK_ADDR	0x00ffffff
+#define REG_MASK_ADDR	0x0000ffff
 #define REG_MASK_PR	0x01000000/*periphs register*/
 
 /*
@@ -564,24 +624,24 @@ struct cec_uevent {
 	const char *env;
 };
 
-/* cec ip irq flags bit discription */
-#define EECEC_IRQ_TX_DONE			BIT(16)
-#define EECEC_IRQ_RX_EOM			BIT(17)
-#define EECEC_IRQ_TX_NACK			BIT(18)
+/* cec ip irq flags bit description */
+#define EECEC_IRQ_TX_DONE		BIT(16)
+#define EECEC_IRQ_RX_EOM		BIT(17)
+#define EECEC_IRQ_TX_NACK		BIT(18)
 #define EECEC_IRQ_TX_ARB_LOST		BIT(19)
 #define EECEC_IRQ_TX_ERR_INITIATOR	BIT(20)
 #define EECEC_IRQ_RX_ERR_FOLLOWER	BIT(21)
-#define EECEC_IRQ_RX_WAKEUP			BIT(22)
-#define EE_CEC_IRQ_EN_MASK			(0x3f0000)
+#define EECEC_IRQ_RX_WAKEUP		BIT(22)
+#define EE_CEC_IRQ_EN_MASK			(0x3f00)
 
 /* cec irq bit flags for AO_CEC_B */
-#define CECB_IRQ_TX_DONE			BIT(0)
-#define CECB_IRQ_RX_EOM				BIT(1)
-#define CECB_IRQ_TX_NACK			BIT(2)
+#define CECB_IRQ_TX_DONE		BIT(0)
+#define CECB_IRQ_RX_EOM			BIT(1)
+#define CECB_IRQ_TX_NACK		BIT(2)
 #define CECB_IRQ_TX_ARB_LOST		BIT(3)
 #define CECB_IRQ_TX_ERR_INITIATOR	BIT(4)
 #define CECB_IRQ_RX_ERR_FOLLOWER	BIT(5)
-#define CECB_IRQ_RX_WAKEUP			BIT(6)
+#define CECB_IRQ_RX_WAKEUP		BIT(6)
 #define CECB_IRQ_EN_MASK			(0x3f)
 
 /* common mask */
@@ -603,15 +663,15 @@ struct cec_uevent {
 #define WAKEUP_OP_0D_EN			BIT(1)
 #define WAKEUP_OP_04_EN			BIT(0)
 #define WAKEUP_DIS_MASK			0
-#define WAKEUP_EN_MASK		(WAKEUP_OP_86_EN | \
-							WAKEUP_OP_0D_EN | \
-							WAKEUP_OP_04_EN)
+#define WAKEUP_EN_MASK			(WAKEUP_OP_86_EN | \
+					 WAKEUP_OP_0D_EN | \
+					 WAKEUP_OP_04_EN)
 
 #define EDID_CEC_ID_ADDR		0x00a100a0
 #define EDID_AUTO_CEC_EN		0
 
 #define HHI_32K_CLK_CNTL		(0x89 << 2)
-#define HHI_HDMIRX_ARC_CNTL		(0xe8  << 2)
+#define HHI_HDMIRX_ARC_CNTL		(0xe8 << 2)
 
 #define CEC_IOC_MAGIC                   'C'
 #define CEC_IOC_GET_PHYSICAL_ADDR       _IOR(CEC_IOC_MAGIC, 0x00, uint16_t)
@@ -635,10 +695,9 @@ struct cec_uevent {
 #define CEC_IOC_SET_FREEZE_MODE         _IOW(CEC_IOC_MAGIC, 0x12, uint32_t)
 #define CEC_IOC_GET_BOOT_PORT           _IOW(CEC_IOC_MAGIC, 0x13, uint32_t)
 #define CEC_IOC_SET_DEBUG_EN		_IOW(CEC_IOC_MAGIC, 0x14, uint32_t)
-#define CEC_IOC_GET_DEV_NUM		_IOW(CEC_IOC_MAGIC, 0x15, uint32_t)
-#define CEC_IOC_GET_DEV_VENDOR		_IOW(CEC_IOC_MAGIC, 0x16, uint32_t)
 #define CEC_IOC_GET_WK_OTP_MSG	_IOR(CEC_IOC_MAGIC, 0x17, struct st_rx_msg)
 #define CEC_IOC_GET_WK_AS_MSG	_IOR(CEC_IOC_MAGIC, 0x18, struct st_rx_msg)
+#define CEC_IOC_KEY_EVENT _IOW(CEC_IOC_MAGIC, 0x15, uint32_t)
 
 #ifdef CONFIG_AMLOGIC_MEDIA_TVIN_HDMI
 unsigned long hdmirx_rd_top(unsigned long addr);
@@ -647,7 +706,7 @@ uint32_t hdmirx_rd_dwc(u16 addr);
 void hdmirx_wr_dwc(u16 addr, u32 data);
 unsigned int rd_reg_hhi(unsigned int offset);
 void wr_reg_hhi(unsigned int offset, unsigned int val);
-
+int __attribute__((weak))cec_set_dev_info(uint8_t dev_idx);
 #else
 
 static inline unsigned long hdmirx_rd_top(unsigned long addr)
@@ -664,52 +723,21 @@ static inline uint32_t hdmirx_rd_dwc(u16 addr)
 	return 0;
 }
 
-static inline void hdmirx_wr_dwc(u16 addr, u32 data)
+static inline void hdmirx_wr_dwc(u16 addr, u16 data)
 {
 }
 
-unsigned int rd_reg_hhi(u32 offset)
+unsigned int __weak rd_reg_hhi(u32 offset)
 {
 	return 0;
 }
 
-void wr_reg_hhi(unsigned int offset, unsigned int val)
+void __weak wr_reg_hhi(unsigned int offset, unsigned int val)
 {
 }
 
 #endif
-
-int hdmirx_get_connect_info(void);
-int cec_set_dev_info(uint8_t dev_idx);
-
-
-unsigned int aocec_rd_reg(unsigned long addr);
-void aocec_wr_reg(unsigned long addr, unsigned long data);
 void cecb_irq_handle(void);
-void cec_logicaddr_set(int l_add);
-void cec_arbit_bit_time_set(u32 bit_set, u32 time_set, u32 flag);
-void cec_irq_enable(bool enable);
-void aocec_irq_enable(bool enable);
-void dump_reg(void);
-void cec_status(void);
-void cec_hw_reset(u32 cec_sel);
-void cec_restore_logical_addr(u32 cec_sel, u32 addr_en);
-void cec_logicaddr_add(u32  cec_sel, u32 l_add);
-int dump_cecrx_reg(char *b);
-void cec_clear_all_logical_addr(unsigned int cec_sel);
-void cec_ap_add_logical_addr(u32 l_addr);
-void cec_ap_set_dev_type(u32 type);
-void cec_ap_rm_logical_addr(u32 addr);
-void cec_new_msg_push(void);
-unsigned int cec_config2_phyaddr(unsigned int value, bool wr_flag);
-unsigned int cec_config2_logaddr(unsigned int value, bool wr_flag);
-unsigned int cec_config2_devtype(unsigned int value, bool wr_flag);
-unsigned int cec_config(unsigned int value, bool wr_flag);
-void cec_give_device_vendor_id(unsigned char devtype);
-void cec_give_physical_address(unsigned char dest);
+int cec_ll_tx(const unsigned char *msg, unsigned char len, unsigned char signal_free_time);
 
-void cec_update_dev_info(unsigned char *msg, unsigned int msglen);
-unsigned int get_cec_num(void);
-void cec_dev_list_info(void);
-void get_cec_vendorid(unsigned int idx, unsigned char *str);
 #endif	/* __AO_CEC_H__ */
