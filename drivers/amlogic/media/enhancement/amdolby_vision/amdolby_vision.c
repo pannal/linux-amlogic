@@ -5545,16 +5545,19 @@ static inline void source_meta_copy(
     {
       if (level == 5) {
         level_5_done = true;
-        /* Substitute source L5 with xbmc_detected_l5_* when:
-         *   - source L5 is all-zero (detect / kernel auto-fill), OR
-         *   - xbmc_force_l5_override is set (service.p3i.override addon
-         *     wants to replace a wrong but non-zero source L5).
-         * Both paths still require xbmc_detect_active_area as the master
-         * enable and at least one non-zero target value. */
-        if ((xbmc_force_l5_override || is_level_5_all_zero(orig_index)) &&
-            xbmc_detect_active_area &&
-            (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
-             xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+        /* Substitute source L5 with xbmc_detected_l5_* in two cases:
+         *   1. xbmc_force_l5_override: unconditional override path used by
+         *      service.p3i.override. Substitutes regardless of source L5
+         *      state and regardless of target values — 0,0,0,0 is a valid
+         *      override meaning "no bars / full active frame".
+         *   2. Otherwise: legacy auto-fill path — only when source L5 is
+         *      all-zero AND we have at least one non-zero detected value.
+         * xbmc_detect_active_area is the master enable in both cases. */
+        if (xbmc_detect_active_area &&
+            (xbmc_force_l5_override ||
+             (is_level_5_all_zero(orig_index) &&
+              (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+               xbmc_detected_l5_left || xbmc_detected_l5_right)))) {
           build_level_5_data(combo_index);
           combo_index += LEVEL_5_LENGTH;
           combo_meta_size += LEVEL_5_LENGTH;
