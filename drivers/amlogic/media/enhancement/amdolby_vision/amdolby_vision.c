@@ -475,6 +475,14 @@ static u16 xbmc_detected_l5_right;
 module_param(xbmc_detected_l5_right, ushort, 0664);
 MODULE_PARM_DESC(xbmc_detected_l5_right, "\n xbmc_detected_l5_right\n");
 
+/* When true, the L5 substitution path uses xbmc_detected_l5_* even if the
+ * source RPU already has a non-zero L5 — overriding what the stream says.
+ * Used by Kodi's service.p3i.override addon to push per-folder corrected
+ * active-area offsets for streams whose RPU L5 is wrong. */
+static bool xbmc_force_l5_override = false;
+module_param(xbmc_force_l5_override, bool, 0664);
+MODULE_PARM_DESC(xbmc_force_l5_override, "\n xbmc_force_l5_override - replace source L5 with xbmc_detected_l5_* even when source L5 is non-zero\n");
+
 /*bit0:reset core1 reg; bit1:reset core2 reg;bit2:reset core3 reg*/
 /*bit3: reset core1 lut; bit4: reset core2 lut*/
 static unsigned int force_update_reg;
@@ -5537,8 +5545,14 @@ static inline void source_meta_copy(
     {
       if (level == 5) {
         level_5_done = true;
-        /* If source L5 is all-zero and we have detected values, substitute */
-        if (is_level_5_all_zero(orig_index) && xbmc_detect_active_area &&
+        /* Substitute source L5 with xbmc_detected_l5_* when:
+         *   - source L5 is all-zero (detect / kernel auto-fill), OR
+         *   - xbmc_force_l5_override is set (service.p3i.override addon
+         *     wants to replace a wrong but non-zero source L5).
+         * Both paths still require xbmc_detect_active_area as the master
+         * enable and at least one non-zero target value. */
+        if ((xbmc_force_l5_override || is_level_5_all_zero(orig_index)) &&
+            xbmc_detect_active_area &&
             (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
              xbmc_detected_l5_left || xbmc_detected_l5_right)) {
           build_level_5_data(combo_index);
