@@ -475,13 +475,32 @@ static u16 xbmc_detected_l5_right;
 module_param(xbmc_detected_l5_right, ushort, 0664);
 MODULE_PARM_DESC(xbmc_detected_l5_right, "\n xbmc_detected_l5_right\n");
 
-/* When true, the L5 substitution path uses xbmc_detected_l5_* even if the
- * source RPU already has a non-zero L5 — overriding what the stream says.
- * Used by Kodi's service.p3i.override addon to push per-folder corrected
- * active-area offsets for streams whose RPU L5 is wrong. */
+/* L5 active-area override (Kodi service.p3i.override addon). Independent
+ * namespace from xbmc_detected_l5_* so the detect and override paths can
+ * coexist without one zeroing the other's values during teardown. When
+ * xbmc_force_l5_override is true, the L5 substitution and append paths
+ * use these xbmc_override_l5_* values regardless of source RPU L5 state.
+ * "0,0,0,0" is a legitimate override meaning "treat the stream as having
+ * no bars / full active frame". */
 static bool xbmc_force_l5_override = false;
 module_param(xbmc_force_l5_override, bool, 0664);
-MODULE_PARM_DESC(xbmc_force_l5_override, "\n xbmc_force_l5_override - replace source L5 with xbmc_detected_l5_* even when source L5 is non-zero\n");
+MODULE_PARM_DESC(xbmc_force_l5_override, "\n xbmc_force_l5_override - replace source L5 with xbmc_override_l5_* even when source L5 is non-zero\n");
+
+static u16 xbmc_override_l5_top;
+module_param(xbmc_override_l5_top, ushort, 0664);
+MODULE_PARM_DESC(xbmc_override_l5_top, "\n xbmc_override_l5_top\n");
+
+static u16 xbmc_override_l5_bottom;
+module_param(xbmc_override_l5_bottom, ushort, 0664);
+MODULE_PARM_DESC(xbmc_override_l5_bottom, "\n xbmc_override_l5_bottom\n");
+
+static u16 xbmc_override_l5_left;
+module_param(xbmc_override_l5_left, ushort, 0664);
+MODULE_PARM_DESC(xbmc_override_l5_left, "\n xbmc_override_l5_left\n");
+
+static u16 xbmc_override_l5_right;
+module_param(xbmc_override_l5_right, ushort, 0664);
+MODULE_PARM_DESC(xbmc_override_l5_right, "\n xbmc_override_l5_right\n");
 
 /*bit0:reset core1 reg; bit1:reset core2 reg;bit2:reset core3 reg*/
 /*bit3: reset core1 lut; bit4: reset core2 lut*/
@@ -5412,7 +5431,12 @@ static inline size_t reverse_dv_meta(
  * OSD/subtitle gating as source L5 — detected L5 is suppressed when
  * the OSD is active or subtitles are signaled, so the TV doesn't crop
  * the OSD overlay. */
-static inline void build_level_5_data(unsigned char *dst)
+/* Write the L5 block header + four offsets, with the same OSD/subtitle
+ * suppression gate as both source-L5 forwarding and the legacy detect path.
+ * Caller picks the value source via the wrapper functions below. */
+static inline void build_level_5_data_from(unsigned char *dst,
+                                            u16 top, u16 bottom,
+                                            u16 left, u16 right)
 {
   dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x08;
   dst[4] = 0x05;
@@ -5420,20 +5444,56 @@ static inline void build_level_5_data(unsigned char *dst)
   bool suppress = (xbmc_meta_level_5_osdst && dolby_vision_xbmc_osd) ||
                   (xbmc_meta_level_5_subt && dolby_vision_subtitles);
 
-  if (!suppress && xbmc_detect_active_area &&
-      (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
-       xbmc_detected_l5_left || xbmc_detected_l5_right)) {
-    dst[5]  = (xbmc_detected_l5_left >> 8) & 0xFF;
-    dst[6]  = xbmc_detected_l5_left & 0xFF;
-    dst[7]  = (xbmc_detected_l5_right >> 8) & 0xFF;
-    dst[8]  = xbmc_detected_l5_right & 0xFF;
-    dst[9]  = (xbmc_detected_l5_top >> 8) & 0xFF;
-    dst[10] = xbmc_detected_l5_top & 0xFF;
-    dst[11] = (xbmc_detected_l5_bottom >> 8) & 0xFF;
-    dst[12] = xbmc_detected_l5_bottom & 0xFF;
+  if (!suppress) {
+    dst[5]  = (left >> 8) & 0xFF;
+    dst[6]  = left & 0xFF;
+    dst[7]  = (right >> 8) & 0xFF;
+    dst[8]  = right & 0xFF;
+    dst[9]  = (top >> 8) & 0xFF;
+    dst[10] = top & 0xFF;
+    dst[11] = (bottom >> 8) & 0xFF;
+    dst[12] = bottom & 0xFF;
   } else {
     memset(dst + 5, 0, 8);
   }
+}
+
+/* Legacy detect path: only writes values if at least one is non-zero. */
+static inline void build_level_5_data(unsigned char *dst)
+{
+  if (xbmc_detect_active_area &&
+      (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+       xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+    build_level_5_data_from(dst,
+                            xbmc_detected_l5_top, xbmc_detected_l5_bottom,
+                            xbmc_detected_l5_left, xbmc_detected_l5_right);
+  } else {
+    /* No detected values to write — emit empty header+zeros, matching the
+     * pre-refactor behavior. */
+    dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x08;
+    dst[4] = 0x05;
+    memset(dst + 5, 0, 8);
+  }
+}
+
+/* Override path: writes xbmc_override_l5_* values unconditionally (allows
+ * "0,0,0,0" as a legitimate "no bars" override). */
+static inline void build_level_5_override_data(unsigned char *dst)
+{
+  build_level_5_data_from(dst,
+                          xbmc_override_l5_top, xbmc_override_l5_bottom,
+                          xbmc_override_l5_left, xbmc_override_l5_right);
+}
+
+/* Selector — picks override or detect helper based on the force flag.
+ * Used by the L5-append paths (out-of-order and end-of-loop) so the
+ * override correctly drives them too, not just the in-stream substitution. */
+static inline void build_level_5_data_select(unsigned char *dst)
+{
+  if (xbmc_force_l5_override)
+    build_level_5_override_data(dst);
+  else
+    build_level_5_data(dst);
 }
 
 /* Check if an L5 block in the metadata has all-zero offsets */
@@ -5523,7 +5583,7 @@ static inline void source_meta_copy(
 
     if ((level > 5) && !level_5_done && level_1_done)
     {
-      build_level_5_data(combo_index);
+      build_level_5_data_select(combo_index);
       combo_index += LEVEL_5_LENGTH;
       combo_meta_size += LEVEL_5_LENGTH;
       remaining_space -= LEVEL_5_LENGTH;
@@ -5545,20 +5605,27 @@ static inline void source_meta_copy(
     {
       if (level == 5) {
         level_5_done = true;
-        /* Substitute source L5 with xbmc_detected_l5_* in two cases:
-         *   1. xbmc_force_l5_override: unconditional override path used by
-         *      service.p3i.override. Substitutes regardless of source L5
-         *      state and regardless of target values — 0,0,0,0 is a valid
-         *      override meaning "no bars / full active frame".
-         *   2. Otherwise: legacy auto-fill path — only when source L5 is
-         *      all-zero AND we have at least one non-zero detected value.
-         * xbmc_detect_active_area is the master enable in both cases. */
-        if (xbmc_detect_active_area &&
-            (xbmc_force_l5_override ||
-             (is_level_5_all_zero(orig_index) &&
-              (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
-               xbmc_detected_l5_left || xbmc_detected_l5_right)))) {
-          build_level_5_data(combo_index);
+        /* Substitute source L5 in two cases (both gated by
+         * xbmc_detect_active_area as the master enable):
+         *   1. xbmc_force_l5_override: unconditional override path
+         *      (service.p3i.override addon). Uses xbmc_override_l5_*;
+         *      0,0,0,0 is a valid override meaning "no bars".
+         *   2. Otherwise: legacy auto-fill path — only when source L5
+         *      is all-zero AND we have at least one non-zero detected
+         *      value. Uses xbmc_detected_l5_*. */
+        bool substituted = false;
+        if (xbmc_detect_active_area) {
+          if (xbmc_force_l5_override) {
+            build_level_5_override_data(combo_index);
+            substituted = true;
+          } else if (is_level_5_all_zero(orig_index) &&
+                     (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
+                      xbmc_detected_l5_left || xbmc_detected_l5_right)) {
+            build_level_5_data(combo_index);
+            substituted = true;
+          }
+        }
+        if (substituted) {
           combo_index += LEVEL_5_LENGTH;
           combo_meta_size += LEVEL_5_LENGTH;
           remaining_space -= LEVEL_5_LENGTH;
@@ -5608,7 +5675,7 @@ static inline void source_meta_copy(
 
   if (!level_5_done && level_1_done)
   {
-    build_level_5_data(combo_index);
+    build_level_5_data_select(combo_index);
     combo_index += LEVEL_5_LENGTH;
     combo_meta_size += LEVEL_5_LENGTH;
     num_levels++;
