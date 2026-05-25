@@ -946,16 +946,45 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
+		bool hold_avmute_for_pkt = false;
+
 		/* Consume one-shot eotf hint from userspace if provided, so
 		 * set_disp_mode_auto builds the AVI from the upcoming mode's
 		 * eotf instead of whatever the per-frame send_hdmi_pkt path
 		 * last wrote. See xbmc_next_eotf definition.
+		 *
+		 * For modes that REQUIRE a paired InfoFrame on the wire
+		 * (DV VSIF for DOLBYVISION/LL/DV_AHEAD, DRM packet for HDR10),
+		 * we additionally hold AVMUTE briefly after set_disp_mode_auto
+		 * so the sink doesn't observe the correct AVI without its
+		 * paired packet — which is what makes marginal AVR repeater
+		 * chains wedge during rapid VS10 cycling. SDR/NULL hints don't
+		 * need the hold (no paired packet expected).
 		 */
 		if (xbmc_next_eotf && xbmc_next_eotf < EOTF_T_MAX) {
 			hdmitx_device.hdmi_current_eotf_type = xbmc_next_eotf;
+			hold_avmute_for_pkt =
+				(xbmc_next_eotf == EOTF_T_DOLBYVISION ||
+				 xbmc_next_eotf == EOTF_T_HDR10 ||
+				 xbmc_next_eotf == EOTF_T_LL_MODE ||
+				 xbmc_next_eotf == EOTF_T_DV_AHEAD);
 			xbmc_next_eotf = 0;
 		}
 		set_disp_mode_auto();
+		if (hold_avmute_for_pkt) {
+			/* set_disp_mode_auto cleared AVMUTE; re-assert it so the
+			 * sink stays blanked while the per-frame DV/HDR pipeline
+			 * gets ~2 vsyncs to emit the matching packet. 100ms
+			 * covers 2 frames at the worst-case rate we care about
+			 * (24Hz, 42ms/frame). The DV pipeline runs on vsync, so
+			 * by the time we release the packet is on the wire.
+			 */
+			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
+				MISC_AVMUTE_OP, SET_AVMUTE);
+			msleep(100);
+			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
+				MISC_AVMUTE_OP, CLR_AVMUTE);
+		}
 		memcpy(strstr(hdmitx_device.fmt_attr,"now"), " ", 3);
 	}
 
