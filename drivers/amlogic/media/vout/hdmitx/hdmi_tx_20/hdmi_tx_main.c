@@ -78,21 +78,6 @@ static struct class *hdmitx_class;
 extern bool xbmc_aml_linux_force_422;
 extern bool xbmc_dv_non_ipt;
 extern unsigned int xbmc_dv_vp;
-
-/* One-shot hint from userspace for the eotf that set_disp_mode_auto should
- * build the AVI from. Without this, set_disp_mode_auto reads
- * hdmi_current_eotf_type, which is only updated by hdmitx_set_vsif_pkt on
- * the per-frame DV pipeline path. On a VS10 mode transition Kodi can write
- * attr (triggering set_disp_mode_auto) before the next DV frame has updated
- * the eotf, so the AVI gets built for the previous mode. The first frame
- * after AVMUTE-clear then fixes it via VSIF, but the gap is enough to
- * confuse marginal sink chains (AVR repeaters in particular).
- *
- * Semantics: non-zero, valid eotf_type value → store_attr applies it to
- * hdmi_current_eotf_type and zeros this param before calling
- * set_disp_mode_auto. Zero (default) → no behavior change vs. legacy.
- */
-unsigned int xbmc_next_eotf;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -946,15 +931,6 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
-		/* Consume one-shot eotf hint from userspace if provided, so
-		 * set_disp_mode_auto builds the AVI from the upcoming mode's
-		 * eotf instead of whatever the per-frame send_hdmi_pkt path
-		 * last wrote. See xbmc_next_eotf definition.
-		 */
-		if (xbmc_next_eotf && xbmc_next_eotf < EOTF_T_MAX) {
-			hdmitx_device.hdmi_current_eotf_type = xbmc_next_eotf;
-			xbmc_next_eotf = 0;
-		}
 		set_disp_mode_auto();
 		memcpy(strstr(hdmitx_device.fmt_attr,"now"), " ", 3);
 	}
@@ -7611,6 +7587,3 @@ module_param(dovi_tv_led_no_colorimetry, bool, 0644);
 
 MODULE_PARM_DESC(hdr10plus_vsif_hold, "\n hdr10plus_vsif_hold\n");
 module_param(hdr10plus_vsif_hold, bool, 0644);
-
-MODULE_PARM_DESC(xbmc_next_eotf, "\n one-shot hint for set_disp_mode_auto: hdmi_current_eotf_type to use on next attr write that triggers it; consumed and zeroed\n");
-module_param(xbmc_next_eotf, uint, 0664);
