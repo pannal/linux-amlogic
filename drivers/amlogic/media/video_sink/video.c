@@ -6219,8 +6219,7 @@ SET_FILTER:
 		!is_local_vf(vd_layer[0].dispbuf)
 		? vd_layer[0].dispbuf : NULL,
 		new_frame,
-		(new_frame ? CSC_FLAG_TOGGLE_FRAME : 0) |
-		(is_dolby_vision_on() ? CSC_FLAG_BYPASS_PQ : 0),
+		new_frame ? CSC_FLAG_TOGGLE_FRAME : 0,
 		cur_frame_par ?
 		cur_frame_par->supsc1_hori_ratio :
 		0,
