@@ -91,8 +91,25 @@ extern unsigned int xbmc_dv_vp;
  * Semantics: non-zero, valid eotf_type value → store_attr applies it to
  * hdmi_current_eotf_type and zeros this param before calling
  * set_disp_mode_auto. Zero (default) → no behavior change vs. legacy.
+ *
+ * This is a PURE AVI hint — it has no AVMUTE side effect. The blank that
+ * bridges the AVMUTE-clear → first-paired-packet gap is requested
+ * separately and explicitly via xbmc_avmute_hold_ms, so userspace is the
+ * single owner of that window (no second, racing AVMUTE owner in Kodi).
  */
 unsigned int xbmc_next_eotf;
+
+/* One-shot AVMUTE hold (milliseconds) from userspace. When non-zero,
+ * store_attr re-asserts AVMUTE immediately after set_disp_mode_auto (which
+ * itself clears it) and holds it for this many ms before releasing, then
+ * zeros the param. This keeps the sink blanked while the per-frame DV/HDR
+ * pipeline emits the InfoFrame paired with the just-built AVI — marginal
+ * AVR repeater chains otherwise wedge on that gap during rapid VS10
+ * cycling. Kodi drives the duration (and decides when to request it) so it
+ * is the SOLE owner of the blank; the kernel no longer auto-mutes off the
+ * eotf type. Clamped to a sane ceiling. Zero (default) → no hold (legacy).
+ */
+unsigned int xbmc_avmute_hold_ms;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -946,42 +963,38 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
-		bool hold_avmute_for_pkt = false;
+		unsigned int avmute_hold_ms = 0;
 
 		/* Consume one-shot eotf hint from userspace if provided, so
 		 * set_disp_mode_auto builds the AVI from the upcoming mode's
 		 * eotf instead of whatever the per-frame send_hdmi_pkt path
-		 * last wrote. See xbmc_next_eotf definition.
-		 *
-		 * For modes that REQUIRE a paired InfoFrame on the wire
-		 * (DV VSIF for DOLBYVISION/LL/DV_AHEAD, DRM packet for HDR10),
-		 * we additionally hold AVMUTE briefly after set_disp_mode_auto
-		 * so the sink doesn't observe the correct AVI without its
-		 * paired packet — which is what makes marginal AVR repeater
-		 * chains wedge during rapid VS10 cycling. SDR/NULL hints don't
-		 * need the hold (no paired packet expected).
+		 * last wrote. PURE AVI hint — no AVMUTE side effect; the blank
+		 * is requested separately via xbmc_avmute_hold_ms. See the
+		 * xbmc_next_eotf / xbmc_avmute_hold_ms definitions.
 		 */
 		if (xbmc_next_eotf && xbmc_next_eotf < EOTF_T_MAX) {
 			hdmitx_device.hdmi_current_eotf_type = xbmc_next_eotf;
-			hold_avmute_for_pkt =
-				(xbmc_next_eotf == EOTF_T_DOLBYVISION ||
-				 xbmc_next_eotf == EOTF_T_HDR10 ||
-				 xbmc_next_eotf == EOTF_T_LL_MODE ||
-				 xbmc_next_eotf == EOTF_T_DV_AHEAD);
 			xbmc_next_eotf = 0;
 		}
+		/* Consume one-shot AVMUTE-hold request. Userspace (Kodi) is the
+		 * single owner of the blank window and decides both the
+		 * duration and when to ask for it (paired-packet transitions on
+		 * marginal AVR repeater chains). Clamp to a sane ceiling so a
+		 * bad write can't pin the sink dark. */
+		if (xbmc_avmute_hold_ms) {
+			avmute_hold_ms = xbmc_avmute_hold_ms > 1000 ?
+				1000 : xbmc_avmute_hold_ms;
+			xbmc_avmute_hold_ms = 0;
+		}
 		set_disp_mode_auto();
-		if (hold_avmute_for_pkt) {
+		if (avmute_hold_ms) {
 			/* set_disp_mode_auto cleared AVMUTE; re-assert it so the
 			 * sink stays blanked while the per-frame DV/HDR pipeline
-			 * gets ~2 vsyncs to emit the matching packet. 100ms
-			 * covers 2 frames at the worst-case rate we care about
-			 * (24Hz, 42ms/frame). The DV pipeline runs on vsync, so
-			 * by the time we release the packet is on the wire.
-			 */
+			 * emits the InfoFrame paired with the just-built AVI,
+			 * then release. */
 			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
 				MISC_AVMUTE_OP, SET_AVMUTE);
-			msleep(100);
+			msleep(avmute_hold_ms);
 			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
 				MISC_AVMUTE_OP, CLR_AVMUTE);
 		}
@@ -7643,3 +7656,6 @@ module_param(hdr10plus_vsif_hold, bool, 0644);
 
 MODULE_PARM_DESC(xbmc_next_eotf, "\n one-shot hint for set_disp_mode_auto: hdmi_current_eotf_type to use on next attr write that triggers it; consumed and zeroed\n");
 module_param(xbmc_next_eotf, uint, 0664);
+
+MODULE_PARM_DESC(xbmc_avmute_hold_ms, "\n one-shot AVMUTE hold (ms) re-asserted after set_disp_mode_auto on the next attr write that triggers it; clamped, consumed and zeroed; 0 = no hold\n");
+module_param(xbmc_avmute_hold_ms, uint, 0664);
