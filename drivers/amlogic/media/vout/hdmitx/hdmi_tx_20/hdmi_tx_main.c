@@ -657,9 +657,23 @@ static int set_disp_mode_auto(void)
 	enum hdmi_vic vic = HDMI_Unknown;
 	int colour_depths[] = { 8, 10, 12, 16 };
 	char* colour_sampling[] = {"RGB","YUV422","YUV444","YUV420"};
+	unsigned int avmute_hold_ms;
 
 	memset(mode, 0, sizeof(mode));
 	hdev->ready = 0;
+
+	/* Consume the one-shot AVMUTE-hold request (set by userspace right
+	 * before the attr/mode write that triggers this set_disp_mode_auto).
+	 * Consumed at entry on EVERY path so a stale request can't leak into a
+	 * later, unrelated mode set; the hold itself only fires on the success
+	 * path below. Clamped to a sane ceiling. Userspace (Kodi) is the single
+	 * owner of the blank and requests it on the disruptive transition (the
+	 * resolution-switch display/mode write, or a same-res DV-signaling attr
+	 * write). 0 = no hold (legacy). */
+	avmute_hold_ms = xbmc_avmute_hold_ms;
+	if (avmute_hold_ms > 1000)
+		avmute_hold_ms = 1000;
+	xbmc_avmute_hold_ms = 0;
 
 	/* get current vinfo */
 	info = hdmitx_get_current_vinfo();
@@ -914,6 +928,19 @@ static int set_disp_mode_auto(void)
 	memcpy(hdev->backup_fmt_attr, hdev->fmt_attr, 16);
 	hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
 	hdev->backup_phy_idx = hdev->phy_idx;
+
+	if (ret >= 0 && avmute_hold_ms) {
+		/* Re-assert AVMUTE after the AVMUTE_CLEAR above so the just-
+		 * completed mode change stays blanked until the per-frame DV/HDR
+		 * pipeline emits the InfoFrame paired with the new AVI, then
+		 * release. Bracketing the mode set HERE (rather than around an
+		 * earlier GUI-resolution attr write) means the blank lands on
+		 * the disruptive transition. Runs in the process-context caller
+		 * thread that wrote attr/mode, so the sleep is safe. */
+		hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
+		msleep(avmute_hold_ms);
+		hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, CLR_AVMUTE);
+	}
 	return ret;
 }
 
@@ -963,41 +990,21 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
-		unsigned int avmute_hold_ms = 0;
-
 		/* Consume one-shot eotf hint from userspace if provided, so
 		 * set_disp_mode_auto builds the AVI from the upcoming mode's
 		 * eotf instead of whatever the per-frame send_hdmi_pkt path
-		 * last wrote. PURE AVI hint — no AVMUTE side effect; the blank
-		 * is requested separately via xbmc_avmute_hold_ms. See the
-		 * xbmc_next_eotf / xbmc_avmute_hold_ms definitions.
+		 * last wrote. PURE AVI hint — no AVMUTE side effect; the AVMUTE
+		 * hold (xbmc_avmute_hold_ms) is consumed inside set_disp_mode_auto
+		 * itself so it brackets the mode set regardless of whether this
+		 * attr write or the resolution-switch display/mode write
+		 * triggered it. See the xbmc_next_eotf / xbmc_avmute_hold_ms
+		 * definitions.
 		 */
 		if (xbmc_next_eotf && xbmc_next_eotf < EOTF_T_MAX) {
 			hdmitx_device.hdmi_current_eotf_type = xbmc_next_eotf;
 			xbmc_next_eotf = 0;
 		}
-		/* Consume one-shot AVMUTE-hold request. Userspace (Kodi) is the
-		 * single owner of the blank window and decides both the
-		 * duration and when to ask for it (paired-packet transitions on
-		 * marginal AVR repeater chains). Clamp to a sane ceiling so a
-		 * bad write can't pin the sink dark. */
-		if (xbmc_avmute_hold_ms) {
-			avmute_hold_ms = xbmc_avmute_hold_ms > 1000 ?
-				1000 : xbmc_avmute_hold_ms;
-			xbmc_avmute_hold_ms = 0;
-		}
 		set_disp_mode_auto();
-		if (avmute_hold_ms) {
-			/* set_disp_mode_auto cleared AVMUTE; re-assert it so the
-			 * sink stays blanked while the per-frame DV/HDR pipeline
-			 * emits the InfoFrame paired with the just-built AVI,
-			 * then release. */
-			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
-				MISC_AVMUTE_OP, SET_AVMUTE);
-			msleep(avmute_hold_ms);
-			hdmitx_device.hwop.cntlmisc(&hdmitx_device,
-				MISC_AVMUTE_OP, CLR_AVMUTE);
-		}
 		memcpy(strstr(hdmitx_device.fmt_attr,"now"), " ", 3);
 	}
 
@@ -7657,5 +7664,5 @@ module_param(hdr10plus_vsif_hold, bool, 0644);
 MODULE_PARM_DESC(xbmc_next_eotf, "\n one-shot hint for set_disp_mode_auto: hdmi_current_eotf_type to use on next attr write that triggers it; consumed and zeroed\n");
 module_param(xbmc_next_eotf, uint, 0664);
 
-MODULE_PARM_DESC(xbmc_avmute_hold_ms, "\n one-shot AVMUTE hold (ms) re-asserted after set_disp_mode_auto on the next attr write that triggers it; clamped, consumed and zeroed; 0 = no hold\n");
+MODULE_PARM_DESC(xbmc_avmute_hold_ms, "\n one-shot AVMUTE hold (ms): the next set_disp_mode_auto consumes+zeros it at entry and re-asserts AVMUTE for this long on its success path, bracketing that mode set; clamped; 0 = no hold\n");
 module_param(xbmc_avmute_hold_ms, uint, 0664);
