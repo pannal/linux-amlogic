@@ -93,23 +93,21 @@ extern unsigned int xbmc_dv_vp;
  * set_disp_mode_auto. Zero (default) → no behavior change vs. legacy.
  *
  * This is a PURE AVI hint — it has no AVMUTE side effect. The blank that
- * bridges the AVMUTE-clear → first-paired-packet gap is requested
- * separately and explicitly via xbmc_avmute_hold_ms, so userspace is the
- * single owner of that window (no second, racing AVMUTE owner in Kodi).
+ * paired with the AVI is emitted as part of the mode set itself (see
+ * xbmc_emit_paired_pkt), so the PHY comes back up coherent rather than
+ * AVI-without-VSIF.
  */
 unsigned int xbmc_next_eotf;
 
-/* One-shot AVMUTE hold (milliseconds) from userspace. When non-zero,
- * store_attr re-asserts AVMUTE immediately after set_disp_mode_auto (which
- * itself clears it) and holds it for this many ms before releasing, then
- * zeros the param. This keeps the sink blanked while the per-frame DV/HDR
- * pipeline emits the InfoFrame paired with the just-built AVI — marginal
- * AVR repeater chains otherwise wedge on that gap during rapid VS10
- * cycling. Kodi drives the duration (and decides when to request it) so it
- * is the SOLE owner of the blank; the kernel no longer auto-mutes off the
- * eotf type. Clamped to a sane ceiling. Zero (default) → no hold (legacy).
+/* One-shot request from userspace (Kodi). When non-zero, at the end of the
+ * next set_disp_mode_auto — PHY already back on, ready==1 — the kernel emits
+ * the DV VSIF for the current eotf so the just-rebuilt AVI is coherent with
+ * its paired packet BEFORE the first decoded frame, instead of bringing the
+ * signal up AVI-without-VSIF and relying on AVMUTE to hide the gap. The mode
+ * set's own PHY-disable/enable already hides the transition, so no AVMUTE is
+ * needed. Consumed and zeroed. Zero (default) → no emit (legacy).
  */
-unsigned int xbmc_avmute_hold_ms;
+unsigned int xbmc_emit_paired_pkt;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -657,23 +655,19 @@ static int set_disp_mode_auto(void)
 	enum hdmi_vic vic = HDMI_Unknown;
 	int colour_depths[] = { 8, 10, 12, 16 };
 	char* colour_sampling[] = {"RGB","YUV422","YUV444","YUV420"};
-	unsigned int avmute_hold_ms;
+	unsigned int emit_paired_pkt;
 
 	memset(mode, 0, sizeof(mode));
 	hdev->ready = 0;
 
-	/* Consume the one-shot AVMUTE-hold request (set by userspace right
-	 * before the attr/mode write that triggers this set_disp_mode_auto).
-	 * Consumed at entry on EVERY path so a stale request can't leak into a
-	 * later, unrelated mode set; the hold itself only fires on the success
-	 * path below. Clamped to a sane ceiling. Userspace (Kodi) is the single
-	 * owner of the blank and requests it on the disruptive transition (the
-	 * resolution-switch display/mode write, or a same-res DV-signaling attr
-	 * write). 0 = no hold (legacy). */
-	avmute_hold_ms = xbmc_avmute_hold_ms;
-	if (avmute_hold_ms > 1000)
-		avmute_hold_ms = 1000;
-	xbmc_avmute_hold_ms = 0;
+	/* Consume the one-shot paired-packet emit request at entry (every path,
+	 * so a stale request can't leak into a later, unrelated mode set). It is
+	 * acted on at the success exit below, once the PHY is back on and
+	 * ready==1 (so hdmitx_set_vsif_pkt won't early-return). Userspace (Kodi)
+	 * sets it on the disruptive DV transition (the resolution-switch
+	 * display/mode write). 0 = no emit (legacy). */
+	emit_paired_pkt = xbmc_emit_paired_pkt;
+	xbmc_emit_paired_pkt = 0;
 
 	/* get current vinfo */
 	info = hdmitx_get_current_vinfo();
@@ -929,17 +923,18 @@ static int set_disp_mode_auto(void)
 	hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
 	hdev->backup_phy_idx = hdev->phy_idx;
 
-	if (ret >= 0 && avmute_hold_ms) {
-		/* Re-assert AVMUTE after the AVMUTE_CLEAR above so the just-
-		 * completed mode change stays blanked until the per-frame DV/HDR
-		 * pipeline emits the InfoFrame paired with the new AVI, then
-		 * release. Bracketing the mode set HERE (rather than around an
-		 * earlier GUI-resolution attr write) means the blank lands on
-		 * the disruptive transition. Runs in the process-context caller
-		 * thread that wrote attr/mode, so the sleep is safe. */
-		hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
-		msleep(avmute_hold_ms);
-		hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, CLR_AVMUTE);
+	if (ret >= 0 && emit_paired_pkt &&
+	    hdev->hdmi_current_eotf_type == EOTF_T_DOLBYVISION) {
+		/* PHY is back on and ready==1, so hdmitx_set_vsif_pkt will emit
+		 * rather than early-return. Send the DV-Std VSIF now (RGB_8BIT
+		 * tunnel, NULL data — the per-frame DV pipeline keeps updating it
+		 * afterwards) so the just-rebuilt AVI is paired with its VSIF,
+		 * and the AVI RGB/range is aligned to match, BEFORE the first
+		 * decoded frame. Closes the AVI-without-VSIF window that a
+		 * marginal sink can trip over — without AVMUTE, since the mode
+		 * set's own PHY-disable/enable already hid the transition.
+		 * DV-Std (DOLBYVISION) only for now; LL/HDR10 (VSIF/DRM) TBD. */
+		hdmitx_set_vsif_pkt(EOTF_T_DOLBYVISION, RGB_8BIT, NULL, false);
 	}
 	return ret;
 }
@@ -992,13 +987,11 @@ ssize_t store_attr(struct device *dev,
 	if (strstr(hdmitx_device.fmt_attr,"now")){
 		/* Consume one-shot eotf hint from userspace if provided, so
 		 * set_disp_mode_auto builds the AVI from the upcoming mode's
-		 * eotf instead of whatever the per-frame send_hdmi_pkt path
-		 * last wrote. PURE AVI hint — no AVMUTE side effect; the AVMUTE
-		 * hold (xbmc_avmute_hold_ms) is consumed inside set_disp_mode_auto
-		 * itself so it brackets the mode set regardless of whether this
-		 * attr write or the resolution-switch display/mode write
-		 * triggered it. See the xbmc_next_eotf / xbmc_avmute_hold_ms
-		 * definitions.
+		 * eotf instead of whatever the per-frame send_hdmi_pkt path last
+		 * wrote. The matching DV VSIF is emitted as part of that same
+		 * set_disp_mode_auto (see xbmc_emit_paired_pkt) so the AVI comes
+		 * up paired with its VSIF — no AVMUTE. See the xbmc_next_eotf /
+		 * xbmc_emit_paired_pkt definitions.
 		 */
 		if (xbmc_next_eotf && xbmc_next_eotf < EOTF_T_MAX) {
 			hdmitx_device.hdmi_current_eotf_type = xbmc_next_eotf;
@@ -7664,5 +7657,5 @@ module_param(hdr10plus_vsif_hold, bool, 0644);
 MODULE_PARM_DESC(xbmc_next_eotf, "\n one-shot hint for set_disp_mode_auto: hdmi_current_eotf_type to use on next attr write that triggers it; consumed and zeroed\n");
 module_param(xbmc_next_eotf, uint, 0664);
 
-MODULE_PARM_DESC(xbmc_avmute_hold_ms, "\n one-shot AVMUTE hold (ms): the next set_disp_mode_auto consumes+zeros it at entry and re-asserts AVMUTE for this long on its success path, bracketing that mode set; clamped; 0 = no hold\n");
-module_param(xbmc_avmute_hold_ms, uint, 0664);
+MODULE_PARM_DESC(xbmc_emit_paired_pkt, "\n one-shot: at the end of the next set_disp_mode_auto, emit the DV VSIF for the current eotf so the AVI comes up coherent with its paired packet (no AVMUTE needed); consumed and zeroed; 0 = no emit\n");
+module_param(xbmc_emit_paired_pkt, uint, 0664);
