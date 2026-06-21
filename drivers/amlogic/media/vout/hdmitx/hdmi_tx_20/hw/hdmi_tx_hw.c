@@ -2607,6 +2607,15 @@ static void set_aud_info_pkt(struct hdmitx_dev *hdev,
 		default:
 			break;
 		}
+		/*
+		 * If the DAI resolved a precise CEA channel allocation from the
+		 * ALSA channel map (e.g. 4.0/5.0) it overrides the channel-count
+		 * value written above - that is the only way an AVR sees those
+		 * layouts. layout_valid is false unless the extra_pcm_layouts knob
+		 * explicitly vouched for it, so the default path is unchanged.
+		 */
+		if (audio_param->layout_valid)
+			hdmitx_wr_reg(HDMITX_DWC_FC_AUDICONF2, audio_param->layout);
 		break;
 	case CT_DTS:
 	case CT_DTS_HD:

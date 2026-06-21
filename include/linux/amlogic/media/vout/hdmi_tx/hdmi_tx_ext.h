@@ -56,6 +56,13 @@ struct aud_para {
 	enum hdmi_audio_sampsize size;
 	enum hdmi_audio_chnnum chs;
 	bool fifo_rst;
+	/*
+	 * Optional precise CEA-861 HDMI channel allocation resolved from the
+	 * ALSA channel map. layout_valid is false on zero-initialised structs,
+	 * so consumers fall back to the channel-count based allocation.
+	 */
+	bool layout_valid;
+	unsigned char layout;
 };
 
 #endif

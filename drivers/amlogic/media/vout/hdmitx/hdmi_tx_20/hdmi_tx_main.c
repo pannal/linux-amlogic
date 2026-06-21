@@ -6036,6 +6036,20 @@ static int hdmitx_notify_callback_a(struct notifier_block *block,
 			hdev->aud_output_ch = 0;
 		hdev->audio_param_update_flag = 1;
 	}
+
+	/*
+	 * Carry the optional precise channel allocation (4.0/5.0 etc.) through.
+	 * A change here alone must re-apply the audio params, otherwise a
+	 * same-channel-count layout switch (e.g. 3.1 -> 4.0) would keep a stale
+	 * CA. layout_valid stays false unless the DAI vouched for it, so default
+	 * builds never enter this branch.
+	 */
+	if (audio_param->layout != aud_param->layout ||
+		audio_param->layout_valid != aud_param->layout_valid) {
+		audio_param->layout = aud_param->layout;
+		audio_param->layout_valid = aud_param->layout_valid;
+		hdev->audio_param_update_flag = 1;
+	}
 	if (hdev->tx_aud_cfg == 2) {
 		pr_info(AUD "auto mode\n");
 		/* Detect whether Rx is support current audio format */

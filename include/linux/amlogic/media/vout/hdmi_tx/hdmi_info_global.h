@@ -217,6 +217,9 @@ struct hdmitx_audpara {
 	enum hdmi_audio_chnnum channel_num;
 	enum hdmi_audio_fs sample_rate;
 	enum hdmi_audio_sampsize sample_size;
+	/* precise CEA-861 channel allocation; see struct aud_para */
+	bool layout_valid;
+	unsigned char layout;
 };
 
 struct hdmitx_supaudinfo {

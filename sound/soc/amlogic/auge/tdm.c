@@ -57,6 +57,7 @@
 struct channel_speaker_allocation {
         int channels;
         int speakers[8];
+        unsigned char ca;       /* CEA-861 HDMI channel-allocation byte */
 };
 
 #define NL	SNDRV_CHMAP_UNKNOWN
@@ -79,16 +80,42 @@ struct channel_speaker_allocation {
 #define TC	SNDRV_CHMAP_TC
 #define FCH	SNDRV_CHMAP_TFC
 
+/*
+ * The first ORIG_PCM_LAYOUTS entries are the long-standing CoreELEC set
+ * (2.0/3.1/5.1/7.1). The trailing entries are only advertised and matched when
+ * the extra_pcm_layouts knob is enabled (see aml_n_pcm_layouts()), so with the
+ * knob off the channel map exposed to userspace - and therefore every HDMI
+ * channel-allocation byte - is byte-for-byte what it was before.
+ */
+#define ORIG_PCM_LAYOUTS 4
 static struct channel_speaker_allocation channel_allocations[] = {
-/*      	       channel:   7     6    5    4    3     2    1    0  */
-{ .channels = 2,  .speakers = {  NL,   NL,  NL,  NL,  NL,   NL,  FR,  FL } },
-                                 /* 3.1 CEA 0x03 */
-{ .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  FC,  LFE,  FR,  FL } },
-                                 /* surround51 CEA 0x0b */
-{ .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,  LFE,  FR,  FL } },
-                                 /* surround71 CEA 0x13 */
-{ .channels = 8,  .speakers = { RRC,  RLC,  RR,  RL,  FC,  LFE,  FR,  FL } },
+/*      	       channel:   7     6    5    4    3     2    1    0            CEA CA */
+{ .channels = 2,  .speakers = {  NL,   NL,  NL,  NL,  NL,   NL,  FR,  FL }, .ca = 0x00 }, /* 2.0 */
+{ .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  FC,  LFE,  FR,  FL }, .ca = 0x03 }, /* 3.1 */
+{ .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x0b }, /* 5.1 */
+{ .channels = 8,  .speakers = { RRC,  RLC,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x13 }, /* 7.1 */
+/* --- extra layouts: advertised/matched only when extra_pcm_layouts=1 --- */
+{ .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  RR,   RL,  FR,  FL }, .ca = 0x08 }, /* 4.0 */
+{ .channels = 5,  .speakers = {  NL,   NL,  NL,  RR,  RL,   FC,  FR,  FL }, .ca = 0x0a }, /* 5.0 */
 };
+
+/*
+ * Off by default: exposes only the historical 2.0/3.1/5.1/7.1 layouts and
+ * leaves the HDMI channel-allocation byte exactly as the channel-count path
+ * computes it. Set to 1
+ * (echo 1 > /sys/module/<snd_tdm module>/parameters/extra_pcm_layouts)
+ * to additionally advertise 4.0/5.0 channel maps and emit their precise CEA
+ * channel allocation, so AVRs report the real layout with no silent channels.
+ */
+static int extra_pcm_layouts;
+module_param(extra_pcm_layouts, int, 0644);
+MODULE_PARM_DESC(extra_pcm_layouts,
+	"Advertise extra HDMI PCM layouts (4.0/5.0) and emit their CEA channel allocation (0=off)");
+
+static inline int aml_n_pcm_layouts(void)
+{
+	return extra_pcm_layouts ? ARRAY_SIZE(channel_allocations) : ORIG_PCM_LAYOUTS;
+}
 
 static void dump_pcm_setting(struct pcm_setting *setting)
 {
@@ -1097,7 +1124,7 @@ static int aml_dai_tdm_chmap_ctl_tlv(struct snd_kcontrol *kcontrol, int op_flag,
     size -= 8;
     dst = tlv + 2;
 
-    for (i = 0; i < ARRAY_SIZE(channel_allocations); i++)
+    for (i = 0; i < aml_n_pcm_layouts(); i++)
     {
         struct channel_speaker_allocation *ch = &channel_allocations[i];
         int num_chs = 0;
@@ -1161,9 +1188,16 @@ static int aml_dai_tdm_chmap_ctl_get(struct snd_kcontrol *kcontrol,
     if (mutex_lock_interruptible(&prtd->chmap_lock))
         return -EINTR;
 
-    for (channel=0; channel<8; channel++)
     {
-        ucontrol->value.integer.value[7 - channel] = channel_allocations[prtd->chmap_layout].speakers[channel];
+        /* clamp: chmap_layout is -1 until a map is matched (see _put) */
+        int li = prtd->chmap_layout;
+
+        if (li < 0 || li >= ARRAY_SIZE(channel_allocations))
+            li = 0;
+
+        for (channel = 0; channel < 8; channel++)
+            ucontrol->value.integer.value[7 - channel] =
+                channel_allocations[li].speakers[channel];
     }
 
 unlock:
@@ -1187,11 +1221,16 @@ static int aml_dai_tdm_chmap_ctl_put(struct snd_kcontrol *kcontrol,
         return -EINTR;
 
     // now check if the channel setup matches one of our layouts
-    for (layout = 0; layout < ARRAY_SIZE(channel_allocations); layout++)
+    matches = 0;
+    for (layout = 0; layout < aml_n_pcm_layouts(); layout++)
     {
+        /* a layout only applies to its own physical channel count */
+        if (channel_allocations[layout].channels != runtime->channels)
+            continue;
+
         matches = 1;
 
-        for (channel = 0; channel < substream->runtime->channels; channel++)
+        for (channel = 0; channel < runtime->channels; channel++)
         {
             int sp = ucontrol->value.integer.value[channel];
             int chan = channel_allocations[layout].speakers[7 - channel];
@@ -1211,9 +1250,13 @@ static int aml_dai_tdm_chmap_ctl_put(struct snd_kcontrol *kcontrol,
     }
 
 
-    // default to first layout if we didnt find any
+    /*
+     * No match: leave it unresolved (-1) so the prepare hook does not vouch
+     * for a layout and the HDMI-TX keeps its channel-count-based CA. The get
+     * hook clamps -1 back to a valid index.
+     */
     if (!matches)
-        matched_layout = 0;
+        matched_layout = -1;
 
     pr_info("Setting a %d channel layout matching layout #%d\n", runtime->channels, matched_layout);
 
@@ -1295,6 +1338,41 @@ static int aml_dai_tdm_prepare(struct snd_pcm_substream *substream,
 				hdmitx_ext_set_i2s_mask(runtime->channels, 0x1);
 			}
 
+			/*
+			 * Resolve the precise CEA channel-allocation from the
+			 * ALSA channel map userspace set before snd_pcm_prepare().
+			 * Only when the knob is on; otherwise layout_valid stays 0
+			 * and the HDMI-TX keeps its channel-count-based CA, so
+			 * default builds are unchanged.
+			 */
+			if (extra_pcm_layouts) {
+				struct snd_kcontrol *ck =
+					aml_dai_tdm_chmap_kctrl_get(substream);
+
+				if (ck) {
+					struct snd_pcm_chmap *cinfo =
+						snd_kcontrol_chip(ck);
+					struct aml_chmap *cprtd =
+						cinfo ? cinfo->private_data : NULL;
+					int li = cprtd ? cprtd->chmap_layout : -1;
+
+					/*
+					 * Only vouch for a layout that actually
+					 * matches this stream's channel count, so a
+					 * stale map left by a previous, differently
+					 * sized stream can never force a wrong CA.
+					 */
+					if (li >= 0 &&
+					    li < ARRAY_SIZE(channel_allocations) &&
+					    channel_allocations[li].channels ==
+						runtime->channels) {
+						aud_param.layout =
+							channel_allocations[li].ca;
+						aud_param.layout_valid = true;
+					}
+				}
+			}
+
 			aout_notifier_call_chain(AOUT_EVENT_IEC_60958_PCM,
 						 &aud_param);
 		}
@@ -1351,6 +1429,9 @@ static int aml_dai_tdm_prepare(struct snd_pcm_substream *substream,
 			if (prtd == NULL) {
 				prtd = (struct aml_chmap*)kzalloc(sizeof(struct aml_chmap), GFP_KERNEL);
 				info->private_data = prtd;
+				/* unresolved until userspace sets a channel map */
+				if (prtd)
+					prtd->chmap_layout = -1;
 			}
 			mutex_init(&prtd->chmap_lock);
 		}
