@@ -94,9 +94,17 @@ static struct channel_speaker_allocation channel_allocations[] = {
 { .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  FC,  LFE,  FR,  FL }, .ca = 0x03 }, /* 3.1 */
 { .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x0b }, /* 5.1 */
 { .channels = 8,  .speakers = { RRC,  RLC,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x13 }, /* 7.1 */
-/* --- extra layouts: advertised/matched only when extra_pcm_layouts=1 --- */
-{ .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  RR,   RL,  FR,  FL }, .ca = 0x08 }, /* 4.0 */
-{ .channels = 5,  .speakers = {  NL,   NL,  NL,  RR,  RL,   FC,  FR,  FL }, .ca = 0x0a }, /* 5.0 */
+/* --- extra layouts: advertised/matched only when extra_pcm_layouts=1 ---
+ * Carried INSIDE the 6-channel (5.1-shaped) container, not as native 4/5-ch
+ * streams. HDMI transmits channels in fixed canonical slots (0:FL 1:FR 2:LFE
+ * 3:FC 4:RL 5:RR); the CA byte only says which are present. A native 4-ch
+ * stream puts RL/RR in the LFE/FC slots, so the receiver (told CA 0x08) loses
+ * RL and plays RR through centre; a native 5-ch stream doesn't frame on the
+ * paired TDM lanes at all. So place each speaker in its canonical slot and
+ * mark the absent ones SND_CHMAP_NA (silent). Kodi matches on the active
+ * (non-NA) channel count and opens the full 6-ch container. */
+{ .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  NA,   NA,  FR,  FL }, .ca = 0x08 }, /* 4.0 */
+{ .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,   NA,  FR,  FL }, .ca = 0x0a }, /* 5.0 */
 };
 
 /*
