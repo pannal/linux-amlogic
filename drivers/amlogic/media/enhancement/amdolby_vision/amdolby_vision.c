@@ -587,6 +587,27 @@ static unsigned int dolby_vision_default_max[3][3] = {
 	{ 600, 1000, 100 },  /* SDR =>  DOVI/HDR/SDR */
 };
 
+/* dolby_vision_target_max only has rows for DOVI/HDR10/SDR; map the
+ * extended source formats onto the matching row so e.g. HLG input uses
+ * the HDR row (incl. the *->SDR target luminance) instead of reading
+ * past the table.
+ */
+static int target_lum_src(int src_format)
+{
+	switch (src_format) {
+	case FORMAT_DOVI:
+	case FORMAT_DOVI_LL:
+		return FORMAT_DOVI;
+	case FORMAT_HDR10:
+	case FORMAT_HLG:
+	case FORMAT_HDR10PLUS:
+	case FORMAT_CUVA:
+		return FORMAT_HDR10;
+	default:
+		return FORMAT_SDR;
+	}
+}
+
 static unsigned int dolby_vision_graphic_min = 50; /* 0.0001 */
 static unsigned int dolby_vision_graphic_max; /* 100 */
 static unsigned int old_dolby_vision_graphic_max;
@@ -6465,7 +6486,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			                graphic_min,
 			                graphic_max * 10000,
 			                dolby_vision_target_min,
-			                dolby_vision_target_max[src_format][dst_format] * 10000,
+			                dolby_vision_target_max[target_lum_src(src_format)][dst_format] * 10000,
 			                (!el_flag && !mel_flag) || (dolby_vision_flags & FLAG_DISABLE_COMPOSER),
 			                &hdr10_param,
 			                &new_dovi_setting);
@@ -6538,7 +6559,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 				h == 0xffff ? 0 : h,
 				src_format, dst_format,
 				dolby_vision_target_min,
-				dolby_vision_target_max[src_format][dst_format],
+				dolby_vision_target_max[target_lum_src(src_format)][dst_format],
 				!is_graphics_output_off(),
 				osd_graphic_width,
 				osd_graphic_height,
@@ -6567,7 +6588,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			h == 0xffff ? 0 : h,
 			src_format, dst_format,
 			dolby_vision_target_min,
-			dolby_vision_target_max[src_format][dst_format],
+			dolby_vision_target_max[target_lum_src(src_format)][dst_format],
 			pri_mode,
 			(!el_flag && !mel_flag),
 			total_md_size, frame_count);
