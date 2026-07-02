@@ -444,6 +444,18 @@ static u32 xbmc_dv_hdr10_min_lum = 0;
 module_param(xbmc_dv_hdr10_min_lum, uint, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_min_lum, "\n xbmc_dv_hdr10_min_lum\n");
 
+/* VS10 ->SDR brightness boost: cap the source's declared peak luminance
+ * (DV source_max_pq / HDR10 mastering peak) before control_path so the
+ * DV library tone-maps for a dimmer source and lifts the SDR output.
+ * 0 = off, 1 = auto (cap at the content's MaxCLL - brightness without
+ * clipping), >= 100 = manual assumed source peak in nits. The *->SDR
+ * column of dolby_vision_target_lum_max is ignored by the library
+ * (proven on-device), so this is the working lever.
+ */
+static u32 xbmc_dv_sdr_src_max_nits = 0;
+module_param(xbmc_dv_sdr_src_max_nits, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_sdr_src_max_nits, "\n xbmc_dv_sdr_src_max_nits\n");
+
 static u16 xbmc_dv_hdr10_max_cll = 0;
 module_param(xbmc_dv_hdr10_max_cll, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_max_cll, "\n xbmc_dv_hdr10_max_cll\n");
@@ -606,6 +618,57 @@ static int target_lum_src(int src_format)
 	default:
 		return FORMAT_SDR;
 	}
+}
+
+/* 12-bit PQ codes for 100..10000 nits in 100-nit steps (SMPTE ST 2084
+ * inverse EOTF, code = round(4095 * PQ(nits / 10000))). Matches the
+ * anchors used by the DV output packet code (1000->3079, 2000->3388,
+ * 4000->3696, 10000->4095).
+ */
+static const u16 nits_to_pq12_tbl[100] = {
+	2081, 2372, 2547, 2672, 2771, 2851, 2920, 2979, 3032, 3079,
+	3121, 3160, 3196, 3229, 3260, 3289, 3316, 3341, 3365, 3388,
+	3410, 3431, 3451, 3470, 3488, 3505, 3522, 3538, 3554, 3569,
+	3583, 3597, 3611, 3624, 3637, 3649, 3662, 3673, 3685, 3696,
+	3707, 3718, 3728, 3738, 3748, 3758, 3767, 3776, 3785, 3794,
+	3803, 3811, 3820, 3828, 3836, 3844, 3852, 3859, 3867, 3874,
+	3881, 3888, 3895, 3902, 3909, 3916, 3922, 3929, 3935, 3941,
+	3947, 3953, 3959, 3965, 3971, 3977, 3982, 3988, 3994, 3999,
+	4004, 4010, 4015, 4020, 4025, 4030, 4035, 4040, 4045, 4050,
+	4055, 4059, 4064, 4068, 4073, 4077, 4082, 4086, 4091, 4095,
+};
+
+static u16 sdr_src_nits_to_pq12(u32 nits)
+{
+	u32 idx;
+
+	if (nits < 100)
+		nits = 100;
+	if (nits > 10000)
+		nits = 10000;
+	idx = (nits - 100 + 50) / 100; /* nearest 100-nit step */
+	if (idx > 99)
+		idx = 99;
+	return nits_to_pq12_tbl[idx];
+}
+
+/* Resolve xbmc_dv_sdr_src_max_nits to effective nits: 0 = off,
+ * 1 = auto (use the content's MaxCLL when sane), >= 100 = manual
+ * ceiling: titles with a sane MaxCLL below it get the full auto
+ * treatment (no clipping), brighter titles are treated as peaking at
+ * the ceiling (content above it clips). The ceiling doubles as the
+ * assumed peak when MaxCLL is missing (and for HLG, which has none).
+ */
+static u32 sdr_src_boost_nits(u32 max_cll)
+{
+	u32 cll = (max_cll >= 100 && max_cll <= 10000) ? max_cll : 0;
+
+	if (xbmc_dv_sdr_src_max_nits >= 100)
+		return (cll && cll < xbmc_dv_sdr_src_max_nits) ?
+			cll : xbmc_dv_sdr_src_max_nits;
+	if (xbmc_dv_sdr_src_max_nits == 1)
+		return cll;
+	return 0;
 }
 
 static unsigned int dolby_vision_graphic_min = 50; /* 0.0001 */
@@ -6471,10 +6534,70 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	    (dst_format == FORMAT_SDR) && !is_dv_ll())
 		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
 
+	/* VS10 DV->SDR brightness boost: cap source_max_pq in the base DM
+	 * data (bytes 66/67, survives the L1/L2 strip above) so the DV
+	 * library assumes a dimmer source and lifts the SDR output. Auto
+	 * uses the stream's L6 MaxCLL (parsed and written by Kodi). */
+	if (xbmc_dv_sdr_src_max_nits && (xbmc_dv_vp == 0) &&
+	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
+	    (dst_format == FORMAT_SDR) && (total_md_size > 67)) {
+		u32 boost_nits = sdr_src_boost_nits(xbmc_dv_md_level_6_max_cll);
+
+		if (boost_nits) {
+			u16 cap_pq = sdr_src_nits_to_pq12(boost_nits);
+			u16 src_max_pq = (md_buf[current_id][66] << 8) |
+					 md_buf[current_id][67];
+
+			if (src_max_pq > cap_pq) {
+				md_buf[current_id][66] = cap_pq >> 8;
+				md_buf[current_id][67] = cap_pq & 0xff;
+			}
+		}
+	}
+
 	if (debug_dolby & 0x400)
 		do_gettimeofday(&start);
 
 	if (module_installed) {
+		struct hdr10_parameter hdr10_param_use = hdr10_param;
+
+		/* VS10 HDR10/HLG->SDR brightness boost: cap the declared
+		 * mastering peak/CLL so the DV library tone-maps for a dimmer
+		 * source. Auto caps at the content's own MaxCLL (brightness
+		 * without clipping; no-op for HLG, which has no CLL). Manual:
+		 * HDR10 caps down the real stream metadata, HLG has none -
+		 * hdr10_param otherwise carries stale values from the last
+		 * HDR10 stream - so SET the assumed peak deterministically;
+		 * best-effort, the library may assume the nominal 1000-nit
+		 * HLG peak and ignore it. */
+		if (xbmc_dv_sdr_src_max_nits && (dst_format == FORMAT_SDR) &&
+		    ((src_format == FORMAT_HDR10) || (src_format == FORMAT_HLG))) {
+			u32 nits = sdr_src_boost_nits(src_format == FORMAT_HLG ?
+				0 : hdr10_param_use.max_content_light_level);
+
+			if (nits) {
+				u32 cap;
+
+				if (nits > 10000)
+					nits = 10000;
+				cap = nits * 10000; /* 0.0001 nit units */
+
+				if (src_format == FORMAT_HLG ||
+				    hdr10_param_use.max_display_mastering_lum > cap)
+					hdr10_param_use.max_display_mastering_lum = cap;
+				/* manual only: also cap the content claims
+				 * (in auto they are the truth already) */
+				if (xbmc_dv_sdr_src_max_nits != 1) {
+					if (src_format == FORMAT_HLG ||
+					    hdr10_param_use.max_content_light_level > nits)
+						hdr10_param_use.max_content_light_level = nits;
+					if (src_format == FORMAT_HLG ||
+					    hdr10_param_use.max_frame_avg_light_level > nits)
+						hdr10_param_use.max_frame_avg_light_level = nits;
+				}
+			}
+		}
+
 		flag = p_funcs_stb->control_path(
 			                src_format, dst_format,
 			                comp_buf[current_id],
@@ -6488,7 +6611,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			                dolby_vision_target_min,
 			                dolby_vision_target_max[target_lum_src(src_format)][dst_format] * 10000,
 			                (!el_flag && !mel_flag) || (dolby_vision_flags & FLAG_DISABLE_COMPOSER),
-			                &hdr10_param,
+			                &hdr10_param_use,
 			                &new_dovi_setting);
 
 		// Copy original source metadata for standard DV (non-LL) output
