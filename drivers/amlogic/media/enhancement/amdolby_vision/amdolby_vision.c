@@ -6541,7 +6541,11 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	if (xbmc_dv_sdr_src_max_nits && (xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
 	    (dst_format == FORMAT_SDR) && (total_md_size > 67)) {
-		u32 boost_nits = sdr_src_boost_nits(xbmc_dv_md_level_6_max_cll);
+		/* many RPUs carry no L6 block (e.g. Nosferatu 2024: L6 absent,
+		 * BL SEI CLL 212) - fall back to the BL's HDR10 SEI CLL like
+		 * the HDMI packet code does */
+		u32 boost_nits = sdr_src_boost_nits(xbmc_dv_md_level_6_max_cll ?
+			xbmc_dv_md_level_6_max_cll : xbmc_dv_hdr10_max_cll);
 
 		if (boost_nits) {
 			u16 cap_pq = sdr_src_nits_to_pq12(boost_nits);
