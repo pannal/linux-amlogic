@@ -3300,6 +3300,32 @@ static int is_policy_changed(void)
   return ret;
 }
 
+/* Kodi flips dolby_vision_xbmc_osd/dolby_vision_subtitles the moment an
+ * OSD or subtitle overlay (dis)appears, but the L5 suppress gate is only
+ * evaluated while composing metadata, which normally happens per new
+ * frame. Poll for changes each vsync so a paused frame gets its metadata
+ * rebuilt too. */
+static int is_l5_gate_changed(void)
+{
+  static unsigned int last_xbmc_osd;
+  static unsigned int last_subtitles;
+  int ret = 0;
+
+  if (last_xbmc_osd != dolby_vision_xbmc_osd ||
+      last_subtitles != dolby_vision_subtitles) {
+    if (xbmc_meta_level_5_osdst || xbmc_meta_level_5_subt) {
+      pr_dolby_dbg("L5 gate changed: osd %u->%u subs %u->%u\n",
+                   last_xbmc_osd, dolby_vision_xbmc_osd,
+                   last_subtitles, dolby_vision_subtitles);
+      ret = 1;
+    }
+    last_xbmc_osd = dolby_vision_xbmc_osd;
+    last_subtitles = dolby_vision_subtitles;
+  }
+
+  return ret;
+}
+
 static bool vf_is_hdr10_plus(struct vframe_s *vf);
 static bool vf_is_hdr10(struct vframe_s *vf);
 static bool vf_is_hlg(struct vframe_s *vf);
@@ -7099,6 +7125,7 @@ int dolby_vision_process(struct vframe_s *vf,
 	int video_status = 0;
 	int graphic_status = 0;
 	int policy_changed = 0;
+	int l5_gate_changed = 0;
 	int sink_changed = 0;
 	int format_changed = 0;
 	u8 core_mask = 0x7;
@@ -7221,7 +7248,9 @@ int dolby_vision_process(struct vframe_s *vf,
 
 	/* monitor policy changes */
 	policy_changed = is_policy_changed();
-	if (policy_changed || format_changed || (graphic_status & 2) || osd_update) {
+	l5_gate_changed = is_l5_gate_changed();
+	if (policy_changed || format_changed || (graphic_status & 2) || osd_update ||
+	    l5_gate_changed) {
 		dolby_vision_set_toggle_flag(1);
 		if (osd_update) osd_update = false;
 	}
@@ -7233,7 +7262,7 @@ int dolby_vision_process(struct vframe_s *vf,
 
 	if (sink_changed || policy_changed || format_changed ||
 	    (video_status == 1 && !(dolby_vision_flags & FLAG_CERTIFICAION)) ||
-	    (graphic_status & 2) ||
+	    (graphic_status & 2) || l5_gate_changed ||
 	    (dolby_vision_flags & FLAG_FORCE_HDMI_PKT)) {
 		if (debug_dolby & 1)
 			pr_dolby_dbg("sink %s,cap 0x%x,video %s,osd %s,vf %p,toggle %d\n",
