@@ -2881,9 +2881,19 @@ static int aml_cec_probe(struct platform_device *pdev)
 	cec_set_clk(&pdev->dev);
 	/* irq set */
 	cec_irq_enable(false);
-	/* Init cec function from register*/
+	/* Seed the function config from uboot (config.ini cec_func_config,
+	 * passed as the "hdmitx=cecXX" bootarg): bl301 reads its CEC wake
+	 * mask from AO_DEBUG_REG0 at suspend entry, and nothing in CE
+	 * userspace programs it via ioctl - libCEC's AOCEC adapter only
+	 * uses SET_OPTION_SYS_CTRL. Seeding CEC_FUNC_CFG_ALL here armed
+	 * wake-by-<UCP power>/<Image View On> regardless of the user's
+	 * wake-up settings.
+	 */
+#ifdef CONFIG_AMLOGIC_HDMITX
+	cec_dev->cfg = get_hdmitx_device()->cec_func_config;
+#else
 	cec_dev->cfg = CEC_FUNC_CFG_ALL;
-	//cec_func_init(cec_dev->cfg);
+#endif
 	/* for init */
 	cec_pre_init();
 
