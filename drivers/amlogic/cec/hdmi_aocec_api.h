@@ -19,6 +19,7 @@ extern struct hrtimer start_bit_check;
 extern bool ceca_err_flag;
 extern bool ee_cec;
 extern unsigned char msg_log_buf[128];
+extern bool enable_cec_mailbox;
 
 #define MAX_LOG_ADDR_CNT 1
 

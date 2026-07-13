@@ -68,6 +68,18 @@ bool ee_cec;
 struct hrtimer start_bit_check;
 unsigned char msg_log_buf[128] = { 0 };
 
+/* CE: cec_save_mail_box() SCPI sync stays disabled by default (see
+ * f33da666693d "aocec: disable cec_save_mail_box"): SCPI_CL_SET_CEC_DATA
+ * is not recognized by all uboot 2015.01 BL30s, stalling every
+ * suspend/shutdown for the 10s SCPI wait, and bl301 takes its CEC wake
+ * mask from AO_DEBUG_REG0/REG1, not from this push. Defined here (not in
+ * hdmi_aocec_api.c, where the backport moved the function) to keep the
+ * original hdmi_ao_cec.enable_cec_mailbox parameter name.
+ */
+bool enable_cec_mailbox;
+module_param(enable_cec_mailbox, bool, 0644);
+MODULE_PARM_DESC(enable_cec_mailbox, "Enable SCPI mailbox sync in cec_save_mail_box");
+
 static struct dbgflg stdbgflg;
 static int phy_addr_test;
 static struct tasklet_struct ceca_tasklet;

@@ -2306,6 +2306,11 @@ void cec_save_mail_box(void)
 	unsigned int tmp;
 	struct st_cec_mailbox_data cec_mailbox;
 
+	if (!enable_cec_mailbox) {
+		CEC_INFO("%s: skipped (enable_cec_mailbox=0)\n", __func__);
+		return;
+	}
+
 	CEC_INFO("%s\n", __func__);
 	tmp = cec_get_cur_phy_addr();
 	//use register AO_DEBUG_REG1 to save physical addr,no need cec_dev->phy_addr
