@@ -456,6 +456,14 @@ static u32 xbmc_dv_sdr_src_max_nits = 0;
 module_param(xbmc_dv_sdr_src_max_nits, uint, 0664);
 MODULE_PARM_DESC(xbmc_dv_sdr_src_max_nits, "\n xbmc_dv_sdr_src_max_nits\n");
 
+/* VS10 DV->SDR: keep the source's ETSI extension metadata (L1 per-shot
+ * anchors + L2 creative SDR trims) instead of stripping it before
+ * control_path. 0 = strip (avdvplus R8 behavior, static tone curve),
+ * 1 = keep (per-frame Dolby display management, default). */
+static u32 xbmc_dv_sdr_keep_ext = 1;
+module_param(xbmc_dv_sdr_keep_ext, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_sdr_keep_ext, "\n xbmc_dv_sdr_keep_ext\n");
+
 static u16 xbmc_dv_hdr10_max_cll = 0;
 module_param(xbmc_dv_hdr10_max_cll, ushort, 0664);
 MODULE_PARM_DESC(xbmc_dv_hdr10_max_cll, "\n xbmc_dv_hdr10_max_cll\n");
@@ -6602,8 +6610,10 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 	/* VS10 DV→SDR: clear extension block count so the DV engine uses
 	 * default tone mapping instead of being influenced by source L1/L2
-	 * metadata, which can cause incorrect brightness in SDR output. */
-	if ((xbmc_dv_vp == 0) &&
+	 * metadata, which can cause incorrect brightness in SDR output.
+	 * xbmc_dv_sdr_keep_ext bypasses the strip so the library sees the
+	 * per-shot L1 anchors and the colorist's 100-nit L2 trims. */
+	if (!xbmc_dv_sdr_keep_ext && (xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
 	    (dst_format == FORMAT_SDR) && !is_dv_ll())
 		md_buf[current_id][ETSI_META_OFFSET-1] = 0x00;
