@@ -3540,6 +3540,10 @@ static int dolby_vision_policy_process
 }
 
 static char dv_provider[32] = "dvbldec";
+/* set on provider change, consumed by dolby_vision_parse_metadata: the
+ * previous stream's parser context and metadata backups must not leak
+ * into the new stream */
+static bool dv_provider_changed;
 
 void dolby_vision_set_provider(char *prov_name)
 {
@@ -3547,6 +3551,7 @@ void dolby_vision_set_provider(char *prov_name)
 		if (strcmp(dv_provider, prov_name)) {
 			strcpy(dv_provider, prov_name);
 			dv_provider_is_dvbldec = !strcmp(prov_name, "dvbldec");
+			dv_provider_changed = true;
 			pr_dolby_dbg("provider changed to %s\n", dv_provider);
 		}
 	}
@@ -4219,8 +4224,11 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				if (vf)
 					pr_dolby_error("meta(%d), pts(%lld) -> metadata parser init fail\n",
 					               size, vf->pts_us64);
-				*total_comp_size = backup_comp_size;
-				*total_md_size = backup_md_size;
+				/* keep totals at 0 (zeroed at branch entry): a
+				 * failed VS10/ATSC T35 probe has no previous
+				 * metadata of its own to fall back to, and
+				 * restoring the backups here leaks another
+				 * stream's metadata into this one */
 				ret = 2;
 				goto parse_err;
 			}
@@ -4242,7 +4250,15 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				if (vf)
 					pr_dolby_error("meta(%d), pts(%lld) -> metadata parser process fail\n",
 					               size, vf->pts_us64);
-				ret = 3;
+				/* ret 4, not 3: a failed VS10/ATSC T35 probe is
+				 * a false DV detection (e.g. x265 SDR content
+				 * with T35 SEI), never a transient RPU error in
+				 * a running DV stream. parse_sei_and_meta only
+				 * restores the last-good-parse backups for
+				 * ret 3, so totals stay 0 and the caller's
+				 * false-detection guard resolves the frame to
+				 * SDR instead of inheriting stale metadata. */
+				ret = 4;
 			} else {
 				if (*total_comp_size + comp_size < COMP_BUF_SIZE)
 					*total_comp_size += comp_size;
@@ -4321,6 +4337,12 @@ static int parse_sei_and_meta
 		backup_comp_size = *total_comp_size;
 		backup_md_size = *total_md_size;
 	}
+	/* ret 3 = RPU process failure in a DV stream: reuse the last good
+	 * metadata so one corrupt RPU doesn't glitch playback. ret 4 (failed
+	 * VS10/ATSC T35 probe) deliberately does NOT restore: totals stay 0
+	 * so the false-DV-detection guard in dolby_vision_parse_metadata can
+	 * resolve the frame to SDR instead of running another stream's
+	 * metadata over non-DV content. */
 	if (ret == 3) {
 		*total_comp_size = backup_comp_size;
 		*total_md_size = backup_md_size;
@@ -5848,6 +5870,32 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 	if (!dolby_vision_enable || !module_installed)
 		return -1;
+
+	/* provider changed = new source stream. Release the metadata parser
+	 * and drop the last-good-parse backups so the previous stream's
+	 * metadata cannot leak into this one. Without this, SDR content
+	 * whose T35 SEI false-triggers the DV/VS10 probe inherits the
+	 * previous DV title's metadata through the parse-failure backup
+	 * restore in parse_sei_and_meta (guard sees total_md_size != 0),
+	 * and every frame then renders through the stale dovi_setting
+	 * (green/purple picture). The play_id based release in
+	 * parse_sei_and_meta_ext only works for the v4l path; this covers
+	 * the amports/OTT path.
+	 */
+	if (dv_provider_changed) {
+		dv_provider_changed = false;
+		if (metadata_parser) {
+			if (p_funcs_stb)
+				p_funcs_stb->metadata_parser_release();
+			metadata_parser = NULL;
+			pr_dolby_dbg("provider change, release parser\n");
+		}
+		backup_comp_size = 0;
+		backup_md_size = 0;
+		last_total_md_size = 0;
+		last_total_comp_size = 0;
+		dolby_vision_clear_buf();
+	}
 
 	if (vf) {
 		video_frame = true;
