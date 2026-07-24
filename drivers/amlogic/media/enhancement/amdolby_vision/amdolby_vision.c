@@ -501,10 +501,19 @@ MODULE_PARM_DESC(xbmc_detected_l5_right, "\n xbmc_detected_l5_right\n");
  * xbmc_force_l5_override is true, the L5 substitution and append paths
  * use these xbmc_override_l5_* values regardless of source RPU L5 state.
  * "0,0,0,0" is a legitimate override meaning "treat the stream as having
- * no bars / full active frame". */
+ * no bars / full active frame".
+ * With xbmc_l5_override_additive also set, the override offsets are ADDED
+ * to each frame's source L5 instead of replacing it (Kodi auto-letterbox
+ * for cropped encodes: the override carries the player-added padding, the
+ * RPU carries the per-scene baked bars — the sink needs the sum). Frames
+ * without a source L5 block emit the override values alone. */
 static bool xbmc_force_l5_override = false;
 module_param(xbmc_force_l5_override, bool, 0664);
 MODULE_PARM_DESC(xbmc_force_l5_override, "\n xbmc_force_l5_override - replace source L5 with xbmc_override_l5_* even when source L5 is non-zero\n");
+
+static bool xbmc_l5_override_additive = false;
+module_param(xbmc_l5_override_additive, bool, 0664);
+MODULE_PARM_DESC(xbmc_l5_override_additive, "\n xbmc_l5_override_additive - add xbmc_override_l5_* to the source frame L5 instead of replacing it\n");
 
 static u16 xbmc_override_l5_top;
 module_param(xbmc_override_l5_top, ushort, 0664);
@@ -5634,6 +5643,32 @@ static inline void build_level_5_override_data(unsigned char *dst)
                           xbmc_override_l5_left, xbmc_override_l5_right);
 }
 
+/* Additive override: the frame's source L5 offsets plus the override
+ * offsets, saturated to u16. src_l5 points at the source L5 block
+ * (layout as written by build_level_5_data_from); offsets live at
+ * bytes 5..12 as big-endian u16 left/right/top/bottom. */
+static inline u16 l5_saturating_add(u16 a, u16 b)
+{
+  u32 sum = (u32)a + (u32)b;
+
+  return (sum > 0xFFFF) ? 0xFFFF : (u16)sum;
+}
+
+static inline void build_level_5_additive_data(unsigned char *dst,
+                                               const unsigned char *src_l5)
+{
+  u16 left   = ((u16)src_l5[5] << 8)  | src_l5[6];
+  u16 right  = ((u16)src_l5[7] << 8)  | src_l5[8];
+  u16 top    = ((u16)src_l5[9] << 8)  | src_l5[10];
+  u16 bottom = ((u16)src_l5[11] << 8) | src_l5[12];
+
+  build_level_5_data_from(dst,
+                          l5_saturating_add(top, xbmc_override_l5_top),
+                          l5_saturating_add(bottom, xbmc_override_l5_bottom),
+                          l5_saturating_add(left, xbmc_override_l5_left),
+                          l5_saturating_add(right, xbmc_override_l5_right));
+}
+
 /* Selector — picks override or detect helper based on the force flag.
  * Used by the L5-append paths (out-of-order and end-of-loop) so the
  * override correctly drives them too, not just the in-stream substitution. */
@@ -5759,13 +5794,20 @@ static inline void source_meta_copy(
          *   1. xbmc_force_l5_override: unconditional override path
          *      (service.p3i.override addon). Uses xbmc_override_l5_*;
          *      0,0,0,0 is a valid override meaning "no bars".
+         *      With xbmc_l5_override_additive (Kodi auto-letterbox on
+         *      cropped encodes) the override is added to the frame's
+         *      source L5 instead, so variable in-picture bars compose
+         *      with the player-added padding per frame.
          *   2. Otherwise: legacy auto-fill path — only when source L5
          *      is all-zero AND we have at least one non-zero detected
          *      value. Uses xbmc_detected_l5_*. */
         bool substituted = false;
         if (xbmc_detect_active_area) {
           if (xbmc_force_l5_override) {
-            build_level_5_override_data(combo_index);
+            if (xbmc_l5_override_additive)
+              build_level_5_additive_data(combo_index, orig_index);
+            else
+              build_level_5_override_data(combo_index);
             substituted = true;
           } else if (is_level_5_all_zero(orig_index) &&
                      (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
