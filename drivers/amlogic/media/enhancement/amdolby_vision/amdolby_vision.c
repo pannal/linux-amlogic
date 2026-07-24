@@ -6557,7 +6557,12 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	 * levels are properly formatted before control_path processes them.
 	 * Clamps L1 min_pq to at least 17 and filters levels for SDR output
 	 * based on source luminance. Without this, control_path may produce
-	 * static output, losing HDR10+ per-scene dynamic tonemapping. */
+	 * static output, losing HDR10+ per-scene dynamic tonemapping.
+	 * xbmc_dv_sdr_keep_ext disables the SDR-output filtering (in_scope)
+	 * so ->SDR keeps every level like other targets do - Player-Led /
+	 * VS10-Only is the path SDR-display users actually run (is_dv_ll()
+	 * is true whenever the DV type is not Display-Led), so the strip
+	 * bypass below never fires for them; this is their equivalent. */
 	if ((xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
 	    is_dv_ll()) {
@@ -6567,7 +6572,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		size_t remaining_input = total_md_size - ETSI_META_OFFSET;
 		size_t remaining_space = total_md_size - ETSI_META_OFFSET;
 		uint8_t num_levels = 0;
-		const bool in_scope = (dst_format == FORMAT_SDR);
+		const bool in_scope = (dst_format == FORMAT_SDR) &&
+				      !xbmc_dv_sdr_keep_ext;
 
 		while ((md_index < md_end_index) &&
 		       (remaining_input >= 5) &&
