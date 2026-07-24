@@ -589,7 +589,16 @@ static unsigned int g_vtiming;
 module_param(g_vtiming, uint, 0664);
 MODULE_PARM_DESC(g_vtiming, "\n vpotch\n");
 
-static unsigned int dolby_vision_target_min = 50; /* 0.0001 */
+/* Target display min luminance handed to the DV control path, in
+ * 0.0001 nit units. The stock 50 (0.005 nits) makes every VS10
+ * mapping floor video black at PQ code ~77 (10-bit), visible as
+ * black crush below code ~80 on PQ output (github CoreELEC #83).
+ * 1 (0.0001 nits) keeps the floor at PQ code ~65, one step above
+ * reference black.
+ */
+static unsigned int dolby_vision_target_min = 1;
+module_param(dolby_vision_target_min, uint, 0664);
+MODULE_PARM_DESC(dolby_vision_target_min, "\n dolby_vision_target_min\n");
 
 static unsigned int dolby_vision_target_lum_max[9] = { 
 	4000, 1000, 100,  // DOVI => DOVI/HDR/SDR
@@ -6323,7 +6332,9 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 					graphic_min =
 					dolby_vision_target_min =
 						(vinfo->vout_device->
-						dv_info->tminLUM ^ 2)
+						dv_info->tminLUM *
+						vinfo->vout_device->
+						dv_info->tminLUM)
 						* 10000 / (127 * 127);
 				}
 			}
@@ -6331,8 +6342,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			if (vinfo->hdr_info.lumi_max) {
 				/* Luminance value = 50 * (2 ^ (CV/32)) */
 				graphic_max =
-				target_lumin_max = 50 *
-					(2 ^ (vinfo->hdr_info.lumi_max >> 5));
+				target_lumin_max = 50 <<
+					(vinfo->hdr_info.lumi_max >> 5);
 				/* Desired Content Min Luminance =*/
 				/*	Desired Content Max Luminance*/
 				/*	* (CV/255) * (CV/255) / 100	*/
