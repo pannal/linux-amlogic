@@ -2305,13 +2305,19 @@ static void apply_stb_core_settings
 
   if (mask & 2) {  // Core 2
     if (stb_core_setting_update_flag != CP_FLAG_CHANGE_ALL) {
-      // when CP_FLAG_CONST_TC2 is set,
-      // set the stb_core_setting_update_flag
-      // until only meeting the CP_FLAG_CONST_TC2
-      if (stb_core_setting_update_flag & CP_FLAG_CONST_TC2)
-        stb_core2_const_flag = true;
-      else if (stb_core_setting_update_flag & CP_FLAG_CHANGE_TC2)
+      /* CHANGE_TC2 wins when the library reports both bits at once —
+       * dolby_core2_set() below already gives CHANGE priority and programs
+       * the LUT, so latching "const" here makes it program the *previous*
+       * curve instead of the fresh one. At stream open that previous curve
+       * is still the pre-playback state (SDR source, 600-nit target), which
+       * renders the OSD black against a DV target; and because a stream
+       * whose metadata then stays constant reports neither bit, the latch
+       * never clears itself and the dead curve is re-applied every frame
+       * until the first real scene change. */
+      if (stb_core_setting_update_flag & CP_FLAG_CHANGE_TC2)
         stb_core2_const_flag = false;
+      else if (stb_core_setting_update_flag & CP_FLAG_CONST_TC2)
+        stb_core2_const_flag = true;
     }
     /* revert the core2 lut as last corret one when const case */
     if (stb_core2_const_flag)
