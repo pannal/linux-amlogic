@@ -2304,13 +2304,25 @@ static void apply_stb_core_settings
   }
 
   if (mask & 2) {  // Core 2
-    if (stb_core_setting_update_flag != CP_FLAG_CHANGE_ALL) {
+    /* Decide const-vs-change from *this* frame's control_path result
+     * (update_bk), not from the value after the double-apply OR above.
+     * update_flag_more can raise that to CP_FLAG_CHANGE_ALL, which skips the
+     * whole block and leaves the library's dm_lut2 in place — but on a frame
+     * where the library reported CP_FLAG_CONST_TC2 that LUT is not valid, it
+     * is only telling us to keep using the last one. Programming it blacks
+     * out the OSD, and on a stream whose opening metadata never changes no
+     * later frame reports either TC2 bit, so the dead curve is re-applied
+     * until the first real scene change.
+     * CONST keeps priority over CHANGE here on purpose: when both bits are
+     * set the LUT is still invalid, so reusing the last applied curve is
+     * correct (that is also what keeps a seek back to the start working). */
+    if (update_bk != CP_FLAG_CHANGE_ALL) {
       // when CP_FLAG_CONST_TC2 is set,
       // set the stb_core_setting_update_flag
       // until only meeting the CP_FLAG_CONST_TC2
-      if (stb_core_setting_update_flag & CP_FLAG_CONST_TC2)
+      if (update_bk & CP_FLAG_CONST_TC2)
         stb_core2_const_flag = true;
-      else if (stb_core_setting_update_flag & CP_FLAG_CHANGE_TC2)
+      else if (update_bk & CP_FLAG_CHANGE_TC2)
         stb_core2_const_flag = false;
     }
     /* revert the core2 lut as last corret one when const case */
