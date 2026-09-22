@@ -79,6 +79,8 @@ extern bool xbmc_aml_linux_force_422;
 extern bool xbmc_dv_non_ipt;
 extern unsigned int xbmc_dv_vp;
 static int set_disp_mode_auto(void);
+static int set_disp_mode_auto_locked(void);
+static void hdmitx_cancel_dv_reconnect(struct hdmitx_dev *hdev);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
 void hdmitx_set_vsif_pkt(enum eotf_type type, enum mode_type
@@ -250,6 +252,7 @@ static void hdmitx_early_suspend(struct early_suspend *h)
 
 	phdmi->ready = 0;
 	phdmi->hpd_lock = 1;
+	hdmitx_cancel_dv_reconnect(hdev);
 	hdev->hwop.cntlmisc(hdev, MISC_SUSFLAG, 1);
 	usleep_range(10000, 10010);
 	phdmi->hwop.cntlmisc(phdmi, MISC_AVMUTE_OP, SET_AVMUTE);
@@ -387,6 +390,7 @@ static int hdmitx_reboot_notifier(struct notifier_block *nb,
 	cancel_delayed_work_sync(&hdev->work_hpd_plugin);
 	cancel_delayed_work_sync(&hdev->work_hpd_plugout);
 	cancel_work_sync(&hdev->work_hdr);
+	hdmitx_cancel_dv_reconnect(hdev);
 	hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
 	if (hdev->debug_param.avmute_frame > 0)
 		msleep(mute_us / 1000);
@@ -614,7 +618,7 @@ static void edidinfo_detach_to_vinfo(struct hdmitx_dev *hdev)
 	hdmitx_vdev.dv_info = &dv_dummy;
 }
 
-static int set_disp_mode_auto(void)
+static int set_disp_mode_auto_locked(void)
 {
 	int ret =  -1;
 
@@ -885,6 +889,17 @@ static int set_disp_mode_auto(void)
 	return ret;
 }
 
+/* HPD work already holds setclk_mutex; vout/sysfs callers enter here. */
+static int set_disp_mode_auto(void)
+{
+	int ret;
+
+	mutex_lock(&setclk_mutex);
+	ret = set_disp_mode_auto_locked();
+	mutex_unlock(&setclk_mutex);
+	return ret;
+}
+
 /*disp_mode attr*/
 static ssize_t show_disp_mode(struct device *dev,
 	struct device_attribute *attr, char *buf)
@@ -899,7 +914,9 @@ static ssize_t show_disp_mode(struct device *dev,
 static ssize_t store_disp_mode(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+	mutex_lock(&setclk_mutex);
 	set_disp_mode(buf);
+	mutex_unlock(&setclk_mutex);
 	return count;
 }
 
@@ -919,6 +936,7 @@ static ssize_t show_attr(struct device *dev,
 ssize_t store_attr(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+	mutex_lock(&setclk_mutex);
 	strncpy(hdmitx_device.fmt_attr, buf, sizeof(hdmitx_device.fmt_attr));
 	hdmitx_device.fmt_attr[15] = '\0';
 	if (!memcmp(hdmitx_device.fmt_attr, "rgb", 3))
@@ -931,9 +949,10 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
 	if (strstr(hdmitx_device.fmt_attr,"now")){
-		set_disp_mode_auto();
+		set_disp_mode_auto_locked();
 		memcpy(strstr(hdmitx_device.fmt_attr,"now"), " ", 3);
 	}
+	mutex_unlock(&setclk_mutex);
 
 	return count;
 }
@@ -1899,6 +1918,95 @@ void update_current_para(struct hdmitx_dev *hdev)
 	hdev->para = hdmi_get_fmt_name(mode, hdev->fmt_attr);
 }
 
+/* A reconnect must use the newly read sink capabilities. */
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+static bool hdmitx_sink_supports_std_dv(const struct hdmitx_dev *hdev)
+{
+	const struct dv_info *dv = &hdev->rxcap.dv_info;
+
+	if (dv->ieeeoui != DV_IEEE_OUI || dv->block_flag != CORRECT)
+		return false;
+	return dv->ver == 0 ||
+		(dv->ver == 1 && (dv->length == 0xb || dv->length == 0xe)) ||
+		(dv->ver == 2 && (dv->Interface == 2 || dv->Interface == 3));
+}
+
+#endif
+
+static bool hdmitx_dv_reconnect_allowed(const struct hdmitx_dev *hdev)
+{
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	int mode = get_dolby_vision_mode();
+
+	return !hdev->hpd_lock && !hdev->bist_lock &&
+		!xbmc_dv_non_ipt && !xbmc_aml_linux_force_422 &&
+		is_dolby_vision_enable() && is_dolby_vision_on() &&
+		(mode == DOLBY_VISION_OUTPUT_MODE_IPT ||
+		 mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL) &&
+		hdmitx_sink_supports_std_dv(hdev);
+#else
+	(void)hdev;
+	return false;
+#endif
+}
+
+/* Called with edid_spinlock held; the VSIF callback can run in IRQ context. */
+static void hdmitx_queue_dv_reconnect(struct hdmitx_dev *hdev)
+{
+	if (hdev->dv_reconnect_pending &&
+	    hdev->hdmi_current_eotf_type == EOTF_T_DOLBYVISION &&
+	    hdev->hdmi_current_tunnel_mode == RGB_8BIT &&
+	    hdmitx_dv_reconnect_allowed(hdev))
+		schedule_work(&hdev->work_dv_reconnect);
+}
+
+static void hdmitx_dv_reconnect_work(struct work_struct *work)
+{
+	struct hdmitx_dev *hdev = container_of(work, struct hdmitx_dev,
+		work_dv_reconnect);
+	unsigned long flags;
+	bool repair = false;
+
+	/* Serialize with unplug/plug and never sleep under edid_spinlock. */
+	mutex_lock(&setclk_mutex);
+	if (!hdev->hwop.cntlmisc(hdev, MISC_HPD_GPI_ST, 0))
+		goto out;
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (hdev->dv_reconnect_pending && hdev->hpd_state && hdev->ready) {
+		repair = hdmitx_dv_reconnect_allowed(hdev) &&
+			hdev->hdmi_current_eotf_type == EOTF_T_DOLBYVISION &&
+			hdev->hdmi_current_tunnel_mode == RGB_8BIT;
+		/* Consume before modeset so fresh VSIFs cannot create a loop. */
+		hdev->dv_reconnect_pending = false;
+		if (repair)
+			hdev->ready = 0;
+	}
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	if (repair) {
+		pr_info("DV: restoring RGB8 transport after HDMI reconnect\n");
+		set_disp_mode_auto_locked();
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+		/* Modeset replaces AVI; request current metadata, not a saved VSIF. */
+		dolby_vision_set_toggle_flag(3);
+#endif
+	}
+out:
+	mutex_unlock(&setclk_mutex);
+}
+
+static void hdmitx_cancel_dv_reconnect(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	hdev->hpd_lock = 1;
+	hdev->dv_reconnect_pending = false;
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	cancel_work_sync(&hdev->work_dv_reconnect);
+	/* An in-flight modeset may have set ready again before cancellation. */
+	hdev->ready = 0;
+}
+
 struct vsif_debug_save vsif_debug_info;
 struct vsif_debug_save hsty_vsif_config_data[8];
 unsigned int hsty_vsif_config_loc, hsty_vsif_config_num;
@@ -2242,6 +2350,7 @@ void hdmitx_set_vsif_pkt(enum eotf_type type,
 			}
 		}
 	}
+	hdmitx_queue_dv_reconnect(hdev);
 	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 }
 
@@ -6188,6 +6297,7 @@ bool is_tv_changed(void)
 static void hdmitx_hpd_plugin_handler(struct work_struct *work)
 {
 	char bksv_buf[5];
+	unsigned long flags;
 	struct vinfo_s *info = NULL;
 	struct hdmitx_dev *hdev = container_of((struct delayed_work *)work,
 		struct hdmitx_dev, work_hpd_plugin);
@@ -6231,7 +6341,12 @@ static void hdmitx_hpd_plugin_handler(struct work_struct *work)
 		rx_set_receive_hdcp(bksv_buf, 1, 1, 0, 0);
 	}
 
-	set_disp_mode_auto();
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (!hdmitx_dv_reconnect_allowed(hdev))
+		hdev->dv_reconnect_pending = false;
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+
+	set_disp_mode_auto_locked();
 	info = hdmitx_get_current_vinfo();
 	if (info && (info->mode == VMODE_HDMI))
 		hdmitx_set_audio(hdev, &(hdev->cur_audio_param));
@@ -6296,6 +6411,7 @@ static void clear_rx_vinfo(struct hdmitx_dev *hdev)
 
 static void hdmitx_hpd_plugout_handler(struct work_struct *work)
 {
+	unsigned long flags;
 	struct hdmitx_dev *hdev = container_of((struct delayed_work *)work,
 		struct hdmitx_dev, work_hpd_plugout);
 
@@ -6307,6 +6423,15 @@ static void hdmitx_hpd_plugout_handler(struct work_struct *work)
 	hdev->hwop.cntlddc(hdev, DDC_HDCP_MUX_INIT, 1);
 	hdev->hwop.cntlddc(hdev, DDC_HDCP_OP, HDCP14_OFF);
 	mutex_lock(&setclk_mutex);
+	/* Remember the live context, but do not replay its packets on reconnect.
+	 * Retain an outstanding repair across HPD bounce before VSIF resumes.
+	 */
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (!hdev->hpd_lock && !xbmc_dv_non_ipt &&
+	    hdev->hdmi_current_eotf_type == EOTF_T_DOLBYVISION &&
+	    hdev->hdmi_current_tunnel_mode == RGB_8BIT)
+		hdev->dv_reconnect_pending = true;
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 	if (hdev->cedst_policy)
 		cancel_delayed_work(&hdev->work_cedst);
 	edidinfo_detach_to_vinfo(hdev);
@@ -6472,6 +6597,8 @@ static int hdmi_task_handle(void *data)
 	hdmitx_set_uevent(HDMITX_HDCPPWR_EVENT, HDMI_WAKEUP);
 
 	INIT_WORK(&hdmitx_device->work_hdr, hdr_work_func);
+	INIT_WORK(&hdmitx_device->work_dv_reconnect, hdmitx_dv_reconnect_work);
+	hdmitx_device->dv_reconnect_pending = false;
 	hdmitx_device->hdmi_wq = alloc_workqueue(DEVICE_NAME,
 		WQ_HIGHPRI | WQ_CPU_INTENSIVE, 0);
 	INIT_DELAYED_WORK(&hdmitx_device->work_hpd_plugin,
@@ -7243,6 +7370,7 @@ static int amhdmitx_remove(struct platform_device *pdev)
 {
 	struct device *dev = hdmitx_device.hdtx_dev;
 
+	hdmitx_cancel_dv_reconnect(&hdmitx_device);
 	cancel_work_sync(&hdmitx_device.work_hdr);
 
 	if (hdmitx_device.hwop.uninit)
