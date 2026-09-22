@@ -936,22 +936,35 @@ static ssize_t show_attr(struct device *dev,
 ssize_t store_attr(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+	char *now;
+
 	mutex_lock(&setclk_mutex);
+	/* A refresh must not discard the explicit colour/depth selection. */
+	if (sysfs_streq(buf, "now")) {
+		set_disp_mode_auto_locked();
+		goto out;
+	}
+
 	strncpy(hdmitx_device.fmt_attr, buf, sizeof(hdmitx_device.fmt_attr));
 	hdmitx_device.fmt_attr[15] = '\0';
-	if (!memcmp(hdmitx_device.fmt_attr, "rgb", 3))
+	if (strstr(hdmitx_device.fmt_attr, "rgb"))
 		hdmitx_device.para->cs = COLORSPACE_RGB444;
-	else if (!memcmp(hdmitx_device.fmt_attr, "422", 3))
+	else if (strstr(hdmitx_device.fmt_attr, "422"))
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
-	else if (!memcmp(hdmitx_device.fmt_attr, "420", 3))
+	else if (strstr(hdmitx_device.fmt_attr, "444"))
+		hdmitx_device.para->cs = COLORSPACE_YUV444;
+	else if (strstr(hdmitx_device.fmt_attr, "420"))
 		hdmitx_device.para->cs = COLORSPACE_YUV420;
 	else
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
 
-	if (strstr(hdmitx_device.fmt_attr,"now")){
+	now = strstr(hdmitx_device.fmt_attr, "now");
+	if (now) {
+		/* Keep the refresh command out of the saved mode attributes. */
+		memset(now, ' ', 3);
 		set_disp_mode_auto_locked();
-		memcpy(strstr(hdmitx_device.fmt_attr,"now"), " ", 3);
 	}
+out:
 	mutex_unlock(&setclk_mutex);
 
 	return count;
