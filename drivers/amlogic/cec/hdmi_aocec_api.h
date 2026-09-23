@@ -114,6 +114,7 @@ void cec_debug_fs_init(void);
 unsigned int read_clock(unsigned int addr);
 unsigned int read_periphs(unsigned int addr);
 unsigned int get_pin_status(void);
+const char *cec_pin_level(void);
 void cec_spd_info_init(void);
 void delete_current_spd_info(unsigned int phy_addr);
 void update_current_spd_5v(int port_id, bool is5V);

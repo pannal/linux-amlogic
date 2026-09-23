@@ -2751,3 +2751,12 @@ unsigned int get_pin_status(void)
 
 	return reg;
 }
+
+const char *cec_pin_level(void)
+{
+	unsigned int level = get_pin_status();
+
+	if (level == 0xff)
+		return "unsupported";
+	return level ? "high" : "low";
+}

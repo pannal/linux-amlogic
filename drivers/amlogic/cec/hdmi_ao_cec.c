@@ -205,17 +205,17 @@ void cecb_irq_handle(void)
 	    (intr_cec & CEC_IRQ_TX_ARB_LOST) ||
 	    (intr_cec & CEC_IRQ_TX_ERR_INITIATOR)) {
 		if (intr_cec & CEC_IRQ_TX_NACK) {
-			CEC_PRINT("TX FAIL_NACK, pin_status: %d\n", get_pin_status());
+			CEC_PRINT("TX FAIL_NACK, pin_level: %s\n", cec_pin_level());
 			cec_tx_result = CEC_FAIL_NACK;
 		} else if (intr_cec & CEC_IRQ_TX_ARB_LOST) {
-			CEC_PRINT("TX FAIL_BUSY(ARB_LOST), pin_status: %d\n", get_pin_status());
+			CEC_PRINT("TX FAIL_BUSY(ARB_LOST), pin_level: %s\n", cec_pin_level());
 			cec_tx_result = CEC_FAIL_BUSY;
 			/* clear start */
 			hdmirx_cec_write(DWC_CEC_TX_CNT, 0);
 			hdmirx_set_bits_dwc(DWC_CEC_CTRL, 0, 0, 3);
 		} else if (intr_cec & CEC_IRQ_TX_ERR_INITIATOR) {
-			CEC_PRINT("TX FAIL_OTHER(INITIATOR_ERR: int_sts:0x%x), pin_status: %d\n",
-				intr_cec, get_pin_status());
+			CEC_PRINT("TX FAIL_OTHER(INITIATOR_ERR: int_sts:0x%x), pin_level: %s\n",
+				intr_cec, cec_pin_level());
 			cec_tx_result = CEC_FAIL_OTHER;
 		} else {
 			dprintk(L_2, "irq_flg: Other\n");
@@ -226,7 +226,7 @@ void cecb_irq_handle(void)
 
 	/* RX error irq flag */
 	if (intr_cec & CEC_IRQ_RX_ERR_FOLLOWER) {
-		CEC_PRINT("RX FOLLOWER_ERR, pin_status: %d\n", get_pin_status());
+		CEC_PRINT("RX FOLLOWER_ERR, pin_level: %s\n", cec_pin_level());
 		hdmirx_cec_write(DWC_CEC_LOCK, 0);
 		/* TODO: need reset cec hw logic? */
 	}
@@ -392,6 +392,36 @@ static bool check_physical_addr_valid(int timeout)
 	return true;
 }
 
+/* Called from the transmit timeout path, before recovery changes the state. */
+static void cec_log_tx_timeout(unsigned int cec_sel)
+{
+	CEC_ERR("timeout state: controller=%u cfg=0x%x debug0=0x%08x debug1=0x%08x addr_enable=0x%x framework=%u hal=0x%x\n",
+		cec_sel, cec_config(0, 0), read_ao(AO_DEBUG_REG0),
+		read_ao(AO_DEBUG_REG1), cec_dev->cec_info.addr_enable,
+		cec_dev->framework_on, cec_dev->hal_flag);
+
+	if (cec_sel == CEC_A) {
+		CEC_ERR("timeout CECA: gen=0x%x rw=0x%x irq_mask=0x%x irq_stat=0x%x\n",
+			read_ao(AO_CEC_GEN_CNTL), read_ao(AO_CEC_RW_REG),
+			read_ao(AO_CEC_INTR_MASKN), read_ao(AO_CEC_INTR_STAT));
+		CEC_ERR("timeout CECA: tx_status=0x%x rx_status=0x%x rx_count=0x%x addr0=0x%x\n",
+			aocec_rd_reg(CEC_TX_MSG_STATUS),
+			aocec_rd_reg(CEC_RX_MSG_STATUS),
+			aocec_rd_reg(CEC_RX_NUM_MSG),
+			aocec_rd_reg(CEC_LOGICAL_ADDR0));
+	} else {
+		if (cec_dev->plat_data->ee_to_ao)
+			CEC_ERR("timeout CECB: gen=0x%x rw=0x%x irq_mask=0x%x irq_stat=0x%x\n",
+				read_ao(AO_CECB_GEN_CNTL), read_ao(AO_CECB_RW_REG),
+				read_ao(AO_CECB_INTR_MASKN), read_ao(AO_CECB_INTR_STAT));
+		CEC_ERR("timeout CECB: irq=0x%x ctrl=0x%x tx_count=0x%x rx_count=0x%x lock=0x%x\n",
+			cecb_irq_stat(), hdmirx_cec_read(DWC_CEC_CTRL),
+			hdmirx_cec_read(DWC_CEC_TX_CNT),
+			hdmirx_cec_read(DWC_CEC_RX_CNT),
+			hdmirx_cec_read(DWC_CEC_LOCK));
+	}
+}
+
 /* Return value: < 0: fail, > 0: success */
 int cec_ll_tx(const unsigned char *msg, unsigned char len, unsigned char signal_free_time)
 {
@@ -472,7 +502,7 @@ try_again:
 		ret = ceca_trigger_tx(msg, len);
 	if (ret < 0) {
 		/* we should increase send idx if busy */
-		CEC_ERR("TX FAIL_BUSY(controller busy), pin_status: %d\n", get_pin_status());
+		CEC_ERR("TX FAIL_BUSY(controller busy), pin_level: %s\n", cec_pin_level());
 		if (retry > 0) {
 			retry--;
 			msleep(100 + (prandom_u32() & 0x07) * 10);
@@ -487,7 +517,8 @@ try_again:
 	if (ret <= 0) {
 		/* timeout or interrupt */
 		if (ret == 0) {
-			CEC_ERR("TX FAIL_OTHER(timeout), pin_status: %d\n", get_pin_status());
+			CEC_ERR("TX FAIL_OTHER(timeout), pin_level: %s\n", cec_pin_level());
+			cec_log_tx_timeout(cec_sel);
 			cec_hw_reset(cec_sel);
 		}
 		ret = CEC_FAIL_OTHER;
@@ -1042,6 +1073,34 @@ static ssize_t pin_status_show(struct class *cla,
 	} else {
 		return sprintf(buf, "%s\n", pin_status ? "ok" : "fail");
 	}
+}
+
+/* Current configuration, distinct from the previous wake event in wake_up. */
+static ssize_t wake_config_show(struct class *cla,
+			       struct class_attribute *attr, char *buf)
+{
+	unsigned int debug0 = read_ao(AO_DEBUG_REG0);
+	unsigned int debug1 = read_ao(AO_DEBUG_REG1);
+	int pos = 0;
+
+#ifdef CONFIG_AMLOGIC_HDMITX
+	pos += scnprintf(buf + pos, PAGE_SIZE - pos, "boot_config:0x%x\n",
+			 get_hdmitx_device()->cec_func_config);
+#endif
+	pos += scnprintf(buf + pos, PAGE_SIZE - pos,
+		"runtime_config:0x%x\nsaved_config:0x%x\n"
+		"AO_DEBUG_REG0:0x%08x\nAO_DEBUG_REG1:0x%08x\n"
+		"runtime_physical_addr:0x%04x\nsaved_physical_addr:0x%04x\n"
+		"runtime_logical_addr:0x%x\nruntime_addr_enable:0x%x\n"
+		"saved_logical_addr1:0x%x\nsaved_logical_addr2:0x%x\n"
+		"saved_device_type:0x%x\npin_level:%s\n"
+		"pin_status_cached:%u\n",
+		cec_config(0, 0), debug0 & 0xff, debug0, debug1,
+		cec_dev->phy_addr, debug1 & 0xffff,
+		cec_dev->cec_info.log_addr, cec_dev->cec_info.addr_enable,
+		(debug1 >> 16) & 0xf, (debug1 >> 24) & 0xf,
+		(debug1 >> 20) & 0xf, cec_pin_level(), pin_status);
+	return pos;
 }
 
 static ssize_t physical_addr_show(struct class *cla,
@@ -2008,6 +2067,7 @@ static struct class_attribute aocec_class_attr_list[] = {
 	__ATTR_RO(cec_version),
 	__ATTR_RO(arc_port),
 	__ATTR_RO(wake_up),
+	__ATTR_RO(wake_config),
 	__ATTR_RW(port_seq),
 	__ATTR_RW(physical_addr),
 	__ATTR_RW(vendor_id),
