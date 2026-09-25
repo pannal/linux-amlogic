@@ -705,6 +705,14 @@ MODULE_PARM_DESC(dolby_vision_graphic_min, "\n dolby_vision_graphic_min\n");
 module_param(dolby_vision_graphic_max, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_graphic_max, "\n dolby_vision_graphic_max\n");
 
+/* 1: the player writes BT.2020 PQ RGB into the OSD plane (it composites its
+ * own GUI), so core2 is told the graphics are HDR RGB instead of SDR RGB.
+ */
+static unsigned int dolby_vision_graphic_pq;
+static unsigned int old_dolby_vision_graphic_pq;
+module_param(dolby_vision_graphic_pq, uint, 0664);
+MODULE_PARM_DESC(dolby_vision_graphic_pq, "\n osd graphics are bt2020 pq\n");
+
 static unsigned int dv_HDR10_graphics_max = 300;
 module_param(dv_HDR10_graphics_max, uint, 0664);
 MODULE_PARM_DESC(dv_HDR10_graphics_max, "\n dv_HDR10_graphics_max\n");
@@ -2203,6 +2211,17 @@ static int is_graphic_changed(void)
       osd_graphic_width = new_osd_graphic_width;
       osd_graphic_height = new_osd_graphic_height;
       ret |= 2;
+    }
+  }
+
+  if (old_dolby_vision_graphic_pq != dolby_vision_graphic_pq) {
+    if (debug_dolby & 0x2)
+      pr_dolby_dbg("graphic pq changed %d-%d\n", old_dolby_vision_graphic_pq, dolby_vision_graphic_pq);
+
+    if (!is_osd_off) {
+      old_dolby_vision_graphic_pq = dolby_vision_graphic_pq;
+      ret |= 2;
+      force_set_lut = true;
     }
   }
 
@@ -6582,7 +6601,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 	/* always use rgb setting */
 	new_dovi_setting.g_bitdepth = 8;
-	new_dovi_setting.g_format = G_SDR_RGB;
+	new_dovi_setting.g_format =
+		dolby_vision_graphic_pq ? G_HDR_RGB : G_SDR_RGB;
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;
