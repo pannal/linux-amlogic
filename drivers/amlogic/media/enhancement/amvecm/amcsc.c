@@ -399,6 +399,7 @@ MODULE_PARM_DESC(hdmi_csc_type, "\n current color space convert type\n");
 /* by default follow source to match default sdr_mode*/
 static uint hdr_policy = 0x01;
 static uint cur_hdr_policy = 0x01;
+static uint cur_osd_pq_passthrough;
 module_param(hdr_policy, uint, 0664);
 MODULE_PARM_DESC(hdr_policy, "\n current hdr_policy\n");
 
@@ -8497,6 +8498,13 @@ static int vpp_matrix_update(
 			signal_change_flag |= SIG_HDR_MODE;
 		}
 
+		if (osd_pq_passthrough != cur_osd_pq_passthrough) {
+			pr_csc(4, "osd pq passthrough changed from %d to %d.\n",
+			       cur_osd_pq_passthrough,
+			       osd_pq_passthrough);
+			signal_change_flag |= SIG_HDR_MODE;
+		}
+
 		source_format[VD1_PATH] = get_source_type(VD1_PATH);
 		source_format[VD2_PATH] = get_source_type(VD2_PATH);
 		get_cur_vd_signal_type(vd_path);
@@ -8563,6 +8571,7 @@ static int vpp_matrix_update(
 				vinfo, p, vd_path, source_format);
 		cur_hdr_policy = get_hdr_policy();
 		cur_primary_policy = get_primary_policy();
+		cur_osd_pq_passthrough = osd_pq_passthrough;
 	}
 
 	hdr2_needs_update = 0;
@@ -8950,7 +8959,8 @@ int amvecm_matrix_process(
 			}
 		}
 		if (!is_dolby_vision_enable() &&
-		    get_hdr_policy() != cur_hdr_policy) {
+		    (get_hdr_policy() != cur_hdr_policy ||
+		     osd_pq_passthrough != cur_osd_pq_passthrough)) {
 			null_vf_cnt[vd_path] = 1;
 			toggle_frame = 1;
 		} else if (!is_video_layer_on(vd_path) &&
