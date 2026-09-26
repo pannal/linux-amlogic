@@ -2239,17 +2239,21 @@ static int is_graphic_changed(void)
       graphic_pq_target = pq;
       graphic_pq_tries = 0;
     }
-    /* Never force it while the DV core is on with no video yet (a
-     * restart at a playlist change): a forced apply there counts as a
-     * core2 on, which starts the "Need update core2 first" loop - a
-     * reset, reprogram and HDMI packet every vsync until video arrives,
-     * while the sink is still locking. The change stays pending, and the
-     * first video frame's parse picks it up. Once that loop has run out
-     * (graphics only, video gone), a forced apply cannot restart it.
+    /* Force it only while video runs (a still frame parses nothing), or
+     * with graphics only once the "Need update core2 first" loop has run
+     * out. Never while the DV core is off: its next turn-on parses the
+     * switch from scratch, and a force left armed there reloads core2 in
+     * the turn-on vsync. Never while it is on with no video yet (a restart
+     * at a playlist change): a forced apply there counts as a core2 on and
+     * starts that loop - a reset, reprogram and HDMI packet every vsync
+     * until video arrives. Either way the sink, still locking onto the
+     * tunnel, could end at "no signal". The first video frame's parse
+     * picks the change up.
      */
     if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES &&
-        (dolby_vision_core1_on || !dolby_vision_on ||
-         dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT)) {
+        (dolby_vision_core1_on ||
+         (dolby_vision_on &&
+          dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT))) {
       if (debug_dolby & 0x2)
         pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
 
