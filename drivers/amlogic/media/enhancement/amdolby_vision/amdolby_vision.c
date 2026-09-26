@@ -6599,10 +6599,14 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	else
 		new_dovi_setting.dovi2hdr10_nomapping = 0;
 
-	/* always use rgb setting */
+	/* always use rgb setting; PQ graphics only when the player declares
+	 * them, and never in VP mode, whose core2 LUT override below
+	 * (dolby_core2_set) is an SDR gamma curve.
+	 */
 	new_dovi_setting.g_bitdepth = 8;
 	new_dovi_setting.g_format =
-		dolby_vision_graphic_pq ? G_HDR_RGB : G_SDR_RGB;
+		(dolby_vision_graphic_pq && !xbmc_dv_vp) ?
+		G_HDR_RGB : G_SDR_RGB;
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;

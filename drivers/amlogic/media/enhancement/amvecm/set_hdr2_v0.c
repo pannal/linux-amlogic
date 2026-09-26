@@ -45,6 +45,12 @@ u32 osd_pq_passthrough;
 module_param(osd_pq_passthrough, uint, 0664);
 MODULE_PARM_DESC(osd_pq_passthrough, "\n osd plane carries bt2020 pq, skip sdr->hdr\n");
 
+/* The osd_pq_passthrough value OSD1 was last programmed with. amcsc keeps
+ * re-running the csc process until this matches: only the path that
+ * actually programs OSD1 may acknowledge a change.
+ */
+u32 osd_pq_applied;
+
 // sdr to hdr table  12bit
 int cgain_lut0[65] = {
 	0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400,
@@ -2470,6 +2476,9 @@ enum hdr_process_sel hdr_func(
 
 	if (disable_flush_flag)
 		return hdr_process_select;
+
+	if (module_sel == OSD1_HDR)
+		osd_pq_applied = osd_pq_passthrough;
 
 	if (osd_pq_passthrough && module_sel == OSD1_HDR &&
 	    (hdr_process_select & SDR_HDR)) {
