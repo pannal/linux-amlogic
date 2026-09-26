@@ -2239,7 +2239,15 @@ static int is_graphic_changed(void)
       graphic_pq_target = pq;
       graphic_pq_tries = 0;
     }
-    if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES) {
+    /* Never force it while the DV core is on with no video yet (a
+     * restart at a playlist change): a forced apply there counts as a
+     * core2 on, which starts the "Need update core2 first" loop - a
+     * reset, reprogram and HDMI packet every vsync until video arrives,
+     * while the sink is still locking. The change stays pending, and the
+     * first video frame's parse picks it up.
+     */
+    if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES &&
+        (dolby_vision_core1_on || !dolby_vision_on)) {
       if (debug_dolby & 0x2)
         pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
 
