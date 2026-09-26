@@ -709,15 +709,26 @@ MODULE_PARM_DESC(dolby_vision_graphic_max, "\n dolby_vision_graphic_max\n");
  * own GUI), so core2 is told the graphics are HDR RGB instead of SDR RGB.
  */
 static unsigned int dolby_vision_graphic_pq;
-static unsigned int old_dolby_vision_graphic_pq;
 module_param(dolby_vision_graphic_pq, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_graphic_pq, "\n osd graphics are bt2020 pq\n");
 
 /* PQ graphics for core2: declared by the player, never in VP mode */
 static unsigned int graphic_pq_active(void)
 {
-	return dolby_vision_graphic_pq && !xbmc_dv_vp;
+	return READ_ONCE(dolby_vision_graphic_pq) && !READ_ONCE(xbmc_dv_vp);
 }
+
+/* The PQ graphics state core2 was last configured with: recorded only when
+ * control_path accepted a setting built with it (parse_metadata), so a
+ * change that lands on a vsync whose parse fails is not taken as applied.
+ * is_graphic_changed asks for a re-parse at most GRAPHIC_PQ_TRIES times per
+ * new state.
+ */
+#define GRAPHIC_PQ_TRIES 8
+static unsigned int applied_graphic_pq;
+static unsigned int parsed_graphic_pq;
+static unsigned int graphic_pq_target;
+static unsigned int graphic_pq_tries;
 
 static unsigned int dv_HDR10_graphics_max = 300;
 module_param(dv_HDR10_graphics_max, uint, 0664);
@@ -2221,14 +2232,22 @@ static int is_graphic_changed(void)
   }
 
   /* the effective state: VP mode keeps SDR graphics (see g_format) */
-  if (old_dolby_vision_graphic_pq != graphic_pq_active()) {
-    if (debug_dolby & 0x2)
-      pr_dolby_dbg("graphic pq changed %d-%d\n", old_dolby_vision_graphic_pq, graphic_pq_active());
+  {
+    const unsigned int pq = graphic_pq_active();
 
-    if (!is_osd_off) {
-      old_dolby_vision_graphic_pq = graphic_pq_active();
-      ret |= 2;
-      force_set_lut = true;
+    if (pq != graphic_pq_target) {
+      graphic_pq_target = pq;
+      graphic_pq_tries = 0;
+    }
+    if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES) {
+      if (debug_dolby & 0x2)
+        pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
+
+      if (!is_osd_off) {
+        graphic_pq_tries++;
+        ret |= 2;
+        force_set_lut = true;
+      }
     }
   }
 
@@ -6614,9 +6633,10 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	 * 8-bit, core2 renders PQ menu colours visibly off (a lighter,
 	 * greyer blue on Superman's BD-J bar, authored PQ (64,78,104)).
 	 */
-	new_dovi_setting.g_bitdepth = graphic_pq_active() ? 10 : 8;
+	parsed_graphic_pq = graphic_pq_active();
+	new_dovi_setting.g_bitdepth = parsed_graphic_pq ? 10 : 8;
 	new_dovi_setting.g_format =
-		graphic_pq_active() ? G_HDR_RGB : G_SDR_RGB;
+		parsed_graphic_pq ? G_HDR_RGB : G_SDR_RGB;
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;
@@ -6839,6 +6859,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	}
 
 	if (flag >= 0) {
+		applied_graphic_pq = parsed_graphic_pq;
 
 		stb_core_setting_update_flag |= flag;
 
