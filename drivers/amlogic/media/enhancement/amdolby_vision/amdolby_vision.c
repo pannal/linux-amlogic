@@ -2198,18 +2198,20 @@ void update_graphic_status(void)
 
 /* When core2 may take a new graphic_pq state: while video runs, or with
  * graphics only once the "Need update core2 first" loop has run out. Not
- * while the DV core is starting up without video (a restart at a playlist
+ * while the DV core starts up without video (a restart at a playlist
  * change): a forced apply there counts as a core2 on and starts that loop,
  * a reset, reprogram and HDMI packet every vsync until video arrives, and
  * even a plain parse of a new graphics format on the first video frame,
- * before core1 is on, can leave the sink (still locking onto the tunnel) at
- * "no signal". The DV core off is handled by the caller.
+ * before core1 is on, was seen to leave the sink (still locking onto the
+ * tunnel) at "no signal". False while the DV core is off. If the core is on
+ * with no video and that loop never started, a change waits for video or
+ * for the core to go off.
  */
 static bool graphic_pq_may_change(void)
 {
-	return dolby_vision_core1_on ||
-		(dolby_vision_on &&
-		 dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT);
+  return dolby_vision_core1_on ||
+         (dolby_vision_on &&
+          dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT);
 }
 
 static int is_graphic_changed(void)
@@ -6654,9 +6656,9 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	 * PQ graphics are declared 10-bit, as avdvplus R10 does: declared
 	 * 8-bit, core2 renders PQ menu colours visibly off (a lighter,
 	 * greyer blue on Superman's BD-J bar, authored PQ (64,78,104)).
-	 */
-	/* A fresh DV start takes the switch; while starting up without
-	 * video keep what core2 has, and take a change once video runs.
+	 * A fresh start from the core off takes the switch; while starting
+	 * up without video keep what core2 has, and take a change once
+	 * graphic_pq_may_change().
 	 */
 	parsed_graphic_pq = (!dolby_vision_on || graphic_pq_may_change()) ?
 		graphic_pq_active() : applied_graphic_pq;
