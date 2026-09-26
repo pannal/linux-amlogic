@@ -705,6 +705,31 @@ MODULE_PARM_DESC(dolby_vision_graphic_min, "\n dolby_vision_graphic_min\n");
 module_param(dolby_vision_graphic_max, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_graphic_max, "\n dolby_vision_graphic_max\n");
 
+/* 1: the player writes BT.2020 PQ RGB into the OSD plane (it composites its
+ * own GUI), so core2 is told the graphics are HDR RGB instead of SDR RGB.
+ */
+static unsigned int dolby_vision_graphic_pq;
+module_param(dolby_vision_graphic_pq, uint, 0664);
+MODULE_PARM_DESC(dolby_vision_graphic_pq, "\n osd graphics are bt2020 pq\n");
+
+/* PQ graphics for core2: declared by the player, never in VP mode */
+static unsigned int graphic_pq_active(void)
+{
+	return READ_ONCE(dolby_vision_graphic_pq) && !READ_ONCE(xbmc_dv_vp);
+}
+
+/* The PQ graphics state core2 was last configured with: recorded only when
+ * control_path accepted a setting built with it (parse_metadata), so a
+ * change that lands on a vsync whose parse fails is not taken as applied.
+ * is_graphic_changed asks for a re-parse at most GRAPHIC_PQ_TRIES times per
+ * new state.
+ */
+#define GRAPHIC_PQ_TRIES 8
+static unsigned int applied_graphic_pq;
+static unsigned int parsed_graphic_pq;
+static unsigned int graphic_pq_target;
+static unsigned int graphic_pq_tries;
+
 static unsigned int dv_HDR10_graphics_max = 300;
 module_param(dv_HDR10_graphics_max, uint, 0664);
 MODULE_PARM_DESC(dv_HDR10_graphics_max, "\n dv_HDR10_graphics_max\n");
@@ -2171,6 +2196,24 @@ void update_graphic_status(void)
   pr_dolby_dbg("osd update, need toggle\n");
 }
 
+/* When core2 may take a new graphic_pq state: while video runs, or with
+ * graphics only once the "Need update core2 first" loop has run out. Not
+ * while the DV core starts up without video (a restart at a playlist
+ * change): a forced apply there counts as a core2 on and starts that loop,
+ * a reset, reprogram and HDMI packet every vsync until video arrives, and
+ * even a plain parse of a new graphics format on the first video frame,
+ * before core1 is on, was seen to leave the sink (still locking onto the
+ * tunnel) at "no signal". False while the DV core is off. If the core is on
+ * with no video and that loop never started, a change waits for video or
+ * for the core to go off.
+ */
+static bool graphic_pq_may_change(void)
+{
+  return dolby_vision_core1_on ||
+         (dolby_vision_on &&
+          dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT);
+}
+
 static int is_graphic_changed(void)
 {
   int ret = 0;
@@ -2203,6 +2246,32 @@ static int is_graphic_changed(void)
       osd_graphic_width = new_osd_graphic_width;
       osd_graphic_height = new_osd_graphic_height;
       ret |= 2;
+    }
+  }
+
+  /* the effective state: VP mode keeps SDR graphics (see g_format) */
+  {
+    const unsigned int pq = graphic_pq_active();
+
+    if (pq != graphic_pq_target) {
+      graphic_pq_target = pq;
+      graphic_pq_tries = 0;
+    }
+    /* Force it only when core2 may take it (a still frame parses
+     * nothing). Never while the DV core is off: its next turn-on parses
+     * the switch from scratch, and a force left armed there reloads core2
+     * in the turn-on vsync.
+     */
+    if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES &&
+        graphic_pq_may_change()) {
+      if (debug_dolby & 0x2)
+        pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
+
+      if (!is_osd_off) {
+        graphic_pq_tries++;
+        ret |= 2;
+        force_set_lut = true;
+      }
     }
   }
 
@@ -6580,9 +6649,22 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	else
 		new_dovi_setting.dovi2hdr10_nomapping = 0;
 
-	/* always use rgb setting */
-	new_dovi_setting.g_bitdepth = 8;
-	new_dovi_setting.g_format = G_SDR_RGB;
+	/* always use rgb setting; PQ graphics only when the player declares
+	 * them, and never in VP mode: that path is unvalidated with PQ
+	 * graphics (at tm > 3 dolby_core2_set even replaces the graphics
+	 * curve with an SDR gamma one). The player keeps it off there too.
+	 * PQ graphics are declared 10-bit, as avdvplus R10 does: declared
+	 * 8-bit, core2 renders PQ menu colours visibly off (a lighter,
+	 * greyer blue on Superman's BD-J bar, authored PQ (64,78,104)).
+	 * A fresh start from the core off takes the switch; while starting
+	 * up without video keep what core2 has, and take a change once
+	 * graphic_pq_may_change().
+	 */
+	parsed_graphic_pq = (!dolby_vision_on || graphic_pq_may_change()) ?
+		graphic_pq_active() : applied_graphic_pq;
+	new_dovi_setting.g_bitdepth = parsed_graphic_pq ? 10 : 8;
+	new_dovi_setting.g_format =
+		parsed_graphic_pq ? G_HDR_RGB : G_SDR_RGB;
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;
@@ -6805,6 +6887,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	}
 
 	if (flag >= 0) {
+		applied_graphic_pq = parsed_graphic_pq;
 
 		stb_core_setting_update_flag |= flag;
 

@@ -36,6 +36,21 @@ u32 disable_flush_flag;
 module_param(disable_flush_flag, uint, 0664);
 MODULE_PARM_DESC(disable_flush_flag, "\n disable_flush_flag\n");
 
+/* 1: the player already writes BT.2020 PQ RGB into the OSD plane (it
+ * composites its own GUI). Where the VPP would encode OSD1 SDR->HDR, leave
+ * the transfer and gamut untouched and apply only the BT.2020 RGB->YUV
+ * matrix, so graphics authored in PQ reach the sink unchanged.
+ */
+u32 osd_pq_passthrough;
+module_param(osd_pq_passthrough, uint, 0664);
+MODULE_PARM_DESC(osd_pq_passthrough, "\n osd plane carries bt2020 pq, skip sdr->hdr\n");
+
+/* The osd_pq_passthrough value OSD1 was last programmed with. amcsc keeps
+ * re-running the csc process until this matches: only the path that
+ * actually programs OSD1 may acknowledge a change.
+ */
+u32 osd_pq_applied;
+
 // sdr to hdr table  12bit
 int cgain_lut0[65] = {
 	0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400,
@@ -2453,6 +2468,9 @@ enum hdr_process_sel hdr_func(
 	int *oft_pre_out = bypass_pre;
 	int *oft_post_out = bypass_pos;
 	bool always_full_func = false;
+	bool osd_pq_pass = false;
+	/* one read: the ack below must describe what this call programs */
+	u32 osd_pq = READ_ONCE(osd_pq_passthrough);
 
 	pr_csc(16, "hdr func: hdr module=%d, select=0x%x\n",
 	       module_sel,
@@ -2460,6 +2478,18 @@ enum hdr_process_sel hdr_func(
 
 	if (disable_flush_flag)
 		return hdr_process_select;
+
+	if (module_sel == OSD1_HDR)
+		osd_pq_applied = osd_pq;
+
+	if (osd_pq && module_sel == OSD1_HDR &&
+	    (hdr_process_select & SDR_HDR)) {
+		hdr_process_select &= ~SDR_HDR;
+		hdr_process_select |= HDR_BYPASS;
+		osd_pq_pass = true;
+		pr_csc(12, "%s: osd pq passthrough, sdr_hdr -> bypass\n",
+		       __func__);
+	}
 
 	memset(&hdr_mtx_param, 0, sizeof(struct hdr_proc_mtx_param_s));
 	memset(&hdr_lut_param, 0, sizeof(struct hdr_proc_lut_param_s));
@@ -2968,7 +2998,8 @@ enum hdr_process_sel hdr_func(
 				oft_pre_out = bypass_pre;
 				oft_post_out = bypass_pos;
 			} else {
-				coeff_in = rgb2ycbcr_709;
+				coeff_in = osd_pq_pass ?
+					rgb2ycbcr_ncl2020 : rgb2ycbcr_709;
 				oft_pre_in = rgb2yuvpre;
 				oft_post_in = rgb2yuvpos;
 				oft_pre_out = bypass_pre;

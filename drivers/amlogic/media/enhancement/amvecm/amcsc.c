@@ -402,6 +402,27 @@ static uint cur_hdr_policy = 0x01;
 module_param(hdr_policy, uint, 0664);
 MODULE_PARM_DESC(hdr_policy, "\n current hdr_policy\n");
 
+/* An osd_pq_passthrough change still to reach OSD1 (hdr_func records
+ * osd_pq_applied when it programs OSD1). Each path raises it at most
+ * OSD_PQ_TRIES times per new value, so a path that never programs OSD1
+ * (both layers on with the HDR module off, VD2 while DV is on) does not
+ * re-run the csc process every frame.
+ */
+#define OSD_PQ_TRIES 4
+static u32 osd_pq_target;
+static int osd_pq_tries[VD_PATH_MAX];
+
+static bool osd_pq_pending(enum vd_path_e vd_path)
+{
+	u32 want = READ_ONCE(osd_pq_passthrough);
+
+	if (want != osd_pq_target) {
+		osd_pq_target = want;
+		memset(osd_pq_tries, 0, sizeof(osd_pq_tries));
+	}
+	return want != osd_pq_applied && osd_pq_tries[vd_path] < OSD_PQ_TRIES;
+}
+
 /* 0: source: use src meta */
 /* 1: Auto: 601/709=709 P3/2020=P3 */
 /* 2: Native: 601/709=off P3/2020=2020 */
@@ -8497,6 +8518,14 @@ static int vpp_matrix_update(
 			signal_change_flag |= SIG_HDR_MODE;
 		}
 
+		if (osd_pq_pending(vd_path)) {
+			osd_pq_tries[vd_path]++;
+			pr_csc(4, "osd pq passthrough changed from %d to %d.\n",
+			       osd_pq_applied,
+			       osd_pq_target);
+			signal_change_flag |= SIG_HDR_MODE;
+		}
+
 		source_format[VD1_PATH] = get_source_type(VD1_PATH);
 		source_format[VD2_PATH] = get_source_type(VD2_PATH);
 		get_cur_vd_signal_type(vd_path);
@@ -8764,6 +8793,12 @@ int amvecm_matrix_process(
 				dovi_on = false;
 			}
 		}
+		/* A paused or still frame repeats without the csc process: make
+		 * the repeat run it while an OSD switch is pending.
+		 */
+		if (osd_pq_pending(VD1_PATH) &&
+		    (is_video_layer_on(VD1_PATH) || video_layer_wait_on[VD1_PATH]))
+			video_process_flags[VD1_PATH] |= PROC_FLAG_FORCE_PROCESS;
 	}
 
 	sink_changed = is_sink_cap_changed(vinfo,
@@ -8949,8 +8984,12 @@ int amvecm_matrix_process(
 				}
 			}
 		}
-		if (!is_dolby_vision_enable() &&
-		    get_hdr_policy() != cur_hdr_policy) {
+		/* the DV core may be enabled yet idle (HDR10 through the VPP):
+		 * an OSD switch still needs the VPP to run
+		 */
+		if ((!is_dolby_vision_enable() &&
+		     get_hdr_policy() != cur_hdr_policy) ||
+		    (!is_dolby_vision_on() && osd_pq_pending(vd_path))) {
 			null_vf_cnt[vd_path] = 1;
 			toggle_frame = 1;
 		} else if (!is_video_layer_on(vd_path) &&
