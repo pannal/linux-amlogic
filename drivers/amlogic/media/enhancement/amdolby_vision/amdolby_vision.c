@@ -713,6 +713,12 @@ static unsigned int old_dolby_vision_graphic_pq;
 module_param(dolby_vision_graphic_pq, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_graphic_pq, "\n osd graphics are bt2020 pq\n");
 
+/* PQ graphics for core2: declared by the player, never in VP mode */
+static unsigned int graphic_pq_active(void)
+{
+	return dolby_vision_graphic_pq && !xbmc_dv_vp;
+}
+
 static unsigned int dv_HDR10_graphics_max = 300;
 module_param(dv_HDR10_graphics_max, uint, 0664);
 MODULE_PARM_DESC(dv_HDR10_graphics_max, "\n dv_HDR10_graphics_max\n");
@@ -2214,12 +2220,13 @@ static int is_graphic_changed(void)
     }
   }
 
-  if (old_dolby_vision_graphic_pq != dolby_vision_graphic_pq) {
+  /* the effective state: VP mode keeps SDR graphics (see g_format) */
+  if (old_dolby_vision_graphic_pq != graphic_pq_active()) {
     if (debug_dolby & 0x2)
-      pr_dolby_dbg("graphic pq changed %d-%d\n", old_dolby_vision_graphic_pq, dolby_vision_graphic_pq);
+      pr_dolby_dbg("graphic pq changed %d-%d\n", old_dolby_vision_graphic_pq, graphic_pq_active());
 
     if (!is_osd_off) {
-      old_dolby_vision_graphic_pq = dolby_vision_graphic_pq;
+      old_dolby_vision_graphic_pq = graphic_pq_active();
       ret |= 2;
       force_set_lut = true;
     }
@@ -6600,13 +6607,13 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		new_dovi_setting.dovi2hdr10_nomapping = 0;
 
 	/* always use rgb setting; PQ graphics only when the player declares
-	 * them, and never in VP mode, whose core2 LUT override below
-	 * (dolby_core2_set) is an SDR gamma curve.
+	 * them, and never in VP mode: that path is unvalidated with PQ
+	 * graphics (at tm > 3 dolby_core2_set even replaces the graphics
+	 * curve with an SDR gamma one). The player keeps it off there too.
 	 */
 	new_dovi_setting.g_bitdepth = 8;
 	new_dovi_setting.g_format =
-		(dolby_vision_graphic_pq && !xbmc_dv_vp) ?
-		G_HDR_RGB : G_SDR_RGB;
+		graphic_pq_active() ? G_HDR_RGB : G_SDR_RGB;
 
 	new_dovi_setting.diagnostic_enable = 0;
 	new_dovi_setting.diagnostic_mux_select = 0;

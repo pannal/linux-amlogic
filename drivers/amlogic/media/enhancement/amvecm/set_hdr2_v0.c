@@ -2469,6 +2469,8 @@ enum hdr_process_sel hdr_func(
 	int *oft_post_out = bypass_pos;
 	bool always_full_func = false;
 	bool osd_pq_pass = false;
+	/* one read: the ack below must describe what this call programs */
+	u32 osd_pq = READ_ONCE(osd_pq_passthrough);
 
 	pr_csc(16, "hdr func: hdr module=%d, select=0x%x\n",
 	       module_sel,
@@ -2478,9 +2480,9 @@ enum hdr_process_sel hdr_func(
 		return hdr_process_select;
 
 	if (module_sel == OSD1_HDR)
-		osd_pq_applied = osd_pq_passthrough;
+		osd_pq_applied = osd_pq;
 
-	if (osd_pq_passthrough && module_sel == OSD1_HDR &&
+	if (osd_pq && module_sel == OSD1_HDR &&
 	    (hdr_process_select & SDR_HDR)) {
 		hdr_process_select &= ~SDR_HDR;
 		hdr_process_select |= HDR_BYPASS;
