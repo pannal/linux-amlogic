@@ -2196,6 +2196,22 @@ void update_graphic_status(void)
   pr_dolby_dbg("osd update, need toggle\n");
 }
 
+/* When core2 may take a new graphic_pq state: while video runs, or with
+ * graphics only once the "Need update core2 first" loop has run out. Not
+ * while the DV core is starting up without video (a restart at a playlist
+ * change): a forced apply there counts as a core2 on and starts that loop,
+ * a reset, reprogram and HDMI packet every vsync until video arrives, and
+ * even a plain parse of a new graphics format on the first video frame,
+ * before core1 is on, can leave the sink (still locking onto the tunnel) at
+ * "no signal". The DV core off is handled by the caller.
+ */
+static bool graphic_pq_may_change(void)
+{
+	return dolby_vision_core1_on ||
+		(dolby_vision_on &&
+		 dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT);
+}
+
 static int is_graphic_changed(void)
 {
   int ret = 0;
@@ -2239,21 +2255,13 @@ static int is_graphic_changed(void)
       graphic_pq_target = pq;
       graphic_pq_tries = 0;
     }
-    /* Force it only while video runs (a still frame parses nothing), or
-     * with graphics only once the "Need update core2 first" loop has run
-     * out. Never while the DV core is off: its next turn-on parses the
-     * switch from scratch, and a force left armed there reloads core2 in
-     * the turn-on vsync. Never while it is on with no video yet (a restart
-     * at a playlist change): a forced apply there counts as a core2 on and
-     * starts that loop - a reset, reprogram and HDMI packet every vsync
-     * until video arrives. Either way the sink, still locking onto the
-     * tunnel, could end at "no signal". The first video frame's parse
-     * picks the change up.
+    /* Force it only when core2 may take it (a still frame parses
+     * nothing). Never while the DV core is off: its next turn-on parses
+     * the switch from scratch, and a force left armed there reloads core2
+     * in the turn-on vsync.
      */
     if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES &&
-        (dolby_vision_core1_on ||
-         (dolby_vision_on &&
-          dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT))) {
+        graphic_pq_may_change()) {
       if (debug_dolby & 0x2)
         pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
 
@@ -6647,7 +6655,11 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	 * 8-bit, core2 renders PQ menu colours visibly off (a lighter,
 	 * greyer blue on Superman's BD-J bar, authored PQ (64,78,104)).
 	 */
-	parsed_graphic_pq = graphic_pq_active();
+	/* A fresh DV start takes the switch; while starting up without
+	 * video keep what core2 has, and take a change once video runs.
+	 */
+	parsed_graphic_pq = (!dolby_vision_on || graphic_pq_may_change()) ?
+		graphic_pq_active() : applied_graphic_pq;
 	new_dovi_setting.g_bitdepth = parsed_graphic_pq ? 10 : 8;
 	new_dovi_setting.g_format =
 		parsed_graphic_pq ? G_HDR_RGB : G_SDR_RGB;
