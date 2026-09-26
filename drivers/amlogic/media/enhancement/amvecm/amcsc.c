@@ -399,6 +399,8 @@ MODULE_PARM_DESC(hdmi_csc_type, "\n current color space convert type\n");
 /* by default follow source to match default sdr_mode*/
 static uint hdr_policy = 0x01;
 static uint cur_hdr_policy = 0x01;
+module_param(hdr_policy, uint, 0664);
+MODULE_PARM_DESC(hdr_policy, "\n current hdr_policy\n");
 
 /* An osd_pq_passthrough change still to reach OSD1 (hdr_func records
  * osd_pq_applied when it programs OSD1). Each path raises it at most
@@ -420,8 +422,6 @@ static bool osd_pq_pending(enum vd_path_e vd_path)
 	}
 	return want != osd_pq_applied && osd_pq_tries[vd_path] < OSD_PQ_TRIES;
 }
-module_param(hdr_policy, uint, 0664);
-MODULE_PARM_DESC(hdr_policy, "\n current hdr_policy\n");
 
 /* 0: source: use src meta */
 /* 1: Auto: 601/709=709 P3/2020=P3 */

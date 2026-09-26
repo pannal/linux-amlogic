@@ -2244,10 +2244,12 @@ static int is_graphic_changed(void)
      * core2 on, which starts the "Need update core2 first" loop - a
      * reset, reprogram and HDMI packet every vsync until video arrives,
      * while the sink is still locking. The change stays pending, and the
-     * first video frame's parse picks it up.
+     * first video frame's parse picks it up. Once that loop has run out
+     * (graphics only, video gone), a forced apply cannot restart it.
      */
     if (applied_graphic_pq != pq && graphic_pq_tries < GRAPHIC_PQ_TRIES &&
-        (dolby_vision_core1_on || !dolby_vision_on)) {
+        (dolby_vision_core1_on || !dolby_vision_on ||
+         dolby_vision_core2_on_cnt >= DV_CORE2_RECONFIG_CNT)) {
       if (debug_dolby & 0x2)
         pr_dolby_dbg("graphic pq changed %d-%d\n", applied_graphic_pq, pq);
 
