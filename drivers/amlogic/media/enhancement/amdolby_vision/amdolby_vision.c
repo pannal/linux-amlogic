@@ -6610,8 +6610,11 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	 * them, and never in VP mode: that path is unvalidated with PQ
 	 * graphics (at tm > 3 dolby_core2_set even replaces the graphics
 	 * curve with an SDR gamma one). The player keeps it off there too.
+	 * PQ graphics are declared 10-bit, as avdvplus R10 does: declared
+	 * 8-bit, core2 renders PQ menu colours visibly off (a lighter,
+	 * greyer blue on Superman's BD-J bar, authored PQ (64,78,104)).
 	 */
-	new_dovi_setting.g_bitdepth = 8;
+	new_dovi_setting.g_bitdepth = graphic_pq_active() ? 10 : 8;
 	new_dovi_setting.g_format =
 		graphic_pq_active() ? G_HDR_RGB : G_SDR_RGB;
 
