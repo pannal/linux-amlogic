@@ -242,39 +242,6 @@ static int update_table_item(u32 addr, u32 val, u8 irq_mode)
 	u32 paddr;
 	static int pace_logging;
 
-	if ((item_count > 500) || rdma_reset_tigger_flag) {
-		int i;
-		struct rdma_table_item reset_item[2] = {
-			{
-				.addr = OSD_RDMA_FLAG_REG,
-				.val = OSD_RDMA_STATUS_MARK_TBL_RST,
-			},
-			{
-				.addr = OSD_RDMA_FLAG_REG,
-				.val = OSD_RDMA_STATUS_MARK_TBL_DONE,
-			}
-		};
-
-		/* rdma table is full */
-		if (!(pace_logging++ % 50))
-			pr_info("update_table_item overflow!vsync_cnt=%d, rdma_cnt=%d\n",
-				vsync_irq_count, rdma_irq_count);
-		/* update rdma table */
-		for (i = 1; i < item_count - 1; i++)
-			osd_reg_write(rdma_table[i].addr, rdma_table[i].val);
-
-		osd_reg_write(addr, val);
-		update_recovery_item(addr, val);
-
-		item_count = 2;
-		osd_rdma_mem_cpy(rdma_table, &reset_item[0], 8);
-		osd_rdma_mem_cpy(&rdma_table[item_count - 1],
-			&reset_item[1], 8);
-		osd_reg_write(END_ADDR,
-			(table_paddr + item_count * 8 - 1));
-		return -1;
-	}
-
 	/* pr_debug("%02dth, ctrl: 0x%x, status: 0x%x, auto:0x%x, flag:0x%x\n",
 	 *	item_count, osd_reg_read(RDMA_CTRL),
 	 *	osd_reg_read(RDMA_STATUS),
@@ -282,6 +249,13 @@ static int update_table_item(u32 addr, u32 val, u8 irq_mode)
 	 *	osd_reg_read(OSD_RDMA_FLAG_REG));
 	 */
 retry:
+	/* Serialize the recovery decision, direct replay and table publication
+	 * with append and IRQ rebuild. Never call OSD callbacks under this lock.
+	 */
+	spin_lock_irqsave(&rdma_lock, flags);
+	if ((item_count > 500) || READ_ONCE(rdma_reset_tigger_flag))
+		goto recover;
+	spin_unlock_irqrestore(&rdma_lock, flags);
 	if (0 == (retry_count--)) {
 		pr_debug("OSD RDMA stuck: 0x%x = 0x%x, status: 0x%x\n",
 			addr, val, osd_reg_read(RDMA_STATUS));
@@ -289,6 +263,8 @@ retry:
 			reject1, reject2, item_count,
 			osd_reg_read(OSD_RDMA_FLAG_REG));
 		spin_lock_irqsave(&rdma_lock, flags);
+		if ((item_count > 500) || READ_ONCE(rdma_reset_tigger_flag))
+			goto recover;
 		request_item.addr = OSD_RDMA_FLAG_REG;
 		request_item.val = OSD_RDMA_STATUS_MARK_TBL_DONE;
 		osd_rdma_mem_cpy(
@@ -331,6 +307,8 @@ retry:
 
 	/*atom_lock_start:*/
 	spin_lock_irqsave(&rdma_lock, flags);
+	if ((item_count > 500) || READ_ONCE(rdma_reset_tigger_flag))
+		goto recover;
 	request_item.addr = OSD_RDMA_FLAG_REG;
 	request_item.val = OSD_RDMA_STATUS_MARK_TBL_DONE;
 	osd_rdma_mem_cpy(&rdma_table[item_count], &request_item, 8);
@@ -358,6 +336,41 @@ retry:
 	/*atom_lock_end:*/
 	spin_unlock_irqrestore(&rdma_lock, flags);
 	return ret;
+recover:
+	{
+		bool report = !(pace_logging++ % 50);
+		int i;
+		struct rdma_table_item reset_item[2] = {
+			{
+				.addr = OSD_RDMA_FLAG_REG,
+				.val = OSD_RDMA_STATUS_MARK_TBL_RST,
+			},
+			{
+				.addr = OSD_RDMA_FLAG_REG,
+				.val = OSD_RDMA_STATUS_MARK_TBL_DONE,
+			}
+		};
+
+		/* update rdma table */
+		for (i = 1; i < item_count - 1; i++)
+			osd_reg_write(rdma_table[i].addr, rdma_table[i].val);
+
+		osd_reg_write(addr, val);
+		update_recovery_item(addr, val);
+
+		item_count = 2;
+		osd_rdma_mem_cpy(rdma_table, &reset_item[0], 8);
+		osd_rdma_mem_cpy(&rdma_table[item_count - 1],
+			&reset_item[1], 8);
+		osd_reg_write(END_ADDR,
+			(table_paddr + item_count * 8 - 1));
+		spin_unlock_irqrestore(&rdma_lock, flags);
+		if (report)
+			pr_info("update_table_item overflow!vsync_cnt=%d, rdma_cnt=%d\n",
+				vsync_irq_count, rdma_irq_count);
+		return -1;
+	}
+
 }
 
 static inline u32 is_rdma_reg(u32 addr)
