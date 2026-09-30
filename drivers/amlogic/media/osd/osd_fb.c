@@ -783,31 +783,20 @@ static int osd_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 		ret = copy_from_user(&sync_request, argp,
 				sizeof(struct fb_sync_request_s));
 		break;
-	// Only wait for vsync when not HW decoding.
 	case FBIO_WAITFORVSYNC:
-		if (get_vpu_mem_pd_vmod(VPU_VIU_VD1)) {
-			if (info->node < osd_meson_dev.viu1_osd_count)
-				vsync_timestamp = (s32)osd_wait_vsync_event();
-			else
-				vsync_timestamp = (s32)osd_wait_vsync_event_viu2();
-		} else {
-			vsync_timestamp = 0;
-		}
+		/* The Mali fbdev backend waits here after FBIOPAN_DISPLAY before
+		 * reusing a framebuffer. VD1 power state does not establish that
+		 * the OSD pan has reached scanout: decoder polling may run on a
+		 * different thread. Keep the same display wait as the 64-bit
+		 * request, preserving this request's 32-bit timestamp ABI.
+		 */
+		if (info->node < osd_meson_dev.viu1_osd_count)
+			vsync_timestamp = (s32)osd_wait_vsync_event();
+		else
+			vsync_timestamp = (s32)osd_wait_vsync_event_viu2();
 		ret = copy_to_user(argp, &vsync_timestamp, sizeof(s32));
 		break;
 	case FBIO_WAITFORVSYNC_64:
-		/* Drop the VD1 power-state gate: the legacy 32-bit case above
-		 * returns 0 immediately when video is HW-decoding, on the
-		 * assumption that the codec subsystem handles vsync timing.
-		 * That is wrong for external clock-sync consumers — they need
-		 * the real display vsync timestamp regardless of video state.
-		 * The osd_vsync_wq fires on every display refresh independent
-		 * of VD1, so unconditionally waiting is safe.
-		 * The only known caller of FBIO_WAITFORVSYNC_64 is Kodi's
-		 * VideoSyncAML; the 32-bit FBIO_WAITFORVSYNC case is left
-		 * unchanged to preserve compatibility with any generic
-		 * userspace tooling that might be relying on legacy behaviour.
-		 */
 		if (info->node < osd_meson_dev.viu1_osd_count)
 			vsync_timestamp_64 = osd_wait_vsync_event();
 		else
