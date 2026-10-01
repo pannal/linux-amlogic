@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise production framebuffer wait/pan bodies with modeled scanout.
 
+Enabled/disabled leases exercise ON and legacy OFF policy.
 The harness does not emulate Mali/GPU rendering or physical RDMA. It tests the
 handoff used by the CE Mali fbdev binary: pan, wait, then reuse a framebuffer.
 """
@@ -43,6 +44,8 @@ static struct {
     bool osd_fps_start[3];
     unsigned osd_fps[3];
 } osd_hw;
+static bool gui_wait = true;
+static bool osd_gui_wait_enabled(u32 node) { (void)node; return gui_wait; }
 static int power_down, waited[2], current_buffer, pending_buffer, scanned_writes;
 static int copy_fault;
 static size_t copied;
@@ -163,9 +166,9 @@ static void framebuffer_reuse(bool legacy) {
     assert(current_buffer==(legacy ? 0 : 1));
 }
 int main(int argc,char **argv) {
-    bool legacy=argc>1;
+    bool legacy=argc>1; gui_wait=!legacy;
     abi_cases(legacy); framebuffer_reuse(legacy);
-    puts(legacy ? "Legacy defect reproduced: scanout buffer reused before refresh"
+    puts(legacy ? "Legacy bypass/pan model reproduced (not device evidence)"
                 : "Framebuffer wait/pan ABI, routing, timeout/interruption and buffer-reuse cases passed");
     return 0;
 }
@@ -202,6 +205,13 @@ def main():
     if result.returncode:
         print(result.stderr)
         raise SystemExit(result.returncode)
+    # OFF must retain the original bypass; ON keeps the tested wait. Hardware
+    # inactive, both outputs, both widths and timeout/interruption run in each.
+    if not args.expect_legacy_defect:
+        off = run(block, pan, wait1, wait2, True)
+        if off.returncode:
+            raise SystemExit(off.stderr)
+        print('Legacy OFF ABI/routing/timeout policy preserved')
     if args.negative_controls:
         mutations = {
             'fake-hardware-wait': block.replace('vsync_timestamp = (s32)osd_wait_vsync_event();',
@@ -210,8 +220,9 @@ def main():
                 'vsync_timestamp = (s32)osd_wait_vsync_event();'),
             'wrong-ABI-width': block.replace('sizeof(s32)', 'sizeof(s64)'),
         }
+        mutations['ungated-video-wait'] = block.replace('!osd_gui_wait_enabled(info->node)', 'false')
         for name, mutant in mutations.items():
-            if mutant == block or run(mutant, pan, wait1, wait2).returncode == 0:
+            if mutant == block or run(mutant, pan, wait1, wait2, name == 'ungated-video-wait').returncode == 0:
                 raise SystemExit('Negative control survived: ' + name)
             print('Rejected negative control:', name)
 

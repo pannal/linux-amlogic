@@ -59,6 +59,7 @@
 /* Local Headers */
 #include "osd.h"
 #include "osd_fb.h"
+#include "osd_gui_wait.h"
 #include "osd_hw.h"
 #include "osd_log.h"
 #include "osd_sync.h"
@@ -783,13 +784,20 @@ static int osd_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 		ret = copy_from_user(&sync_request, argp,
 				sizeof(struct fb_sync_request_s));
 		break;
+	case FBIOGET_GUI_WAIT_LEASE:
+		return osd_gui_wait_create(info->node, argp);
 	case FBIO_WAITFORVSYNC:
-		/* The Mali fbdev backend waits here after FBIOPAN_DISPLAY before
-		 * reusing a framebuffer. VD1 power state does not establish that
-		 * the OSD pan has reached scanout: decoder polling may run on a
-		 * different thread. Keep the same display wait as the 64-bit
-		 * request, preserving this request's 32-bit timestamp ABI.
+		/* Preserve legacy synchronous video pacing. Independent presentation
+		 * opts this process/framebuffer into the native GUI wait through a
+		 * lease. Mali callback threads share its TGID; unrelated callers do
+		 * not. This timestamp wait is not a pan-specific retirement fence.
 		 */
+		if (!get_vpu_mem_pd_vmod(VPU_VIU_VD1) &&
+		    !osd_gui_wait_enabled(info->node)) {
+			vsync_timestamp = 0;
+			ret = copy_to_user(argp, &vsync_timestamp, sizeof(s32));
+			break;
+		}
 		if (info->node < osd_meson_dev.viu1_osd_count)
 			vsync_timestamp = (s32)osd_wait_vsync_event();
 		else
