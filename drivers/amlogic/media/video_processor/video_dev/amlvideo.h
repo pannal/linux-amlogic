@@ -85,6 +85,7 @@ struct vivi_dev {
 	struct vframe_s *amlvideo_pool_omx[AMLVIDEO_POOL_SIZE + 1];
 	int index;
 	struct mutex vf_mutex;
+	spinlock_t queue_lock;
 	int amlvideo_v4l_num;
 	char vf_receiver_name[AMLVIDEO_VF_NAME_SIZE];
 	char vf_provider_name[AMLVIDEO_VF_NAME_SIZE];

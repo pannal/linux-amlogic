@@ -149,20 +149,41 @@ static struct vivi_fmt formats[] = {
  *           provider operations
  * -----------------------------------------------------------------
  */
+/* vf_mutex serializes producers; queue_lock also excludes IRQ consumers. */
+static void amlvideo_queue_init(struct vivi_dev *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->queue_lock, flags);
+	vfq_init(&dev->q_ready, AMLVIDEO_POOL_SIZE, dev->amlvideo_pool_ready);
+	vfq_init(&dev->q_omx, AMLVIDEO_POOL_SIZE, dev->amlvideo_pool_omx);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+}
+
 static struct vframe_s *amlvideo_vf_peek(void *op_arg)
 {
 	struct vivi_dev *dev = (struct vivi_dev *)op_arg;
+	struct vframe_s *vf;
+	unsigned long flags;
 
-	return vfq_peek(&dev->q_ready);
+	spin_lock_irqsave(&dev->queue_lock, flags);
+	vf = vfq_peek(&dev->q_ready);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+	return vf;
 }
 
 static struct vframe_s *amlvideo_vf_get(void *op_arg)
 {
 	struct vframe_s *vf;
 	struct vivi_dev *dev = (struct vivi_dev *)op_arg;
+	unsigned long flags;
+	int ready;
 
+	spin_lock_irqsave(&dev->queue_lock, flags);
 	vf = vfq_pop(&dev->q_ready);
-	ATRACE_COUNTER(dev->v4l2_dev.name, vfq_level(&dev->q_ready));
+	ready = vfq_level(&dev->q_ready);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+	ATRACE_COUNTER(dev->v4l2_dev.name, ready);
 	return vf;
 }
 
@@ -193,16 +214,18 @@ static int amlvideo_event_cb(int type, void *data, void *private_data)
 
 static int amlvideo_vf_states(struct vframe_states *states, void *op_arg)
 {
-	/* unsigned long flags; */
-	/* spin_lock_irqsave(&lock, flags); */
 	struct vivi_dev *dev = (struct vivi_dev *)op_arg;
-	int avail_count = vfq_level(&dev->q_ready) + vfq_level(&dev->q_omx);
+	unsigned long flags;
+	int avail_count;
+
+	spin_lock_irqsave(&dev->queue_lock, flags);
+	avail_count = vfq_level(&dev->q_ready) + vfq_level(&dev->q_omx);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
 
 	states->vf_pool_size = AMLVIDEO_POOL_SIZE;
 	states->buf_recycle_num = 0;
 	states->buf_free_num = AMLVIDEO_POOL_SIZE - avail_count;
 	states->buf_avail_num = avail_count;
-	/* spin_unlock_irqrestore(&lock, flags); */
 	return 0;
 }
 
@@ -246,10 +269,7 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 				omx_secret_mode = false;
 		}
 		dev->first_frame = 0;
-		vfq_init(&dev->q_ready, AMLVIDEO_POOL_SIZE,
-			&dev->amlvideo_pool_ready[0]);
-		vfq_init(&dev->q_omx, AMLVIDEO_POOL_SIZE,
-			&dev->amlvideo_pool_omx[0]);
+		amlvideo_queue_init(dev);
 		mutex_unlock(&dev->vf_mutex);
 	}
 	if (type == VFRAME_EVENT_PROVIDER_REG) {
@@ -284,10 +304,7 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 				AMLVIDEO_DBG("aaa->name=%s", aaa->name);
 			if (dev->inst == 0)
 				omx_secret_mode = true;
-			vfq_init(&dev->q_ready, AMLVIDEO_POOL_SIZE,
-					&dev->amlvideo_pool_ready[0]);
-			vfq_init(&dev->q_omx, AMLVIDEO_POOL_SIZE,
-					&dev->amlvideo_pool_omx[0]);
+			amlvideo_queue_init(dev);
 			vf_provider_init(&dev->video_vf_prov,
 						dev->vf_provider_name,
 						&amlvideo_vf_provider, dev);
@@ -304,11 +321,10 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 		vf_notify_receiver(dev->vf_provider_name,
 		VFRAME_EVENT_PROVIDER_FR_END_HINT, data);
 	} else if (type == VFRAME_EVENT_PROVIDER_RESET) {
+		mutex_lock(&dev->vf_mutex);
 		dev->first_frame = 0;
-		vfq_init(&dev->q_ready, AMLVIDEO_POOL_SIZE,
-			&dev->amlvideo_pool_ready[0]);
-		vfq_init(&dev->q_omx, AMLVIDEO_POOL_SIZE,
-			&dev->amlvideo_pool_omx[0]);
+		amlvideo_queue_init(dev);
+		mutex_unlock(&dev->vf_mutex);
 
 		vf_notify_receiver(dev->vf_provider_name,
 			VFRAME_EVENT_PROVIDER_RESET, data);
@@ -551,20 +567,39 @@ static int vidioc_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	u32 index;
 	struct vframe_s *vf;
 	struct vivi_dev *dev = video_drvdata(file);
-	while ((vf = vfq_peek(&dev->q_omx)))
-	{
-		index = (u32)vf->pts_us64;
-		vfq_push(&dev->q_ready, vfq_pop(&dev->q_omx));
-		ATRACE_COUNTER(dev->v4l2_dev.name, vfq_level(&dev->q_omx));
-		ATRACE_COUNTER(dev->v4l2_dev.name, vfq_level(&dev->q_ready));
-		vf_notify_receiver(
-				dev->vf_provider_name,
-				VFRAME_EVENT_PROVIDER_VFRAME_READY,
-				NULL);
+	unsigned long flags;
+	int cursor, moved = 0;
+	int pending, ready;
 
-		if (p->index == index)
+	mutex_lock(&dev->vf_mutex);
+	spin_lock_irqsave(&dev->queue_lock, flags);
+	/* A later QBUF may already have consumed this index as part of its prefix.
+	 * Returning it again must not publish unrelated, newer pending frames.
+	 */
+	for (cursor = dev->q_omx.rp; cursor != dev->q_omx.wp;
+	     cursor = (cursor + 1) % dev->q_omx.size) {
+		if ((u32)dev->q_omx.pool[cursor]->pts_us64 == p->index)
 			break;
 	}
+	if (cursor != dev->q_omx.wp) {
+		while ((vf = vfq_peek(&dev->q_omx))) {
+			index = (u32)vf->pts_us64;
+			vfq_push(&dev->q_ready, vfq_pop(&dev->q_omx));
+			moved++;
+			if (p->index == index)
+				break;
+		}
+	}
+	pending = vfq_level(&dev->q_omx);
+	ready = vfq_level(&dev->q_ready);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+	mutex_unlock(&dev->vf_mutex);
+
+	ATRACE_COUNTER(dev->v4l2_dev.name, pending);
+	ATRACE_COUNTER(dev->v4l2_dev.name, ready);
+	while (moved--)
+		vf_notify_receiver(dev->vf_provider_name,
+			VFRAME_EVENT_PROVIDER_VFRAME_READY, NULL);
 	return 0;
 }
 
@@ -575,14 +610,22 @@ static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	u64 pts_us64 = 0;
 	u64 pts_tmp;
 	struct vframe_s *next_vf;
-
-	if (vfq_level(&dev->q_omx) == AMLVIDEO_POOL_SIZE - 1 || vfq_level(&dev->q_ready) == AMLVIDEO_POOL_SIZE - 1)
-		return -EAGAIN;
-
-	if (!vf_peek(dev->vf_receiver_name))
-		return -EAGAIN;
+	unsigned long flags;
+	int pending;
 
 	mutex_lock(&dev->vf_mutex);
+	spin_lock_irqsave(&dev->queue_lock, flags);
+	/* Every dequeued frame reserves a ready-ring slot until the sink takes it.
+	 * QBUF can publish the entire pending prefix, so separate ring limits
+	 * would let its write pointer wrap onto the read pointer (false empty).
+	 */
+	pending = vfq_level(&dev->q_omx) + vfq_level(&dev->q_ready);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+	if (pending >= AMLVIDEO_POOL_SIZE - 1 ||
+	    !vf_peek(dev->vf_receiver_name)) {
+		mutex_unlock(&dev->vf_mutex);
+		return -EAGAIN;
+	}
 
 	dev->vf = vf_get(dev->vf_receiver_name);
 	if (!dev->vf) {
@@ -649,8 +692,11 @@ static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	p->timestamp.tv_usec = pts_us64 & 0xFFFFFFFF;
 	dev->last_pts_us64 = pts_us64;
 	dev->vf->pts_us64 = omx_freerun_index;
+	spin_lock_irqsave(&dev->queue_lock, flags);
 	vfq_push(&dev->q_omx, dev->vf);
-	ATRACE_COUNTER(dev->v4l2_dev.name, vfq_level(&dev->q_omx));
+	pending = vfq_level(&dev->q_omx);
+	spin_unlock_irqrestore(&dev->queue_lock, flags);
+	ATRACE_COUNTER(dev->v4l2_dev.name, pending);
 
 	if ((dev->vf->type & VIDTYPE_COMPRESS) != 0) {
 		p->timecode.type = dev->vf->compWidth;
@@ -947,6 +993,7 @@ static int __init amlvideo_create_instance(int inst)
 	spin_lock_init(&dev->slock);
 	mutex_init(&dev->mutex);
 	mutex_init(&dev->vf_mutex);
+	spin_lock_init(&dev->queue_lock);
 
 	ret = -ENOMEM;
 	vfd = video_device_alloc();
