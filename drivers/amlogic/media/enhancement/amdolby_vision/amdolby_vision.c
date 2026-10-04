@@ -4439,7 +4439,10 @@ static int parse_sei_and_meta
 				     p_md_buf,
 				     p_comp_buf);
 
-	if (ret == 0) {
+	/* Drops advance the parser using scratch buffers, not the displayed
+	 * frame's metadata. Repeats and parse-error recovery still use that frame.
+	 */
+	if (ret == 0 && !drop_flag) {
 		current_id = next_id;
 		backup_comp_size = *total_comp_size;
 		backup_md_size = *total_md_size;
@@ -6101,14 +6104,16 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			if (ret == 1) { /*parse succeeded*/
 				meta_flag_bl = 0;
 				src_format = FORMAT_DOVI;
-				memcpy(md_buf[current_id], vf->src_fmt.md_buf, vf->src_fmt.md_size);
-				memcpy(comp_buf[current_id], vf->src_fmt.comp_buf, vf->src_fmt.comp_size);
+				if (!drop_flag) {
+					memcpy(md_buf[current_id], vf->src_fmt.md_buf, vf->src_fmt.md_size);
+					memcpy(comp_buf[current_id], vf->src_fmt.comp_buf, vf->src_fmt.comp_size);
+				}
 				total_md_size =  vf->src_fmt.md_size;
 				total_comp_size =  vf->src_fmt.comp_size;
 				ret_flags = vf->src_fmt.parse_ret_flags;
 				if ((debug_dolby & 4) && dump_enable) {
-					dump_buffer("DOLBY: ETSI display management metadata", md_buf[current_id], total_md_size);
-					dump_buffer("DOLBY: ETSI composing metadata", comp_buf[current_id], total_comp_size);
+					dump_buffer("DOLBY: ETSI display management metadata", vf->src_fmt.md_buf, total_md_size);
+					dump_buffer("DOLBY: ETSI composing metadata", vf->src_fmt.comp_buf, total_comp_size);
 				}
 			} else {  /*no parse or parse failed*/
 				meta_flag_bl =
