@@ -191,6 +191,8 @@ static void amlvideo_vf_put(struct vframe_s *vf, void *op_arg)
 {
 	struct vivi_dev *dev = (struct vivi_dev *)op_arg;
 
+	if (vf)
+		vf->flag &= ~VFRAME_FLAG_AMLVIDEO_DISCARD;
 	vf_put(vf, dev->vf_receiver_name);
 	vf_notify_provider(dev->vf_receiver_name, VFRAME_EVENT_RECEIVER_PUT,
 					NULL);
@@ -584,6 +586,8 @@ static int vidioc_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	if (cursor != dev->q_omx.wp) {
 		while ((vf = vfq_peek(&dev->q_omx))) {
 			index = (u32)vf->pts_us64;
+			if (p->index == index && (p->flags & V4L2_BUF_FLAG_DONE))
+				vf->flag |= VFRAME_FLAG_AMLVIDEO_DISCARD;
 			vfq_push(&dev->q_ready, vfq_pop(&dev->q_omx));
 			moved++;
 			if (p->index == index)
@@ -692,6 +696,7 @@ static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	p->timestamp.tv_usec = pts_us64 & 0xFFFFFFFF;
 	dev->last_pts_us64 = pts_us64;
 	dev->vf->pts_us64 = omx_freerun_index;
+	dev->vf->flag &= ~VFRAME_FLAG_AMLVIDEO_DISCARD;
 	spin_lock_irqsave(&dev->queue_lock, flags);
 	vfq_push(&dev->q_omx, dev->vf);
 	pending = vfq_level(&dev->q_omx);

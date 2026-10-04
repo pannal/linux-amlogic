@@ -43,6 +43,8 @@ typedef uint64_t u64;
 #define VIDTYPE_INTERLACE 8
 #define V4L2_FIELD_INTERLACED 1
 #define VFRAME_EVENT_PROVIDER_VFRAME_READY 1
+#define VFRAME_FLAG_AMLVIDEO_DISCARD 0x1000000
+#define V4L2_BUF_FLAG_DONE 0x4
 #define smp_mb() atomic_thread_fence(memory_order_seq_cst)
 #define smp_rmb() atomic_thread_fence(memory_order_acquire)
 #define smp_wmb() atomic_thread_fence(memory_order_release)
@@ -51,7 +53,7 @@ typedef uint64_t u64;
 #define ATRACE_COUNTER(name,value) do{assert(!queue_spin_depth);(void)(name);(void)(value);}while(0)
 #define pr_info(...) ((void)0)
 struct vframe_s {
-  u32 index,omx_index,type,signal_type,pts,duration;
+  u32 index,omx_index,type,flag,signal_type,pts,duration;
   u64 pts_us64;
   struct {int master_display_colour;} prop;
   u32 hdr10p_data_size;char *hdr10p_data_buf;

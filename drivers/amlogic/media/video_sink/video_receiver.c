@@ -309,6 +309,33 @@ static int dolby_vision_need_wait_common(struct video_recv_s *ins)
 }
 #endif
 
+static int common_discard_frame(struct video_recv_s *ins, struct vframe_s *vf)
+{
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	bool process_dv = glayer_info[0].display_path_id == ins->path_id &&
+		is_dolby_vision_enable();
+#endif
+
+	if (vf != common_vf_peek(ins))
+		return -EAGAIN;
+	if (!vf || !(vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD))
+		return 0;
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	if (process_dv && dolby_vision_wait_metadata(vf) == 1)
+		return -EAGAIN;
+#endif
+	vf = common_vf_get(ins);
+	if (!vf)
+		return -EAGAIN;
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	if (process_dv)
+		dolby_vision_update_metadata(vf, true);
+#endif
+	vf->flag &= ~VFRAME_FLAG_AMLVIDEO_DISCARD;
+	common_vf_put(ins, vf);
+	return 1;
+}
+
 static void common_toggle_frame(
 	struct video_recv_s *ins, struct vframe_s *vf)
 {
@@ -468,6 +495,14 @@ static struct vframe_s *recv_common_dequeue_frame(
 	}
 #endif
 	while (vf) {
+		int discarded = common_discard_frame(ins, vf);
+
+		if (discarded < 0)
+			break;
+		if (discarded) {
+			vf = common_vf_peek(ins);
+			continue;
+		}
 		if (!vf->frame_dirty) {
 #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
 			if ((glayer_info[0].display_path_id == ins->path_id) &&

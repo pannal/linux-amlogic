@@ -1222,6 +1222,46 @@ static inline int pip_vf_put(struct vframe_s *vf)
 	return 0;
 }
 
+/* OMX ioctls can consume frames concurrently with the video IRQ. Keep each
+ * peek/filter/get indivisible without disabling IRQs across provider callbacks.
+ * Ordinary consumers leave marked heads to the IRQ's metadata-aware discard.
+ */
+static atomic_t video_get_owner = ATOMIC_INIT(0);
+
+static struct vframe_s *video_get_frame(struct vframe_s *expected,
+	bool discard, bool limit_index, u32 max_index)
+{
+	struct vframe_s *vf;
+
+	if (atomic_cmpxchg(&video_get_owner, 0, 1))
+		return NULL;
+	vf = vf_peek(RECEIVER_NAME);
+	if (!vf || (expected && vf != expected) ||
+	    (!!(vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD) != discard) ||
+	    (limit_index && vf->omx_index > max_index))
+		vf = NULL;
+	else
+		vf = vf_get(RECEIVER_NAME);
+	atomic_xchg(&video_get_owner, 0);
+	return vf;
+}
+
+static int video_discard_head(struct vframe_s *expected)
+{
+	struct vframe_s *vf;
+	int ret;
+
+	if (atomic_cmpxchg(&video_get_owner, 0, 1))
+		return -EAGAIN;
+	vf = vf_peek(RECEIVER_NAME);
+	if (vf != expected)
+		ret = -EAGAIN;
+	else
+		ret = vf && (vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD) ? 1 : 0;
+	atomic_xchg(&video_get_owner, 0);
+	return ret;
+}
+
 static inline struct vframe_s *video_vf_peek(void)
 {
 	int ret = 0;
@@ -1250,9 +1290,13 @@ static inline struct vframe_s *video_vf_peek(void)
 		 */
 		ret = fence_get_status(vf->fence);
 		if (ret < 0) {
-			vf = vf_get(RECEIVER_NAME);
-			if (vf)
-				vf_put(vf, RECEIVER_NAME);
+			/* Failed marked buffers still need the discard metadata path. */
+			if (!(vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD)) {
+				vf = video_get_frame(vf, false, false, 0);
+				if (vf)
+					vf_put(vf, RECEIVER_NAME);
+				vf = NULL;
+			}
 		} else if (ret == 0) {
 			vf = NULL;
 		}
@@ -1261,7 +1305,7 @@ static inline struct vframe_s *video_vf_peek(void)
 	return vf;
 }
 
-static inline struct vframe_s *video_vf_get(void)
+static inline struct vframe_s *video_vf_get_internal(struct vframe_s *discard)
 {
 	struct vframe_s *vf = NULL;
 	int frame_width, frame_height;
@@ -1272,7 +1316,7 @@ static inline struct vframe_s *video_vf_get(void)
 		return vf;
 	}
 
-	vf = vf_get(RECEIVER_NAME);
+	vf = video_get_frame(discard, discard != NULL, false, 0);
 	if (vf) {
 		get_count++;
 		if (vf->type & VIDTYPE_V4L_EOS) {
@@ -1347,6 +1391,11 @@ static inline struct vframe_s *video_vf_get(void)
 	}
 
 	return vf;
+}
+
+static inline struct vframe_s *video_vf_get(void)
+{
+	return video_vf_get_internal(NULL);
 }
 
 static int video_vf_get_states(struct vframe_states *states)
@@ -1798,6 +1847,8 @@ static bool has_receive_dummy_vframe(void)
 	if (vf && vf->flag & VFRAME_FLAG_EMPTY_FRAME_V4L) {
 		/* get dummy vf. */
 		vf = video_vf_get();
+		if (!vf)
+			return false;
 
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA /* recycle vframe. */
 		for (i = 0; i < DISPBUF_TO_PUT_MAX; i++) {
@@ -3375,6 +3426,8 @@ static int dolby_vision_drop_frame(void)
 		return 1;
 	}
 	vf = video_vf_get();
+	if (!vf)
+		return 1;
 
 	if (debug_flag & DEBUG_FLAG_OMX_DV_DROP_FRAME)
 		pr_info("drop vf %p, index %d, pts %d\n",
@@ -3390,6 +3443,55 @@ static int dolby_vision_drop_frame(void)
 	return 0;
 }
 #endif
+
+/* Preserve DI references and DV BL/EL pairing even for an explicit discard.
+ * Return 1 after consumption, 0 for normal presentation, or -EAGAIN to retry.
+ */
+static int video_discard_frame(struct vframe_s *vf, bool pip, bool dv_path)
+{
+	int marked;
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	bool process_dv = dv_path && is_dolby_vision_enable();
+#endif
+
+	/* Histogram tests use a synthetic frame, not the amlvideo provider. */
+	if (!pip && hist_test_flag)
+		return 0;
+	if (pip) {
+		if (vf != pip_vf_peek())
+			return -EAGAIN;
+		marked = vf && (vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD);
+	} else {
+		marked = video_discard_head(vf);
+	}
+	if (marked <= 0)
+		return marked;
+	/* Other main consumers refuse this marked head, so it remains owned by
+	 * this IRQ path while metadata waits. The final get checks identity again.
+	 */
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	if (process_dv && dolby_vision_wait_metadata(vf) == 1)
+		return -EAGAIN;
+#endif
+	vf = pip ? pip_vf_get() : video_vf_get_internal(vf);
+	if (!vf)
+		return -EAGAIN;
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	if (process_dv)
+		dolby_vision_update_metadata(vf, true);
+#endif
+	vf->flag &= ~VFRAME_FLAG_AMLVIDEO_DISCARD;
+	if (pip) {
+		if (pip_vf_put(vf) < 0)
+			check_pipbuf(vf, true);
+		videopip_drop_vf_cnt++;
+	} else {
+		if (video_vf_put(vf) < 0)
+			check_dispbuf(vf, true);
+		video_drop_vf_cnt++;
+	}
+	return 1;
+}
 
 /* patch for 4k2k bandwidth issue, skiw mali and vpu mif */
 static void dmc_adjust_for_mali_vpu(unsigned int width,
@@ -4871,6 +4973,8 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 
 			if (omx_need_drop_frame_num >= vf->omx_index) {
 				vf = video_vf_get();
+				if (!vf)
+					break;
 				if (video_vf_put(vf) < 0)
 					check_dispbuf(vf, true);
 				video_drop_vf_cnt++;
@@ -5317,9 +5421,24 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 
 	over_sync = false;
 
+	/* A discarded first frame must not anchor VIDEO_START or be toggled. */
+	vf = video_vf_peek();
+	while (vf && !video_suspend) {
+		int discarded = video_discard_frame(vf, false,
+			vd1_path_id == VFM_PATH_AMVIDEO ||
+			vd1_path_id == VFM_PATH_DEF ||
+			vd1_path_id == VFM_PATH_AUTO);
+
+		if (discarded < 0)
+			goto SET_FILTER;
+		if (!discarded)
+			break;
+		vf = video_vf_peek();
+	}
+
 	if ((!cur_dispbuf) || (cur_dispbuf == &vf_local)) {
 		vf = video_vf_peek();
-		if (vf) {
+		if (vf && !(vf->flag & VFRAME_FLAG_AMLVIDEO_DISCARD)) {
 			if (hdmi_in_onvideo == 0) {
 				if (nopostvideostart == false)
 					tsync_avevent_locked(VIDEO_START,
@@ -5407,6 +5526,17 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 	judge_3d_fa_out_mode();
 
 	while (vf && !video_suspend) {
+		int discarded = video_discard_frame(vf, false,
+			vd1_path_id == VFM_PATH_AMVIDEO ||
+			vd1_path_id == VFM_PATH_DEF ||
+			vd1_path_id == VFM_PATH_AUTO);
+
+		if (discarded < 0)
+			break;
+		if (discarded) {
+			vf = video_vf_peek();
+			continue;
+		}
 		if (debug_flag & DEBUG_FLAG_OMX_DEBUG_DROP_FRAME) {
 			pr_info("next pts= %x,index %x,pcr = %x,vpts = %x\n",
 				vf->pts, vf->omx_index,
@@ -5431,7 +5561,9 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 					pr_info("drop omx_index %d, pts %d\n",
 						vf->omx_index, vf->pts);
 				}
-				vf = vf_get(RECEIVER_NAME);
+				vf = video_get_frame(vf, false, false, 0);
+				if (!vf)
+					break;
 				if (vf) {
 					vf_put(vf, RECEIVER_NAME);
 					video_drop_vf_cnt++;
@@ -5790,6 +5922,15 @@ SET_FILTER:
 	}
 #endif
 	while (vf && !video_suspend) {
+		int discarded = video_discard_frame(vf, true,
+			vd1_path_id == VFM_PATH_PIP);
+
+		if (discarded < 0)
+			break;
+		if (discarded) {
+			vf = pip_vf_peek();
+			continue;
+		}
 		if (!vf->frame_dirty) {
 #if defined(CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_VECM)
 			int iret1 = 0, iret2 = 0;
@@ -8130,23 +8271,18 @@ static void set_omx_pts(u32 *p)
 				break;
 			}
 #endif
-			if (vf) {
-				video_drop_vf_cnt++;
-				if (debug_flag &
-				    DEBUG_FLAG_PRINT_DROP_FRAME)
-					pr_info("#line %d: drop frame_num=%d, omx_index=%d\n",
-						__LINE__,
-						frame_num,
-						vf->omx_index);
-				index_dropped = vf->omx_index;
-				if (frame_num >= vf->omx_index) {
-					vf = vf_get(RECEIVER_NAME);
-					if (vf)
-						vf_put(vf, RECEIVER_NAME);
-				} else
-					break;
-			} else
+			if (!vf)
 				break;
+			/* Recheck the current head and bound atomically with acquisition. */
+			vf = video_get_frame(vf, false, true, frame_num);
+			if (!vf)
+				break;
+			index_dropped = vf->omx_index;
+			video_drop_vf_cnt++;
+			if (debug_flag & DEBUG_FLAG_PRINT_DROP_FRAME)
+				pr_info("#line %d: drop frame_num=%d, omx_index=%d\n",
+					__LINE__, frame_num, index_dropped);
+			vf_put(vf, RECEIVER_NAME);
 		}
 		if (frame_num > index_dropped)
 			omx_need_drop_frame_num = frame_num;
