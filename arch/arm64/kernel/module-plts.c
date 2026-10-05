@@ -11,6 +11,9 @@
 #include <linux/module.h>
 #include <linux/sort.h>
 
+#include <asm/insn.h>
+#include <asm/debug-monitors.h>
+
 struct plt_entry {
 	/*
 	 * A program that conforms to the AArch64 Procedure Call Standard
@@ -78,6 +81,34 @@ u64 module_emit_plt_entry(struct module *mod, const Elf64_Rela *rela,
 	return (u64)&plt[i];
 }
 
+u64 module_emit_veneer_for_adrp(struct module *mod, void *loc, u64 val)
+{
+	struct plt_entry *plt = (struct plt_entry *)mod->arch.plt->sh_addr;
+	int i = mod->arch.plt_num_entries;
+	u32 rd, br;
+
+	if (i >= mod->arch.plt_max_entries)
+		return 0;
+
+	rd = le32_to_cpu(*(__le32 *)loc) & 0x1f;
+	br = aarch64_insn_gen_branch_imm((unsigned long)&plt[i].br,
+					 (unsigned long)loc + 4,
+					 AARCH64_INSN_BRANCH_NOLINK);
+
+	if (br == AARCH64_BREAK_FAULT)
+		return 0;
+
+	plt[i] = (struct plt_entry){
+		cpu_to_le32(0x92800000 | rd | (((~val      ) & 0xffff) << 5)),
+		cpu_to_le32(0xf2a00000 | rd | ((( val >> 16) & 0xffff) << 5)),
+		cpu_to_le32(0xf2c00000 | rd | ((( val >> 32) & 0xffff) << 5)),
+		cpu_to_le32(br)
+	};
+
+	mod->arch.plt_num_entries++;
+	return (u64)&plt[i];
+}
+
 #define cmp_3way(a,b)	((a) < (b) ? -1 : (a) > (b))
 
 static int cmp_rela(const void *a, const void *b)
@@ -141,6 +172,12 @@ static unsigned int count_plts(Elf64_Sym *syms, Elf64_Rela *rela, int num)
 			if (rela[i].r_addend != 0 || !duplicate_rel(rela, i))
 				ret++;
 			break;
+#ifdef CONFIG_ARM64_ERRATUM_843419
+		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+		case R_AARCH64_ADR_PREL_PG_HI21:
+			ret++;
+			break;
+#endif
 		}
 	}
 	return ret;

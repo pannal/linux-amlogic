@@ -27,6 +27,7 @@
 #include <linux/moduleloader.h>
 #include <linux/vmalloc.h>
 #include <asm/alternative.h>
+#include <asm/debug-monitors.h>
 #include <asm/insn.h>
 #include <asm/sections.h>
 
@@ -196,6 +197,39 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
 	return 0;
 }
 
+static bool is_forbidden_offset_for_adrp(void *place)
+{
+	return IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) &&
+	       ((u64)place & 0xfff) >= 0xff8;
+}
+
+static int reloc_insn_adrp(struct module *mod, void *place, u64 val)
+{
+	u32 insn;
+#ifdef CONFIG_ARM64_MODULE_PLTS
+	u64 veneer;
+#endif
+
+	if (!is_forbidden_offset_for_adrp(place))
+		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
+				      AARCH64_INSN_IMM_ADR);
+
+#ifdef CONFIG_ARM64_MODULE_PLTS
+	veneer = module_emit_veneer_for_adrp(mod, place, val & ~0xfffULL);
+	if (!veneer)
+		return -ENOEXEC;
+	insn = aarch64_insn_gen_branch_imm((unsigned long)place, veneer,
+			AARCH64_INSN_BRANCH_NOLINK);
+#else
+	return -ENOEXEC;
+#endif
+	if (insn == AARCH64_BREAK_FAULT)
+		return -ENOEXEC;
+
+	*(__le32 *)place = cpu_to_le32(insn);
+	return 0;
+}
+
 int apply_relocate_add(Elf64_Shdr *sechdrs,
 		       const char *strtab,
 		       unsigned int symindex,
@@ -335,14 +369,13 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
 					     AARCH64_INSN_IMM_ADR);
 			break;
-#ifndef CONFIG_ARM64_ERRATUM_843419
 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
 			overflow_check = false;
 		case R_AARCH64_ADR_PREL_PG_HI21:
-			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
-					     AARCH64_INSN_IMM_ADR);
+			ovf = reloc_insn_adrp(me, loc, val);
+			if (ovf && ovf != -ERANGE)
+				return ovf;
 			break;
-#endif
 		case R_AARCH64_ADD_ABS_LO12_NC:
 		case R_AARCH64_LDST8_ABS_LO12_NC:
 			overflow_check = false;

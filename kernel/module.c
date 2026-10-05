@@ -1279,14 +1279,19 @@ static int check_version(Elf_Shdr *sechdrs,
 {
 	unsigned int i, num_versions;
 	struct modversion_info *versions;
+	/* Legacy vendor modules intentionally retain their existing admission.
+	 * The adapted Android module and its native ABI reference require exact
+	 * CRCs, including module_layout; --force must not bypass that contract. */
+	bool strict = !strcmp(mod->name, "dovi5") ||
+		      !strcmp(mod->name, "dv_compat_shim");
 
 	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
 	if (!crc)
-		return 1;
+		return !strict;
 
 	/* No versions at all?  modprobe --force does this. */
 	if (versindex == 0)
-		return try_to_force_load(mod, symname) == 0;
+		return !strict && try_to_force_load(mod, symname) == 0;
 
 	versions = (void *) sechdrs[versindex].sh_addr;
 	num_versions = sechdrs[versindex].sh_size
@@ -1305,12 +1310,12 @@ static int check_version(Elf_Shdr *sechdrs,
 
 	/* Broken toolchain. Warn once, then let it go.. */
 	pr_warn_once("%s: no symbol version for %s\n", mod->name, symname);
-	return 1;
+	return !strict;
 
 bad_version:
 	pr_warn("%s: disagrees about version of symbol %s\n",
 	       mod->name, symname);
-	return 1;
+	return !strict;
 }
 
 static inline int check_modstruct_version(Elf_Shdr *sechdrs,

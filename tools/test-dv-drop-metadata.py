@@ -14,8 +14,9 @@ def balanced(start):
         i+=1
     return s[start:i]
 wrapper=balanced(s.index('static int parse_sei_and_meta\n'))
-repeat=balanced(s.index('if (meta_flag_bl && meta_flag_el)',s.index('int dolby_vision_parse_metadata(')))
-start=s.index('if (ret == 1) { /*parse succeeded*/',s.index('int dolby_vision_parse_metadata('))
+parse_start=s.index('static int dv_parse_metadata_internal(') if 'static int dv_parse_metadata_internal(' in s else s.index('int dolby_vision_parse_metadata(')
+repeat=balanced(s.index('if (meta_flag_bl && meta_flag_el)',parse_start))
+start=s.index('if (ret == 1) { /*parse succeeded*/',parse_start)
 fast=balanced(start)
 pre=r'''
 #include <assert.h>

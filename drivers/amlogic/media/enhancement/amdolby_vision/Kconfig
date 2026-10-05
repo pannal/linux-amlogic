@@ -12,4 +12,14 @@ config AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
         help
                 "Amlogic amdolby_vision module init"
 
+config AMLOGIC_DV5_COMPAT_SHIM
+        tristate "Optional native Dolby Vision compatibility adapter"
+        depends on AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION && ARM64
+        depends on MODVERSIONS && ARM64_MODULE_PLTS && !CFI_CLANG
+        default n
+        help
+                Adapter for the explicitly supported, user-provided Android
+                Dolby module on G12B. The original Dolby backend is required.
+                CoreELEC prepares a separate copy; no proprietary blob is included.
+
 endmenu

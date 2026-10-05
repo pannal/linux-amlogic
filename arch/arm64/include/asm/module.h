@@ -32,6 +32,8 @@ struct mod_arch_specific {
 u64 module_emit_plt_entry(struct module *mod, const Elf64_Rela *rela,
 			  Elf64_Sym *sym);
 
+u64 module_emit_veneer_for_adrp(struct module *mod, void *loc, u64 val);
+
 #ifdef CONFIG_RANDOMIZE_BASE
 #ifdef CONFIG_MODVERSIONS
 #define ARCH_RELOCATES_KCRCTAB

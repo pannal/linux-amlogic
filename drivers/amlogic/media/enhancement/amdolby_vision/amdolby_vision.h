@@ -543,6 +543,10 @@ struct dolby_vision_func_s {
 
 int register_dv_functions(const struct dolby_vision_func_s *func);
 int unregister_dv_functions(void);
+int register_dv_functions_multi(const struct dolby_vision_func_s *func);
+int unregister_dv_functions_multi(void);
+int register_dv_functions_multi(const struct dolby_vision_func_s *func);
+int unregister_dv_functions_multi(void);
 #ifndef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 #define VSYNC_WR_MPEG_REG(adr, val) WRITE_VPP_REG(adr, val)
 #define VSYNC_RD_MPEG_REG(adr) READ_VPP_REG(adr)
