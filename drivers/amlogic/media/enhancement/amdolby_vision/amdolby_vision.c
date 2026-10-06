@@ -1263,7 +1263,8 @@ static int stb_dolby_core1_set
   int reg_size = 0;
   bool bypass_core1 = (!hsize || !vsize || !(dolby_vision_mask & 1));
 
-  if (dolby_vision_on && (dolby_vision_flags & FLAG_DISABE_CORE_SETTING)) return 0;
+  /* Report skipped settings to the applied-backend observer. */
+  if (dolby_vision_on && (dolby_vision_flags & FLAG_DISABE_CORE_SETTING)) return 1;
 
   WRITE_VPP_DV_REG(DOLBY_TV_CLKGATE_CTRL, 0x2800);
   if (reset) {
@@ -1614,7 +1615,8 @@ static int dolby_core1_set
     }
   }
 
-  if (dolby_vision_on && (dolby_vision_flags & FLAG_DISABE_CORE_SETTING)) return 0;
+  /* Report skipped settings to the applied-backend observer. */
+  if (dolby_vision_on && (dolby_vision_flags & FLAG_DISABE_CORE_SETTING)) return 1;
 
   if (dolby_vision_flags & FLAG_DISABLE_COMPOSER) composer_enable = 0;
 
@@ -2392,6 +2394,49 @@ int get_mute_type(void)
     return MUTE_TYPE_NONE;
 }
 
+/* Observation only: a provider lifetime must produce fresh video settings before
+ * it can publish an applied backend. Do not reuse the last-programmed mode for
+ * kept frames, GUI processing, or a new decoder after provider reset. */
+static DEFINE_SPINLOCK(dv_backend_lock);
+static u64 dv_backend_epoch = 1;
+static u64 dv_backend_pending_epoch;
+static int dv_backend_applied = -1;
+
+void dolby_vision_backend_reset(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dv_backend_lock, flags);
+	dv_backend_epoch++;
+	dv_backend_applied = -1;
+	spin_unlock_irqrestore(&dv_backend_lock, flags);
+}
+EXPORT_SYMBOL(dolby_vision_backend_reset);
+
+static u64 dv_backend_generation(void)
+{
+	unsigned long flags;
+	u64 epoch;
+
+	spin_lock_irqsave(&dv_backend_lock, flags);
+	epoch = dv_backend_epoch;
+	spin_unlock_irqrestore(&dv_backend_lock, flags);
+	return epoch;
+}
+
+static void dv_backend_publish(bool video, unsigned int mask, u32 width, u32 height)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dv_backend_lock, flags);
+	if (!video || ((mask & 1) && (!width || !height)))
+		dv_backend_applied = -1;
+	else if ((mask & 1) && width && height &&
+		 dv_backend_pending_epoch == dv_backend_epoch)
+		dv_backend_applied = dv_pending_new ? 1 : 0;
+	spin_unlock_irqrestore(&dv_backend_lock, flags);
+}
+
 static void apply_stb_core_settings
   (int enable,
    unsigned int mask,
@@ -2407,6 +2452,8 @@ static void apply_stb_core_settings
   u32 update_bk = stb_core_setting_update_flag;
   static u32 update_flag_more;
   int mute_type;
+  u32 video_h_size, video_v_size;
+  bool core1_programmed = false;
 
   if (dv_pending_new != !!amdv_multi_dv_mode) {
     /* Never partially combine registers/LUTs from different backends. */
@@ -2422,6 +2469,8 @@ static void apply_stb_core_settings
 
   if (h_size == 0xffff) h_size = 0;
   if (v_size == 0xffff) v_size = 0;
+  video_h_size = h_size;
+  video_v_size = v_size;
 
   if (stb_core_setting_update_flag != update_flag_more && (debug_dolby & 2))
     pr_dolby_dbg("%s update setting again %x->%x\n", __func__, stb_core_setting_update_flag, update_flag_more);
@@ -2436,7 +2485,7 @@ static void apply_stb_core_settings
   adjust_vpotch();
   if (mask & 1) {  // Core 1
     if (is_meson_txlx_stbmode()) {
-      stb_dolby_core1_set(
+      core1_programmed = stb_dolby_core1_set(
           (u32 *)&new_dovi_setting.dm_reg1,
           (  u32 *)&new_dovi_setting.comp_reg,
           (u32 *)&new_dovi_setting.dm_lut1,
@@ -2446,9 +2495,9 @@ static void apply_stb_core_settings
           enable && new_dovi_setting.el_flag, /* EL enable */
           new_dovi_setting.el_halfsize_flag,
           new_dovi_setting.src_format == FORMAT_DOVI,
-          reset);
+          reset) == 0;
     } else {
-      dolby_core1_set(
+      core1_programmed = dolby_core1_set(
           (u32 *)&new_dovi_setting.dm_reg1,
           (u32 *)&new_dovi_setting.comp_reg,
           (u32 *)&new_dovi_setting.dm_lut1,
@@ -2458,7 +2507,7 @@ static void apply_stb_core_settings
           enable && new_dovi_setting.el_flag, /* EL enable */
           new_dovi_setting.el_halfsize_flag,
           new_dovi_setting.src_format == FORMAT_DOVI,
-          reset);
+          reset) == 0;
     }
   }
 
@@ -2540,6 +2589,8 @@ static void apply_stb_core_settings
     dv_applied_ci = dv_pending_ci;
   }
   WRITE_ONCE(amdv_multi_dv_mode, dv_pending_new);
+  dv_backend_publish(enable && (dolby_vision_mask & 1), core1_programmed ? 1 : 0,
+                     video_h_size, video_v_size);
 }
 
 static void osd_bypass(int bypass)
@@ -2746,6 +2797,9 @@ void enable_dolby_vision(int enable)
 				  dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT) &&
 				  dovi_setting.diagnostic_enable == 0 &&
 				  dovi_setting.dovi_ll_enable);
+
+	if (!enable)
+		dolby_vision_backend_reset();
 
 	if (enable) {
 		if (!dolby_vision_on) {
@@ -6206,6 +6260,7 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 	int meta_flag_el = 1;
 	int src_bdp = 12;
 	bool video_frame = false;
+	u64 backend_epoch = dv_backend_generation();
 	struct vframe_master_display_colour_s *p_mdc;
 	unsigned int current_mode = dolby_vision_mode;
 	u32 target_lumin_max = 0;
@@ -7130,6 +7185,12 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 
 	if (flag >= 0) {
 		dv_pending_new = use_new;
+		/* Repeat/keep processing may reuse this provider's settings, but may
+		 * never establish a new lifetime from a retained previous frame. */
+		if (!vf)
+			dv_backend_pending_epoch = 0;
+		else if (toggle_mode == 1 || dv_backend_pending_epoch == backend_epoch)
+			dv_backend_pending_epoch = backend_epoch;
 		applied_graphic_pq = parsed_graphic_pq;
 
 		stb_core_setting_update_flag |= flag;
@@ -8332,6 +8393,7 @@ int unregister_dv_functions(void)
 	unsigned long flags;
 	char *info;
 	dv_wait_transaction();
+	dolby_vision_backend_reset();
 	spin_lock_irqsave(&dovi_lock, flags);
 	if (p_funcs_new) {
 		/* The new registration pins the original module. A direct API
@@ -8388,6 +8450,7 @@ int unregister_dv_functions_multi(void)
 {
 	unsigned long flags;
 	dv_wait_transaction();
+	dolby_vision_backend_reset();
 	spin_lock_irqsave(&dovi_lock, flags);
 	dv_new_backend_available = false;
 	/* Called from adapter exit: its text is owned even if try_get would
@@ -9091,7 +9154,26 @@ static ssize_t dv_video_on_show
 	return len;
 }
 
+/* One coherent read; identity is unknown unless video core processing is on. */
+static ssize_t backend_state_show(struct class *cla,
+				 struct class_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	ssize_t len;
+
+	spin_lock_irqsave(&dv_backend_lock, flags);
+	len = scnprintf(buf, PAGE_SIZE, "%llu %d %u\n",
+			(unsigned long long)dv_backend_epoch,
+			READ_ONCE(dolby_vision_on) && READ_ONCE(dolby_vision_core1_on) ?
+			dv_backend_applied : -1,
+			READ_ONCE(dv_new_backend_available) &&
+			!READ_ONCE(dv_new_runtime_failed));
+	spin_unlock_irqrestore(&dv_backend_lock, flags);
+	return len;
+}
+
 static struct class_attribute amdolby_vision_class_attrs[] = {
+	__ATTR(backend_state, 0444, backend_state_show, NULL),
 	__ATTR(ko_info, 0444,
 	amdolby_vision_ko_info_show, NULL),
 	__ATTR(debug, 0644,

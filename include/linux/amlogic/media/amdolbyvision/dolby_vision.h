@@ -145,6 +145,8 @@ void enable_dolby_vision(int enable);
 bool is_dolby_vision_enable(void);
 bool is_dolby_vision_on(void);
 bool is_dolby_vision_video_on(void);
+/* Invalidate applied-backend observation at VD1 provider lifetime boundaries. */
+void dolby_vision_backend_reset(void);
 bool for_dolby_vision_certification(void);
 void set_dolby_vision_mode(int mode);
 int get_dolby_vision_mode(void);

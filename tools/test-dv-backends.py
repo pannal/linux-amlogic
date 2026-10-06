@@ -273,7 +273,8 @@ static void test_quiescence(void){
 }
 int main(void){setup();test_registration();test_routes();test_raw();test_ll();test_source_copy();test_cp();test_quiescence();puts("PASS: extracted routing/raw/LL/L5 metadata, CP rollback, registration ownership and whole-transaction unregister quiescence");return 0;}
 '''
-combined=preamble+public+private+abi+globals_+services+helpers+format_helpers+''.join(function(n) for n in ['register_dv_functions','unregister_dv_functions','register_dv_functions_multi','unregister_dv_functions_multi','dolby_vision_parse_metadata'])+tests
+observation=driver[driver.index('static DEFINE_SPINLOCK(dv_backend_lock);'):driver.index('static void apply_stb_core_settings\n')]
+combined=preamble+public+private+abi+globals_+observation+services+helpers+format_helpers+''.join(function(n) for n in ['register_dv_functions','unregister_dv_functions','register_dv_functions_multi','unregister_dv_functions_multi','dolby_vision_parse_metadata'])+tests
 flags=['-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-Wno-unused-parameter','-Wno-sign-compare','-Wno-unused-but-set-variable','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread']
 variants=[('production',combined)]
 if a.negative_controls:

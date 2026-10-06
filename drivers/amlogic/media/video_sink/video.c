@@ -7130,6 +7130,11 @@ static void video_vf_unreg_provider(void)
 		try_free_keep_video(1);
 	}
 
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	/* Old IRQs have drained and retained frames are detached. Invalidate
+	 * before admitting any new frame, so an old IRQ cannot tag the new epoch. */
+	dolby_vision_backend_reset();
+#endif
 	atomic_dec(&video_unreg_flag);
 	pr_info("VD1 AFBC 0x%x.\n", READ_VCBUS_REG(AFBC_ENABLE));
 	enable_video_discontinue_report = 1;
@@ -7226,6 +7231,11 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 					__func__);
 		}
 	}
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	/* Old IRQs have drained and retained frames are detached. Invalidate
+	 * before admitting any new frame, so an old IRQ cannot tag the new epoch. */
+	dolby_vision_backend_reset();
+#endif
 	atomic_dec(&video_unreg_flag);
 }
 
