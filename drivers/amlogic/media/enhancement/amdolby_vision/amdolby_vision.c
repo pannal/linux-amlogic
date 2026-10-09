@@ -7649,6 +7649,7 @@ static int dv_process_internal(struct vframe_s *vf,
 	const struct vinfo_s *vinfo = get_current_vinfo();
 	bool reset_flag = false;
 	static int sdr_delay;
+	bool fake_sdr_bypass = false;
 	unsigned int mode = dolby_vision_mode;
 	static bool video_turn_off = true;
 	static bool video_on[VD_PATH_MAX];
@@ -7830,7 +7831,12 @@ static int dv_process_internal(struct vframe_s *vf,
 			    mode == DOLBY_VISION_OUTPUT_MODE_BYPASS) {
 				dolby_vision_target_mode = DOLBY_VISION_OUTPUT_MODE_BYPASS;
 				dolby_vision_mode = DOLBY_VISION_OUTPUT_MODE_BYPASS;
-				dolby_vision_set_toggle_flag(0);
+				/* A clear acknowledges completion to userspace. Keep
+				 * the request pending until the bypass path has sent
+				 * SDR signaling and disabled the cores below.
+				 */
+				fake_sdr_bypass = true;
+				dolby_vision_set_toggle_flag(1);
 				dolby_vision_wait_on = false;
 				dolby_vision_wait_init = false;
 			} else {
@@ -7838,8 +7844,12 @@ static int dv_process_internal(struct vframe_s *vf,
 			}
 		}
 
-		if ((dolby_vision_flags & FLAG_TOGGLE_FRAME) ||
-		((video_status == -1) && dolby_vision_core1_on)) {
+		/* Preserve the metadata admission formerly implied by the
+		 * fake-SDR flag clear, without publishing an early receipt.
+		 */
+		if ((!fake_sdr_bypass &&
+		     (dolby_vision_flags & FLAG_TOGGLE_FRAME)) ||
+		    ((video_status == -1) && dolby_vision_core1_on)) {
 			pr_dolby_dbg("update when video off\n");
 			dv_parse_metadata_internal(NULL, 1, false, false);
 			dolby_vision_set_toggle_flag(1);
