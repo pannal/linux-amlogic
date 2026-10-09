@@ -411,9 +411,44 @@ struct rdma_op_s *get_rdma_ops(int rdma_type)
 		return NULL;
 }
 
+/* Only the normal single-channel path has an exact completion receipt.
+ * Debug/manual/secondary-channel modes retain the caller's bounded fail-safe. */
+u64 vsync_rdma_frame_begin(void)
+{
+	if (second_rdma_feature || (cur_enable[VSYNC_RDMA] & 0xf) != 1)
+		return 0;
+	return rdma_frame_begin(vsync_rdma_handle[VSYNC_RDMA]);
+}
+
+EXPORT_SYMBOL(vsync_rdma_frame_begin);
+
+void vsync_rdma_frame_end(u64 serial, u64 cookie, bool keep_pending)
+{
+	/* Always close an opened batch, even if a live debug/mode change makes
+	 * its receipt unsupported. Withholding a cookie must not stop RDMA. */
+	if (second_rdma_feature || (cur_enable[VSYNC_RDMA] & 0xf) != 1) {
+		cookie = 0;
+		keep_pending = false;
+	}
+	rdma_frame_end(vsync_rdma_handle[VSYNC_RDMA], serial, cookie, keep_pending);
+}
+
+EXPORT_SYMBOL(vsync_rdma_frame_end);
+
+u64 vsync_rdma_frame_completed(void)
+{
+	if (second_rdma_feature || (cur_enable[VSYNC_RDMA] & 0xf) != 1)
+		return 0;
+	return rdma_frame_completed(vsync_rdma_handle[VSYNC_RDMA]);
+}
+
+EXPORT_SYMBOL(vsync_rdma_frame_completed);
+
 void set_rdma_handle(int rdma_type, int handle)
 {
 	vsync_rdma_handle[rdma_type] = handle;
+	if (rdma_type == VSYNC_RDMA)
+		rdma_frame_tracking(handle);
 	pr_info("%s video rdma handle = %d.\n", __func__,
 		vsync_rdma_handle[rdma_type]);
 

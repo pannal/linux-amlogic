@@ -1559,11 +1559,11 @@ void hdmitx_video_mute_op(unsigned int flag)
 	if (flag == 0) {
 		/* hdmitx_device.hwop.cntlconfig(&hdmitx_device, */
 			/* CONF_VIDEO_MUTE_OP, VIDEO_MUTE); */
-		hdmitx_device.vid_mute_op = VIDEO_MUTE;
+		WRITE_ONCE(hdmitx_device.vid_mute_op, VIDEO_MUTE);
 	} else {
 		/* hdmitx_device.hwop.cntlconfig(&hdmitx_device, */
 			/* CONF_VIDEO_MUTE_OP, VIDEO_UNMUTE); */
-		hdmitx_device.vid_mute_op = VIDEO_UNMUTE;
+		WRITE_ONCE(hdmitx_device.vid_mute_op, VIDEO_UNMUTE);
 	}
 }
 EXPORT_SYMBOL(hdmitx_video_mute_op);

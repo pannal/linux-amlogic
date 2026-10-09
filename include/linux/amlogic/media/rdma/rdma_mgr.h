@@ -71,4 +71,9 @@ int rdma_write_reg(int handle, u32 adr, u32 val);
 int rdma_write_reg_bits(int handle, u32 adr, u32 val, u32 start, u32 len);
 
 int rdma_clear(int handle);
+/* Optional exact-batch receipt; zero means no verified completion. */
+void rdma_frame_tracking(int handle);
+u64 rdma_frame_begin(int handle);
+void rdma_frame_end(int handle, u64 serial, u64 cookie, bool keep_pending);
+u64 rdma_frame_completed(int handle);
 #endif

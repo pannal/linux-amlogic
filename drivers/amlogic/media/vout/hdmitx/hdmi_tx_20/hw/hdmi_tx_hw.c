@@ -727,11 +727,12 @@ static irqreturn_t vsync_intr_handler(int irq, void *dev)
 {
 	struct hdmitx_dev *hdev = (struct hdmitx_dev *)dev;
 
-	if (hdev->vid_mute_op != VIDEO_NONE_OP) {
-		hdev->hwop.cntlconfig(hdev,
-			CONF_VIDEO_MUTE_OP, hdev->vid_mute_op);
-		hdev->vid_mute_op = VIDEO_NONE_OP;
-	}
+	/* Consume before applying: a concurrent new seek may queue another mute
+	 * while cntlconfig runs. Clearing afterwards would erase that request. */
+	unsigned char mute_op = xchg(&hdev->vid_mute_op, VIDEO_NONE_OP);
+
+	if (mute_op != VIDEO_NONE_OP)
+		hdev->hwop.cntlconfig(hdev, CONF_VIDEO_MUTE_OP, mute_op);
 
 	return IRQ_HANDLED;
 }

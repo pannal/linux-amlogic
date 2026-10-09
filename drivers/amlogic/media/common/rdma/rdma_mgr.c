@@ -109,6 +109,14 @@ struct rdma_instance_s {
 	unsigned char keep_buf;
 	unsigned char used;
 	int prev_trigger_type;
+	/* Optional video receipt: pending software batch != armed hardware batch. */
+	bool frame_tracking;
+	bool frame_building;
+	bool frame_inflight;
+	u64 frame_serial;
+	u64 frame_pending;
+	u64 frame_armed;
+	u64 frame_completed;
 };
 
 #define MAX_CONFLICT 32
@@ -129,6 +137,8 @@ static struct rdma_device_data_s rdma_meson_dev;
 static DEFINE_SPINLOCK(rdma_lock);
 
 static struct rdma_device_info rdma_info;
+
+static void rdma_frame_invalidate(struct rdma_instance_s *ins);
 
 static struct rdma_regadr_s rdma_regadr[RDMA_NUM] = {
 	{RDMA_AHB_START_ADDR_MAN,
@@ -338,6 +348,7 @@ void rdma_unregister(int i)
 		}
 		info->rdma_ins[i].rdma_table_size = 0;
 		spin_lock_irqsave(&rdma_lock, flags);
+		rdma_frame_invalidate(&info->rdma_ins[i]);
 		info->rdma_ins[i].op = NULL;
 		spin_unlock_irqrestore(&rdma_lock, flags);
 	}
@@ -345,6 +356,15 @@ void rdma_unregister(int i)
 EXPORT_SYMBOL(rdma_unregister);
 static void rdma_reset(unsigned char external_reset)
 {
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&rdma_lock, flags);
+	for (i = 0; i < RDMA_NUM; i++) {
+		rdma_frame_invalidate(&rdma_info.rdma_ins[i]);
+		/* A late pre-reset IRQ must not certify the next configured table. */
+		rdma_info.rdma_ins[i].frame_inflight = true;
+	}
 	if (debug_flag & 4)
 		pr_info("%s(%d)\n",
 			__func__, external_reset);
@@ -365,7 +385,82 @@ static void rdma_reset(unsigned char external_reset)
 			(0x0 << 1));
 	}
 	reset_count++;
+	spin_unlock_irqrestore(&rdma_lock, flags);
 }
+
+/* Receipt helpers never change the existing write/recovery policy. A batch
+ * interrupted by config, clear or recovery cannot certify a complete frame. */
+static void rdma_frame_invalidate(struct rdma_instance_s *ins)
+{
+	ins->frame_serial++;
+	ins->frame_pending = 0;
+	ins->frame_armed = 0;
+	ins->frame_completed = 0;
+}
+
+void rdma_frame_tracking(int handle)
+{
+	unsigned long flags;
+	struct rdma_instance_s *ins;
+
+	if (handle <= 0 || handle >= RDMA_NUM)
+		return;
+	spin_lock_irqsave(&rdma_lock, flags);
+	ins = &rdma_info.rdma_ins[handle];
+	ins->frame_tracking = true;
+	rdma_frame_invalidate(ins);
+	spin_unlock_irqrestore(&rdma_lock, flags);
+}
+EXPORT_SYMBOL(rdma_frame_tracking);
+
+u64 rdma_frame_begin(int handle)
+{
+	unsigned long flags;
+	u64 serial = 0;
+
+	if (handle <= 0 || handle >= RDMA_NUM)
+		return 0;
+	spin_lock_irqsave(&rdma_lock, flags);
+	if (rdma_info.rdma_ins[handle].frame_tracking) {
+		rdma_info.rdma_ins[handle].frame_building = true;
+		serial = rdma_info.rdma_ins[handle].frame_serial;
+	}
+	spin_unlock_irqrestore(&rdma_lock, flags);
+	return serial;
+}
+EXPORT_SYMBOL(rdma_frame_begin);
+
+void rdma_frame_end(int handle, u64 serial, u64 cookie, bool keep_pending)
+{
+	unsigned long flags;
+	struct rdma_instance_s *ins;
+
+	if (!serial || handle <= 0 || handle >= RDMA_NUM)
+		return;
+	spin_lock_irqsave(&rdma_lock, flags);
+	ins = &rdma_info.rdma_ins[handle];
+	if (cookie && serial == ins->frame_serial && ins->rdma_item_count > 0)
+		ins->frame_pending = cookie;
+	else if (!keep_pending)
+		ins->frame_pending = 0;
+	ins->frame_building = false;
+	spin_unlock_irqrestore(&rdma_lock, flags);
+}
+EXPORT_SYMBOL(rdma_frame_end);
+
+u64 rdma_frame_completed(int handle)
+{
+	unsigned long flags;
+	u64 cookie = 0;
+
+	if (handle <= 0 || handle >= RDMA_NUM)
+		return 0;
+	spin_lock_irqsave(&rdma_lock, flags);
+	cookie = rdma_info.rdma_ins[handle].frame_completed;
+	spin_unlock_irqrestore(&rdma_lock, flags);
+	return cookie;
+}
+EXPORT_SYMBOL(rdma_frame_completed);
 
 static int rdma_isr_count;
 irqreturn_t rdma_mgr_isr(int irq, void *dev_id)
@@ -399,11 +494,34 @@ QUERY:
 			if (debug_flag & 2)
 				pr_info("%s: process %d\r\n", __func__, i);
 
+			if (ins->frame_tracking) {
+				unsigned long flags;
+
+				spin_lock_irqsave(&rdma_lock, flags);
+				/* Re-read: config may have run since QUERY. */
+				if (!(READ_VCBUS_REG(RDMA_STATUS) &
+				      (1 << ins->rdma_regadr->irq_status_bitpos))) {
+					spin_unlock_irqrestore(&rdma_lock, flags);
+					continue;
+				}
+				/* Stop the completed channel before acknowledging/rearming. */
+				WRITE_VCBUS_REG_BITS(ins->rdma_regadr->trigger_mask_reg,
+					0, ins->rdma_regadr->trigger_mask_reg_bitpos,
+					rdma_meson_dev.trigger_mask_len);
+				if (ins->frame_armed)
+					ins->frame_completed = ins->frame_armed;
+				ins->frame_armed = 0;
+				ins->frame_inflight = false;
+				WRITE_VCBUS_REG(RDMA_CTRL,
+					1 << ins->rdma_regadr->clear_irq_bitpos);
+				spin_unlock_irqrestore(&rdma_lock, flags);
+			}
 			if (ins->op && ins->op->irq_cb)
 				ins->op->irq_cb(ins->op->arg);
 
-			WRITE_VCBUS_REG(RDMA_CTRL,
-				(1 << ins->rdma_regadr->clear_irq_bitpos));
+			if (!ins->frame_tracking)
+				WRITE_VCBUS_REG(RDMA_CTRL,
+					(1 << ins->rdma_regadr->clear_irq_bitpos));
 		}
 	}
 	rdma_status = READ_VCBUS_REG(RDMA_STATUS);
@@ -461,10 +579,30 @@ int rdma_config(int handle, int trigger_type)
 		return -1;
 	}
 
+	/* Do not let the completion callback copy a partially generated video
+	 * frame. Returning empty requests the existing force-config retry at the
+	 * end of the video IRQ; no register entries or recovery are discarded. */
+	if (ins->frame_building && trigger_type == RDMA_TRIGGER_VSYNC_INPUT) {
+		spin_unlock_irqrestore(&rdma_lock, flags);
+		return 0;
+	}
+
 	if (trigger_type & RDMA_AUTO_START_MASK)
 		auto_start = true;
 
 	trigger_type &= ~RDMA_AUTO_START_MASK;
+	if (ins->frame_tracking) {
+		ins->frame_serial++;
+		ins->frame_armed =
+			!auto_start && trigger_type == RDMA_TRIGGER_VSYNC_INPUT &&
+			ins->rdma_item_count > 0 && !ins->frame_inflight &&
+			!(READ_VCBUS_REG(RDMA_STATUS) &
+			  (1 << ins->rdma_regadr->irq_status_bitpos))
+			? ins->frame_pending : 0;
+		ins->frame_pending = 0;
+		if (auto_start || (trigger_type && ins->rdma_item_count > 0))
+			ins->frame_inflight = true;
+	}
 	if (auto_start) {
 		WRITE_VCBUS_REG_BITS(
 			ins->rdma_regadr->trigger_mask_reg,
@@ -504,10 +642,20 @@ int rdma_config(int handle, int trigger_type)
 		ins->rdma_write_count = 0;
 		ret = 0;
 	} else {
+		if (ins->frame_tracking)
+			WRITE_VCBUS_REG_BITS(ins->rdma_regadr->trigger_mask_reg,
+				0, ins->rdma_regadr->trigger_mask_reg_bitpos,
+				rdma_meson_dev.trigger_mask_len);
 		memcpy(ins->rdma_table_addr, ins->reg_buf,
 			ins->rdma_item_count * 2 * sizeof(u32));
 
 		if (trigger_type > 0 && trigger_type <= RDMA_TRIGGER_MANUAL) {
+			/* A late old-table status during configuration cannot certify
+			 * this replacement, even though its CPU tag was prepared above. */
+			if (ins->frame_tracking &&
+			    (READ_VCBUS_REG(RDMA_STATUS) &
+			     (1 << ins->rdma_regadr->irq_status_bitpos)))
+				ins->frame_armed = 0;
 			ins->rdma_write_count = ins->rdma_item_count;
 			ins->prev_trigger_type = trigger_type;
 			if (trigger_type == RDMA_TRIGGER_MANUAL) {
@@ -633,6 +781,7 @@ int rdma_clear(int handle)
 		ins->rdma_regadr->trigger_mask_reg,
 		0, ins->rdma_regadr->trigger_mask_reg_bitpos,
 		rdma_meson_dev.trigger_mask_len);
+	rdma_frame_invalidate(ins);
 	ins->rdma_write_count = 0;
 	spin_unlock_irqrestore(&rdma_lock, flags);
 	return ret;
@@ -830,6 +979,11 @@ int rdma_write_reg(int handle, u32 adr, u32 val)
 		ins->rdma_item_count++;
 	} else {
 		int i;
+		unsigned long flags;
+
+		spin_lock_irqsave(&rdma_lock, flags);
+		rdma_frame_invalidate(ins);
+		spin_unlock_irqrestore(&rdma_lock, flags);
 		pr_info("%s(%d, %x, %x ,%d) buf overflow\n",
 		__func__, rdma_watchdog_count, handle, adr, val);
 		for (i = 0; i < ins->rdma_item_count; i++)

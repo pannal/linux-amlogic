@@ -985,6 +985,11 @@ atomic_t status_changed = ATOMIC_INIT(0);
 atomic_t axis_changed = ATOMIC_INIT(0);
 atomic_t video_unreg_flag = ATOMIC_INIT(0);
 atomic_t video_inirq_flag = ATOMIC_INIT(0);
+/* Provider lifetime, independent of recycled vframe/canvas addresses. */
+static atomic64_t presentation_epoch = ATOMIC64_INIT(1);
+#ifndef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+static atomic64_t presentation_applied = ATOMIC64_INIT(0);
+#endif
 atomic_t video_pause_flag = ATOMIC_INIT(0);
 int trickmode_duration;
 int trickmode_duration_count;
@@ -4712,6 +4717,23 @@ static int ai_pq_debug;
 static int ai_pq_value = -1;
 static int ai_pq_policy = 1;
 
+/* set_layer_display_canvas must actually replace the selected VD1 source.
+ * DI post-link, switched/extended sources and VD muxing need a separate proof. */
+static bool presentation_source_supported(struct vframe_s *frame, int path)
+{
+	return frame && frame == vd_layer[0].dispbuf &&
+	    !vd_layer[0].switch_vf && !vd_layer[0].do_switch &&
+	    !vd_layer[0].vd1_vd2_mux && !is_di_post_mode(frame) &&
+	    (frame->canvas0Addr ||
+	     ((frame->type & VIDTYPE_COMPRESS) &&
+	      !glayer_info[0].need_no_compress)) &&
+	    frame == cur_dispbuf && !is_local_vf(frame) &&
+	    !(frame->flag & (VFRAME_FLAG_FAKE_FRAME |
+				 VFRAME_FLAG_AMLVIDEO_DISCARD)) &&
+	    (path == VFM_PATH_AMVIDEO || path == VFM_PATH_DEF) &&
+	    !atomic_read(&video_unreg_flag);
+}
+
 #ifdef FIQ_VSYNC
 void vsync_fisr_in(void)
 #else
@@ -4748,6 +4770,10 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 	int axis[4];
 	int crop[4];
 	int pq_process_debug[4];
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	u64 frame_serial = 0;
+#endif
+	u64 frame_epoch = atomic64_read(&presentation_epoch);
 	enum vframe_signal_fmt_e fmt;
 	int i;
 	struct timeval start;
@@ -5087,6 +5113,7 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 	}
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 	vsync_rdma_config_pre();
+	frame_serial = vsync_rdma_frame_begin();
 
 	if (to_notify_trick_wait) {
 		atomic_set(&trickmode_framedone, 1);
@@ -6785,7 +6812,20 @@ exit:
 	if (gvideo_recv[1])
 		gvideo_recv[1]->func->late_proc(gvideo_recv[1]);
 
+	/* The final fresh VD1 frame, after all layer/blend/DI writes. Selection,
+	 * provider get, QBUF and first_frame_toggled are all earlier than this. */
+	if (new_frame && presentation_source_supported(new_frame, vd1_path_id)) {
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+		/* The frame cookie is attached when closing the batch below. */
+#else
+		atomic64_set(&presentation_applied, frame_epoch);
+#endif
+	} else {
+		frame_epoch = 0;
+	}
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	vsync_rdma_frame_end(frame_serial, frame_epoch,
+		!new_frame && presentation_source_supported(cur_dispbuf, vd1_path_id));
 	cur_rdma_buf = cur_dispbuf;
 	pip_rdma_buf = cur_pipbuf;
 RUN_FIRST_RDMA:
@@ -6999,6 +7039,8 @@ static void video_vf_unreg_provider(void)
 				sizeof(struct video_frame_detect_s));
 	frame_detect_drop_count = 0;
 	frame_detect_receive_count = 0;
+	atomic64_inc(&presentation_epoch);
+
 	spin_lock_irqsave(&lock, flags);
 	ret = update_amvideo_recycle_buffer();
 	if (ret == -EAGAIN) {
@@ -7182,6 +7224,8 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 	atomic_inc(&video_unreg_flag);
 	while (atomic_read(&video_inirq_flag) > 0)
 		schedule();
+
+	atomic64_inc(&presentation_epoch);
 
 	spin_lock_irqsave(&lock, flags);
 	ret = update_amvideo_recycle_buffer();
@@ -11082,6 +11126,25 @@ static ssize_t video_angle_store(struct class *cla,
 	return strnlen(buf, count);
 }
 
+/* Read-only ABI: version provider_epoch applied_epoch. This acknowledges a
+ * register batch, not a TV scanout/HDMI delivery timestamp. */
+static ssize_t presentation_state_show(struct class *cla,
+		struct class_attribute *attr, char *buf)
+{
+	u64 epoch = atomic64_read(&presentation_epoch);
+	u64 applied;
+
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	applied = vsync_rdma_frame_completed();
+#else
+	applied = atomic64_read(&presentation_applied);
+#endif
+	if (atomic_read(&video_unreg_flag) ||
+	    epoch != atomic64_read(&presentation_epoch) || applied != epoch)
+		applied = 0;
+	return scnprintf(buf, PAGE_SIZE, "1 %llu %llu\n", epoch, applied);
+}
+
 static ssize_t show_first_frame_nosync_show(struct class *cla,
 					    struct class_attribute *attr,
 					    char *buf)
@@ -12926,6 +12989,7 @@ static struct class_attribute amvideo_class_attrs[] = {
 	__ATTR_RO(frame_aspect_ratio),
 	__ATTR_RO(frame_rate),
 	__ATTR_RO(vframe_states),
+	__ATTR_RO(presentation_state),
 	__ATTR_RO(video_state),
 	__ATTR_RO(fps_info),
 	__ATTR_RO(vframe_ready_cnt),
@@ -13062,6 +13126,7 @@ static struct class_attribute amvideo_poll_class_attrs[] = {
 	__ATTR_RO(frame_width),
 	__ATTR_RO(frame_height),
 	__ATTR_RO(vframe_states),
+	__ATTR_RO(presentation_state),
 	__ATTR_RO(video_state),
 	__ATTR_RO(primary_src_fmt),
 	__ATTR_RO(status_changed),
