@@ -110,13 +110,16 @@ INTEGRATION = r"""
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-typedef unsigned long long u64;
+typedef unsigned long long u64;typedef int32_t s32;typedef uint32_t u32;
 #define CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA 1
+#define CONFIG_AMLOGIC_MEDIA_DEINTERLACE 1
 #define VFRAME_FLAG_FAKE_FRAME 1
 #define VFRAME_FLAG_AMLVIDEO_DISCARD 2
 #define VIDTYPE_COMPRESS 4
 #define VFM_PATH_AMVIDEO 0
-#define VFM_PATH_DEF 1
+#define VFM_PATH_DEF -1
+#define VFM_PATH_INVAILD 255
+#define VFM_PATH_PIP 1
 #define VSYNC_RDMA 0
 #define PAGE_SIZE 4096
 #define EXPORT_SYMBOL(x)
@@ -125,22 +128,32 @@ struct vframe_s {int type,flag,canvas0Addr;bool local,di;};
 static struct vframe_s frame,old;
 static struct vframe_s* cur_dispbuf;
 static struct {struct vframe_s* dispbuf;bool switch_vf,do_switch,vd1_vd2_mux;} vd_layer[1];
-static struct {bool need_no_compress;} glayer_info[1];
-static int video_unreg_flag;
+static struct {bool need_no_compress;int display_path_id;} glayer_info[1];
+static int video_unreg_flag,video_inirq_flag;
+#define READ_ONCE(x) (x)
+static bool route_locked;
+#define spin_lock_irqsave(l,f) do{(f)=0;assert(!route_locked);route_locked=true;}while(0)
+#define spin_unlock_irqrestore(l,f) do{(void)(f);assert(route_locked);route_locked=false;}while(0)
+@ROUTE_TYPES@
+static struct presentation_route_state presentation_route={.generation=1};
 static u64 presentation_epoch=8,complete=8;
 static int atomic_read(int* p){return *p;}
 static u64 atomic64_read(u64* p){return *p;}
 static bool is_local_vf(struct vframe_s* f){return f->local;}
 static bool is_di_post_mode(struct vframe_s* f){return f->di;}
-static int second_rdma_feature,cur_enable[1]={1},vsync_rdma_handle[1]={1};
+static int second_rdma_feature,cur_enable[1]={1},enable[1]={1},vsync_rdma_handle[1]={1};
+static bool di_post_on;static bool is_di_post_on(void){return di_post_on;}
 static int ends;static u64 end_cookie;static bool end_keep;
 static u64 rdma_frame_begin(int h){assert(h==1);return 7;}
-static u64 rdma_frame_completed(int h){assert(h==1);return complete;}
+static void (*completion_hook)(void);
+static u64 rdma_frame_completed(int h){if(h<=0)return 0;assert(h==1);assert(!route_locked);if(completion_hook){void (*hook)(void)=completion_hook;completion_hook=NULL;hook();}return complete;}
 static void rdma_frame_end(int h,u64 s,u64 c,bool keep){assert(h==1&&s==7);++ends;end_cookie=c;end_keep=keep;}
 struct class {};struct class_attribute {};
 @WRAPPER@
 @SOURCE_GATE@
+@ROUTE_HELPERS@
 @STATE@
+@ROUTE_TESTS@
 typedef int irqreturn_t;
 #define IRQ_HANDLED 1
 #define VIDEO_NONE_OP 0
@@ -173,13 +186,82 @@ int main(void){
  assert(vsync_rdma_frame_begin()==7);second_rdma_feature=1;vsync_rdma_frame_end(7,8,true);
  assert(ends==1&&end_cookie==0&&!end_keep);assert(!vsync_rdma_frame_begin());assert(!vsync_rdma_frame_completed());second_rdma_feature=0;
  cur_enable[0]=0;assert(!vsync_rdma_frame_begin());vsync_rdma_frame_end(7,8,true);assert(ends==2&&end_cookie==0&&!end_keep);cur_enable[0]=1;
+ complete=presentation_route_update(&frame,0,presentation_epoch);
  char buf[PAGE_SIZE];presentation_state_show(NULL,NULL,buf);assert(!strcmp(buf,"1 8 8\n"));
  complete=7;presentation_state_show(NULL,NULL,buf);assert(!strcmp(buf,"1 8 0\n"));
- complete=8;video_unreg_flag=1;presentation_state_show(NULL,NULL,buf);assert(!strcmp(buf,"1 8 0\n"));video_unreg_flag=0;
+ complete=presentation_route.generation;video_unreg_flag=1;presentation_state_show(NULL,NULL,buf);assert(!strcmp(buf,"1 8 0\n"));video_unreg_flag=0;
+ route_cases();
  hdmitx_device.hdmi_init=1;hdmitx_device.hwop.cntlconfig=apply;hdmitx_video_mute_op(1);inject_new_mute=true;
  vsync_intr_handler(0,&hdmitx_device);assert(applied_op==VIDEO_UNMUTE);assert(hdmitx_device.vid_mute_op==VIDEO_MUTE);
  vsync_intr_handler(0,&hdmitx_device);assert(applied_op==VIDEO_MUTE&&hdmitx_device.vid_mute_op==VIDEO_NONE_OP);
  puts("PASS production source eligibility, provider epoch readout, mode-switch close and HDMI new-request consumption");return 0;
+}
+"""
+
+ROUTE_TESTS=r"""
+static u64 snapshot(enum presentation_route_support expected){
+ struct presentation_route_state state;u64 applied=presentation_route_snapshot(&state);
+ assert(state.support==expected);assert(state.epoch==presentation_epoch);return applied;
+}
+static void change_route_during_read(void){frame.di=true;presentation_route_update(&frame,0,presentation_epoch);}
+static void route_cases(void){
+ u64 cookie,old_cookie;char buf[PAGE_SIZE],expected[PAGE_SIZE];
+ frame.canvas0Addr=7;frame.type=0;frame.flag=0;frame.local=false;frame.di=false;
+ cur_dispbuf=vd_layer[0].dispbuf=&frame;glayer_info[0].display_path_id=0;
+ vd_layer[0].switch_vf=vd_layer[0].do_switch=vd_layer[0].vd1_vd2_mux=false;
+ glayer_info[0].need_no_compress=false;video_unreg_flag=video_inirq_flag=0;
+ enable[0]=cur_enable[0]=1;second_rdma_feature=0;vsync_rdma_handle[0]=1;
+ cookie=presentation_route_update(&frame,0,presentation_epoch);assert(cookie);
+ complete=0;assert(!snapshot(PRESENTATION_SUPPORTED));
+ presentation_route_state_show(NULL,NULL,buf);snprintf(expected,sizeof(expected),"1 %llu %llu 1 0\n",presentation_epoch,cookie);assert(!strcmp(buf,expected));
+ complete=cookie;assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ video_inirq_flag=1;assert(!snapshot(PRESENTATION_UNKNOWN));video_inirq_flag=0;
+ assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ // A post-DI replacement keeps completion zero but explicitly opts out of this
+ // receipt route. Its completed predecessor must not certify a later route.
+ old_cookie=cookie;frame.di=true;assert(!presentation_route_update(&frame,0,presentation_epoch));
+ assert(!snapshot(PRESENTATION_UNSUPPORTED));assert(presentation_route.generation!=old_cookie);
+ frame.di=false;cookie=presentation_route_update(&frame,0,presentation_epoch);assert(cookie!=old_cookie);
+ complete=old_cookie;assert(!snapshot(PRESENTATION_SUPPORTED));complete=cookie;assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ // No new frame is needed to retain the same paused route's pending token.
+ assert(presentation_route_update(&frame,0,presentation_epoch)==cookie);
+ assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ // Missing/local/fake/discarded sources and mapping failure never prove incapability.
+ assert(!presentation_route_update(NULL,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));
+ frame.local=true;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));frame.local=false;
+ frame.flag=VFRAME_FLAG_FAKE_FRAME;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));frame.flag=VFRAME_FLAG_AMLVIDEO_DISCARD;
+ assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));frame.flag=0;
+ frame.canvas0Addr=0;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));frame.canvas0Addr=7;
+ // Source route switches invalidate the published snapshot even before the IRQ.
+ cookie=presentation_route_update(&frame,0,presentation_epoch);complete=cookie;
+ vd_layer[0].switch_vf=true;assert(!snapshot(PRESENTATION_UNKNOWN));assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));vd_layer[0].switch_vf=false;
+ vd_layer[0].do_switch=true;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));vd_layer[0].do_switch=false;
+ vd_layer[0].vd1_vd2_mux=true;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));vd_layer[0].vd1_vd2_mux=false;
+ glayer_info[0].display_path_id=VFM_PATH_PIP;assert(!presentation_route_update(&frame,VFM_PATH_PIP,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));
+ glayer_info[0].display_path_id=VFM_PATH_DEF;cookie=presentation_route_update(&frame,VFM_PATH_DEF,presentation_epoch);complete=cookie;assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ glayer_info[0].display_path_id=VFM_PATH_INVAILD;assert(!snapshot(PRESENTATION_UNKNOWN)); // -1 and255 must not collide
+ assert(!presentation_route_update(&frame,VFM_PATH_INVAILD,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));glayer_info[0].display_path_id=0;
+ // Requested/active RDMA transition and absent channels are failures/pending,
+ // while a stable alternate/debug/secondary mode is explicitly unsupported.
+ cookie=presentation_route_update(&frame,0,presentation_epoch);complete=cookie;
+ enable[0]=2;assert(!snapshot(PRESENTATION_UNKNOWN));assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));
+ cur_enable[0]=2;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));
+ enable[0]=cur_enable[0]=1;cookie=presentation_route_update(&frame,0,presentation_epoch);complete=old_cookie;assert(!snapshot(PRESENTATION_SUPPORTED));
+ second_rdma_feature=1;assert(!snapshot(PRESENTATION_UNKNOWN));assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));second_rdma_feature=0;
+ vsync_rdma_handle[0]=0;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));
+ vsync_rdma_handle[0]=-1;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));vsync_rdma_handle[0]=1;
+ // A completion lookup racing route publication must discard its initial snapshot.
+ cookie=presentation_route_update(&frame,0,presentation_epoch);complete=cookie;completion_hook=change_route_during_read;assert(!snapshot(PRESENTATION_UNKNOWN));frame.di=false;
+ cookie=presentation_route_update(&frame,0,presentation_epoch);complete=cookie;
+ ++presentation_epoch;assert(!snapshot(PRESENTATION_UNKNOWN));presentation_route_invalidate();
+ // Rapid provider retirement drops route classification as well as old receipts.
+ frame.di=true;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNSUPPORTED));
+ ++presentation_epoch;presentation_route_invalidate();assert(!snapshot(PRESENTATION_UNKNOWN));
+ frame.local=true;assert(!presentation_route_update(&frame,0,presentation_epoch));assert(!snapshot(PRESENTATION_UNKNOWN));frame.local=false;frame.di=false;
+ cookie=presentation_route_update(&frame,0,presentation_epoch);assert(cookie);complete=old_cookie;assert(!snapshot(PRESENTATION_SUPPORTED));
+ complete=cookie;assert(snapshot(PRESENTATION_SUPPORTED)==cookie);
+ video_unreg_flag=1;assert(!snapshot(PRESENTATION_UNKNOWN));video_unreg_flag=0;
+ puts("PASS route capability: supported pending/applied, explicit DI/mux/alternate paths, requested/active changes, stale cookies/providers, default/invalid collision, paused route and unknown failures");
 }
 """
 
@@ -203,10 +285,11 @@ def main():
   td=Path(td)
   def run(src,negative=False):
    (td/'test.c').write_text(src)
-   cmd=[os.environ.get('CC','gcc'),'-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-misleading-indentation','-Wno-sign-compare','-Wno-unused-variable',str(td/'test.c'),'-o',str(td/'test')]
+   # Match the real CE kernel's defined signed-overflow semantics.
+   cmd=[os.environ.get('CC','gcc'),'-std=gnu11','-fno-strict-overflow','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-misleading-indentation','-Wno-sign-compare','-Wno-unused-variable',str(td/'test.c'),'-o',str(td/'test')]
    if not negative:cmd+=['-fsanitize=address,undefined','-fno-omit-frame-pointer']
    subprocess.run(cmd,check=True)
-   r=subprocess.run([str(td/'test')],capture_output=True,text=True,timeout=10,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
+   r=subprocess.run([str(td/'test')],capture_output=True,text=True,timeout=10,env={**os.environ,'UBSAN_OPTIONS':'halt_on_error=1'})
    if negative:assert r.returncode and 'Assertion' in r.stderr,r.stderr
    else:print(r.stdout,end='');assert not r.returncode,r.stderr
   run(source)
@@ -216,16 +299,66 @@ def main():
         if a.baseline_hdmi else (root/hdmi_path).read_text())
   setter=(root/'drivers/amlogic/media/vout/hdmitx/hdmi_tx_20/hdmi_tx_main.c').read_text()
   integration=INTEGRATION.replace('@SOURCE_GATE@',function(video,'static bool presentation_source_supported('))
-  integration=integration.replace('@WRAPPER@','\n'.join(function(wrapper,f) for f in ['u64 vsync_rdma_frame_begin(', 'void vsync_rdma_frame_end(', 'u64 vsync_rdma_frame_completed(']))
-  integration=integration.replace('@STATE@',function(video,'static ssize_t presentation_state_show('))
+  integration=integration.replace('@WRAPPER@','\n'.join(function(wrapper,f) for f in ['u64 vsync_rdma_frame_route(', 'u64 vsync_rdma_frame_begin(', 'void vsync_rdma_frame_end(', 'u64 vsync_rdma_frame_completed(']))
+  integration=integration.replace('@ROUTE_TYPES@',function(video,'enum presentation_route_support')+';\n'+function(video,'struct presentation_route_state')+';')
+  integration=integration.replace('@ROUTE_HELPERS@','\n'.join(function(video,f) for f in ['static u64 presentation_route_config(', 'static enum presentation_route_support presentation_route_classify(', 'static u64 presentation_route_update(', 'static void presentation_route_invalidate(', 'static u64 presentation_route_snapshot(']))
+  integration=integration.replace('@STATE@',function(video,'static ssize_t presentation_state_show(')+'\n'+function(video,'static ssize_t presentation_route_state_show('))
+  integration=integration.replace('@ROUTE_TESTS@',ROUTE_TESTS)
   integration=integration.replace('@MUTE_SETTER@',function(setter,'void hdmitx_video_mute_op('))
   integration=integration.replace('@MUTE_IRQ@',function(hdmi,'static irqreturn_t vsync_intr_handler('))
   integration='#include <string.h>\n#include <sys/types.h>\n'+integration
   run(integration)
+  # Compile the production non-RDMA branch, including the final IRQ write
+  # fragment. Hardware selection/write effects remain modeled inputs.
+  direct=integration[:integration.index('typedef int irqreturn_t;')]
+  direct=direct.replace('#define CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA 1', '')
+  direct=direct.replace(ROUTE_TESTS, '')
+  direct=direct.replace('static u64 presentation_epoch=8,complete=8;',
+                        'static u64 presentation_epoch=8,complete=8,presentation_applied;\n'
+                        'static void atomic64_set(u64* p,u64 value){*p=value;}')
+  tail=irq[irq.index('\tframe_cookie = presentation_route_update('):]
+  tail=tail[:tail.index('#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA\n\tvsync_rdma_frame_end')]
+  direct+=('\nstatic void direct_apply(struct vframe_s* new_frame) {\n'
+           'int vd1_path_id=glayer_info[0].display_path_id;u64 frame_epoch=presentation_epoch,frame_cookie;\n'+tail+'\n}\n')
+  direct+=r"""
+int main(void){
+ struct presentation_route_state state;char buf[PAGE_SIZE];u64 first,second;
+ frame.canvas0Addr=7;cur_dispbuf=vd_layer[0].dispbuf=&frame;
+ first=presentation_route_update(&frame,0,presentation_epoch);assert(first);
+ assert(!presentation_route_snapshot(&state)&&state.support==PRESENTATION_SUPPORTED);
+ direct_apply(&frame);assert(presentation_route_snapshot(&state)==first);
+ presentation_state_show(NULL,NULL,buf);assert(!strcmp(buf,"1 8 8\n"));
+ presentation_route_state_show(NULL,NULL,buf);assert(strstr(buf," 1 "));
+ direct_apply(NULL);assert(presentation_route_snapshot(&state)==first); // sole paused/still frame
+ frame.di=true;direct_apply(&frame);assert(!presentation_route_snapshot(&state)&&state.support==PRESENTATION_UNSUPPORTED);
+ frame.di=false;second=presentation_route_update(&frame,0,presentation_epoch);assert(second!=first);
+ assert(!presentation_route_snapshot(&state)); // prior direct write belongs to another route
+ direct_apply(&frame);assert(presentation_route_snapshot(&state)==second);
+ frame.type=VIDTYPE_COMPRESS;second=presentation_route_update(&frame,0,presentation_epoch);
+ assert(!presentation_route_snapshot(&state));direct_apply(&frame);assert(presentation_route_snapshot(&state)==second);
+ frame.canvas0Addr=0;glayer_info[0].need_no_compress=true;assert(!presentation_route_snapshot(&state));direct_apply(&frame);
+ assert(!presentation_route_snapshot(&state)&&state.support==PRESENTATION_UNKNOWN);
+ ++presentation_epoch;presentation_route_invalidate();assert(!presentation_route_snapshot(&state)&&state.support==PRESENTATION_UNKNOWN);
+ puts("PASS non-RDMA: actual direct-write tail, strict pending/applied, sole paused/still frame, DI/AFBC route changes and provider retirement");
+}
+"""
+  run(direct)
+  if a.negative_controls:
+   for name,old,new in [
+    ('direct write not recorded','atomic64_set(&presentation_applied, frame_cookie);','atomic64_set(&presentation_applied, 0);'),
+    ('direct receipt survives route change','applied != state->generation','false'),
+   ]:
+    assert old in direct;run(direct.replace(old,new,1),True);print('Rejected:',name)
   if a.negative_controls:
    for name,old,new in [
     ('absent source registers admitted','frame->canvas0Addr ||','true ||'),
-    ('old provider receipt admitted','applied != epoch','false'),
+    ('old provider receipt admitted','state->epoch != epoch','false'),
+    ('uncertainty means unsupported','state->support = PRESENTATION_UNKNOWN;', 'state->support = PRESENTATION_UNSUPPORTED;'),
+    ('default/invalid path collision','display_path_id) & 0xffff','display_path_id) & 0xff'),
+    ('old route receipt admitted','applied != state->generation','false'),
+    ('route generation never changes','presentation_route.generation++;','/* keep old generation */'),
+    ('changed route configuration ignored','state->config != presentation_route_config()','false'),
+    ('IRQ mutation accepted','atomic_read(&video_inirq_flag)','false'),
     ('new HDMI request erased','hdev->hwop.cntlconfig(hdev, CONF_VIDEO_MUTE_OP, mute_op);','hdev->hwop.cntlconfig(hdev, CONF_VIDEO_MUTE_OP, mute_op); hdev->vid_mute_op=VIDEO_NONE_OP;'),
    ]:
     assert old in integration;run(integration.replace(old,new,1),True);print('Rejected:',name)

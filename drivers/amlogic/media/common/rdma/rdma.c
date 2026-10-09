@@ -411,8 +411,19 @@ struct rdma_op_s *get_rdma_ops(int rdma_type)
 		return NULL;
 }
 
+/* Configuration identity, not a completion counter. Include the requested
+ * mode so a transition cannot reuse a published classification. */
+u64 vsync_rdma_frame_route(void)
+{
+	return ((u64)(u32)READ_ONCE(vsync_rdma_handle[VSYNC_RDMA]) << 32) |
+		(!!READ_ONCE(second_rdma_feature) << 8) |
+		((READ_ONCE(enable[VSYNC_RDMA]) & 0xf) << 4) |
+		(READ_ONCE(cur_enable[VSYNC_RDMA]) & 0xf);
+}
+EXPORT_SYMBOL(vsync_rdma_frame_route);
+
 /* Only the normal single-channel path has an exact completion receipt.
- * Debug/manual/secondary-channel modes retain the caller's bounded fail-safe. */
+ * Alternate modes are classified separately by the video provider. */
 u64 vsync_rdma_frame_begin(void)
 {
 	if (second_rdma_feature || (cur_enable[VSYNC_RDMA] & 0xf) != 1)

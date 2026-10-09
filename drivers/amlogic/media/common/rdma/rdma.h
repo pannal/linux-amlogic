@@ -32,6 +32,7 @@ extern int rdma_watchdog_setting(int flag);
 int rdma_init2(void);
 struct rdma_op_s *get_rdma_ops(int rdma_type);
 void set_rdma_handle(int rdma_type, int handle);
+u64 vsync_rdma_frame_route(void);
 u64 vsync_rdma_frame_begin(void);
 void vsync_rdma_frame_end(u64 serial, u64 cookie, bool keep_pending);
 u64 vsync_rdma_frame_completed(void);

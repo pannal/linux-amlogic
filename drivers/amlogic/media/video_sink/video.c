@@ -987,6 +987,24 @@ atomic_t video_unreg_flag = ATOMIC_INIT(0);
 atomic_t video_inirq_flag = ATOMIC_INIT(0);
 /* Provider lifetime, independent of recycled vframe/canvas addresses. */
 static atomic64_t presentation_epoch = ATOMIC64_INIT(1);
+enum presentation_route_support {
+	PRESENTATION_UNKNOWN,
+	PRESENTATION_SUPPORTED,
+	PRESENTATION_UNSUPPORTED,
+};
+struct presentation_route_state {
+	u64 epoch;
+	u64 generation;
+	u64 config;
+	int path;
+	enum presentation_route_support support;
+	bool di;
+	bool compressed;
+};
+static DEFINE_SPINLOCK(presentation_route_lock);
+static struct presentation_route_state presentation_route = {
+	.generation = 1,
+};
 #ifndef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 static atomic64_t presentation_applied = ATOMIC64_INIT(0);
 #endif
@@ -4734,6 +4752,124 @@ static bool presentation_source_supported(struct vframe_s *frame, int path)
 	    !atomic_read(&video_unreg_flag);
 }
 
+/* Only scalar configuration is read from sysfs context. Live vframes are
+ * classified in the video IRQ, after source selection and programming. */
+static u64 presentation_route_config(void)
+{
+	u64 config = 0;
+
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	config = vsync_rdma_frame_route();
+#endif
+	config |= (u64)!!READ_ONCE(vd_layer[0].switch_vf) << 9;
+	config |= (u64)!!READ_ONCE(vd_layer[0].do_switch) << 10;
+	config |= (u64)!!READ_ONCE(vd_layer[0].vd1_vd2_mux) << 11;
+	config |= (u64)!!READ_ONCE(glayer_info[0].need_no_compress) << 12;
+#ifdef CONFIG_AMLOGIC_MEDIA_DEINTERLACE
+	config |= (u64)!!is_di_post_on() << 13;
+#endif
+	config |= (u64)(READ_ONCE(glayer_info[0].display_path_id) & 0xffff) << 16;
+	return config;
+}
+
+static enum presentation_route_support presentation_route_classify(
+	struct vframe_s *frame, int path, u64 config)
+{
+	/* Missing/retained/discarded sources and missing mappings are uncertainty,
+	 * not proof that this provider cannot supply a receipt. */
+	if (!frame || is_local_vf(frame) || atomic_read(&video_unreg_flag) ||
+	    (frame->flag & (VFRAME_FLAG_FAKE_FRAME | VFRAME_FLAG_AMLVIDEO_DISCARD)) ||
+	    path == VFM_PATH_INVAILD ||
+	    !(frame->canvas0Addr || ((frame->type & VIDTYPE_COMPRESS) &&
+				     !glayer_info[0].need_no_compress)))
+		return PRESENTATION_UNKNOWN;
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	/* An absent channel or an in-progress requested/active mode transition
+	 * remains a real failure/pending case, with the bounded timeout. */
+	if ((s32)(config >> 32) <= 0 || (config & 0xf) != ((config >> 4) & 0xf))
+		return PRESENTATION_UNKNOWN;
+	if ((config & 0x100) || (config & 0xf) != 1)
+		return PRESENTATION_UNSUPPORTED;
+#endif
+	if (vd_layer[0].switch_vf || vd_layer[0].do_switch ||
+	    vd_layer[0].vd1_vd2_mux || is_di_post_mode(frame) ||
+	    (path != VFM_PATH_AMVIDEO && path != VFM_PATH_DEF))
+		return PRESENTATION_UNSUPPORTED;
+	return presentation_source_supported(frame, path) ?
+		PRESENTATION_SUPPORTED : PRESENTATION_UNKNOWN;
+}
+
+static u64 presentation_route_update(struct vframe_s *frame, int path, u64 epoch)
+{
+	unsigned long flags;
+	u64 config = presentation_route_config();
+	enum presentation_route_support support =
+		presentation_route_classify(frame, path, config);
+	bool di = frame && is_di_post_mode(frame);
+	bool compressed = frame && (frame->type & VIDTYPE_COMPRESS);
+	u64 cookie;
+
+	spin_lock_irqsave(&presentation_route_lock, flags);
+	if (epoch != atomic64_read(&presentation_epoch))
+		support = PRESENTATION_UNKNOWN;
+	if (presentation_route.epoch != epoch ||
+	    presentation_route.config != config || presentation_route.path != path ||
+	    presentation_route.support != support || presentation_route.di != di ||
+	    presentation_route.compressed != compressed)
+		presentation_route.generation++;
+	presentation_route.epoch = epoch;
+	presentation_route.config = config;
+	presentation_route.path = path;
+	presentation_route.support = support;
+	presentation_route.di = di;
+	presentation_route.compressed = compressed;
+	cookie = support == PRESENTATION_SUPPORTED ? presentation_route.generation : 0;
+	spin_unlock_irqrestore(&presentation_route_lock, flags);
+	return cookie;
+}
+
+static void presentation_route_invalidate(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&presentation_route_lock, flags);
+	presentation_route.epoch = atomic64_read(&presentation_epoch);
+	presentation_route.generation++;
+	presentation_route.support = PRESENTATION_UNKNOWN;
+	spin_unlock_irqrestore(&presentation_route_lock, flags);
+}
+
+/* Never nest the route lock with RDMA locks. Revalidate after reading the
+ * completion so a retired provider or changed route cannot reuse it. */
+static u64 presentation_route_snapshot(struct presentation_route_state *state)
+{
+	unsigned long flags;
+	u64 applied;
+	u64 epoch = atomic64_read(&presentation_epoch);
+
+	spin_lock_irqsave(&presentation_route_lock, flags);
+	*state = presentation_route;
+	spin_unlock_irqrestore(&presentation_route_lock, flags);
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	applied = vsync_rdma_frame_completed();
+#else
+	applied = atomic64_read(&presentation_applied);
+#endif
+	spin_lock_irqsave(&presentation_route_lock, flags);
+	if (atomic_read(&video_unreg_flag) || atomic_read(&video_inirq_flag) ||
+	    epoch != atomic64_read(&presentation_epoch) || state->epoch != epoch ||
+	    state->generation != presentation_route.generation ||
+	    state->config != presentation_route_config()) {
+		state->support = PRESENTATION_UNKNOWN;
+		applied = 0;
+	}
+	state->epoch = epoch;
+	if (state->support != PRESENTATION_SUPPORTED || applied != state->generation)
+		applied = 0;
+	spin_unlock_irqrestore(&presentation_route_lock, flags);
+	return applied;
+}
+
 #ifdef FIQ_VSYNC
 void vsync_fisr_in(void)
 #else
@@ -4774,6 +4910,7 @@ static irqreturn_t vsync_isr_in(int irq, void *dev_id)
 	u64 frame_serial = 0;
 #endif
 	u64 frame_epoch = atomic64_read(&presentation_epoch);
+	u64 frame_cookie;
 	enum vframe_signal_fmt_e fmt;
 	int i;
 	struct timeval start;
@@ -6814,18 +6951,22 @@ exit:
 
 	/* The final fresh VD1 frame, after all layer/blend/DI writes. Selection,
 	 * provider get, QBUF and first_frame_toggled are all earlier than this. */
-	if (new_frame && presentation_source_supported(new_frame, vd1_path_id)) {
+	frame_cookie = presentation_route_update(new_frame ? new_frame :
+		vd_layer[0].dispbuf, vd1_path_id, frame_epoch);
+	if (new_frame && frame_cookie &&
+	    presentation_source_supported(new_frame, vd1_path_id)) {
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 		/* The frame cookie is attached when closing the batch below. */
 #else
-		atomic64_set(&presentation_applied, frame_epoch);
+		atomic64_set(&presentation_applied, frame_cookie);
 #endif
 	} else {
-		frame_epoch = 0;
+		frame_cookie = 0;
 	}
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
-	vsync_rdma_frame_end(frame_serial, frame_epoch,
-		!new_frame && presentation_source_supported(cur_dispbuf, vd1_path_id));
+	vsync_rdma_frame_end(frame_serial, frame_cookie,
+		!new_frame && presentation_route.support == PRESENTATION_SUPPORTED &&
+		presentation_source_supported(cur_dispbuf, vd1_path_id));
 	cur_rdma_buf = cur_dispbuf;
 	pip_rdma_buf = cur_pipbuf;
 RUN_FIRST_RDMA:
@@ -7040,6 +7181,7 @@ static void video_vf_unreg_provider(void)
 	frame_detect_drop_count = 0;
 	frame_detect_receive_count = 0;
 	atomic64_inc(&presentation_epoch);
+	presentation_route_invalidate();
 
 	spin_lock_irqsave(&lock, flags);
 	ret = update_amvideo_recycle_buffer();
@@ -7226,6 +7368,7 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 		schedule();
 
 	atomic64_inc(&presentation_epoch);
+	presentation_route_invalidate();
 
 	spin_lock_irqsave(&lock, flags);
 	ret = update_amvideo_recycle_buffer();
@@ -11131,18 +11274,25 @@ static ssize_t video_angle_store(struct class *cla,
 static ssize_t presentation_state_show(struct class *cla,
 		struct class_attribute *attr, char *buf)
 {
-	u64 epoch = atomic64_read(&presentation_epoch);
-	u64 applied;
+	struct presentation_route_state state;
+	u64 applied = presentation_route_snapshot(&state);
 
-#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
-	applied = vsync_rdma_frame_completed();
-#else
-	applied = atomic64_read(&presentation_applied);
-#endif
-	if (atomic_read(&video_unreg_flag) ||
-	    epoch != atomic64_read(&presentation_epoch) || applied != epoch)
-		applied = 0;
-	return scnprintf(buf, PAGE_SIZE, "1 %llu %llu\n", epoch, applied);
+	/* Keep the original three-field ABI for existing consumers. */
+	return scnprintf(buf, PAGE_SIZE, "1 %llu %llu\n", state.epoch,
+		applied ? state.epoch : 0);
+}
+
+/* version provider_epoch route_generation support applied_generation.
+ * UNKNOWN=0, SUPPORTED=1, UNSUPPORTED=2. Unsupported is compatibility evidence,
+ * never a display acknowledgement; zero completion alone carries no capability. */
+static ssize_t presentation_route_state_show(struct class *cla,
+		struct class_attribute *attr, char *buf)
+{
+	struct presentation_route_state state;
+	u64 applied = presentation_route_snapshot(&state);
+
+	return scnprintf(buf, PAGE_SIZE, "1 %llu %llu %u %llu\n", state.epoch,
+		state.generation, state.support, applied);
 }
 
 static ssize_t show_first_frame_nosync_show(struct class *cla,
@@ -12990,6 +13140,7 @@ static struct class_attribute amvideo_class_attrs[] = {
 	__ATTR_RO(frame_rate),
 	__ATTR_RO(vframe_states),
 	__ATTR_RO(presentation_state),
+	__ATTR_RO(presentation_route_state),
 	__ATTR_RO(video_state),
 	__ATTR_RO(fps_info),
 	__ATTR_RO(vframe_ready_cnt),
@@ -13127,6 +13278,7 @@ static struct class_attribute amvideo_poll_class_attrs[] = {
 	__ATTR_RO(frame_height),
 	__ATTR_RO(vframe_states),
 	__ATTR_RO(presentation_state),
+	__ATTR_RO(presentation_route_state),
 	__ATTR_RO(video_state),
 	__ATTR_RO(primary_src_fmt),
 	__ATTR_RO(status_changed),
