@@ -45,6 +45,7 @@
 #include "hdmi_tx_reg.h"
 #include "tvenc_conf.h"
 #include "common.h"
+#include "../hdmi_tx_audio_layout.h"
 #include "hw_clk.h"
 #include <linux/arm-smccc.h>
 #include "checksha.h"
@@ -2565,6 +2566,10 @@ static void set_aud_chnls(struct hdmitx_dev *hdev,
 	}
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDSCHNLS8,  /* CSB 39:36 */
 		aud_csb_ori_sampfreq[audio_param->sample_rate], 4, 4);
+	/* The writer above resets AUDSV for every mode, including passthrough. */
+	if (hdmitx_pcm_rear_center_channels(audio_param))
+		hdmitx_wr_reg(HDMITX_DWC_FC_AUDSV,
+			hdmitx_pcm_rear_center_invalid(audio_param));
 }
 
 #define GET_OUTCHN_NO(a)	(((a) >> 4) & 0xf)
@@ -2573,6 +2578,13 @@ static void set_aud_chnls(struct hdmitx_dev *hdev,
 static void set_aud_info_pkt(struct hdmitx_dev *hdev,
 	struct hdmitx_audpara *audio_param)
 {
+	unsigned int native_channels = hdmitx_pcm_rear_center_channels(audio_param);
+
+	/* Retain explicit 2/4/6-channel output selection by other API callers. */
+	if (GET_OUTCHN_NO(hdev->aud_output_ch) &&
+	    GET_OUTCHN_NO(hdev->aud_output_ch) != 8)
+		native_channels = 0;
+
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDICONF0, 0, 0, 4); /* CT */
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDICONF0, audio_param->channel_num,
 		4, 3); /* CC */
@@ -2613,15 +2625,16 @@ static void set_aud_info_pkt(struct hdmitx_dev *hdev,
 		default:
 			break;
 		}
-		/*
-		 * If the DAI resolved a precise CEA channel allocation from the
-		 * ALSA channel map (e.g. 4.0/5.0) it overrides the channel-count
-		 * value written above - that is the only way an AVR sees those
-		 * layouts. layout_valid is false unless the extra_pcm_layouts knob
-		 * explicitly vouched for it, so the default path is unchanged.
-		 */
-		if (audio_param->layout_valid)
+		/* Keep the existing precise 4.0/5.0 CA policy. Rear-centre
+		 * layouts additionally require the validated eight-slot receipt. */
+		if (audio_param->layout_valid &&
+		    ((audio_param->layout != 0x0e && audio_param->layout != 0x0f) ||
+		     native_channels))
 			hdmitx_wr_reg(HDMITX_DWC_FC_AUDICONF2, audio_param->layout);
+		if (native_channels)
+			hdmitx_set_reg_bits(HDMITX_DWC_FC_AUDICONF0,
+				native_channels - 1, 4, 3);
+
 		break;
 	case CT_DTS:
 	case CT_DTS_HD:

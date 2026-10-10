@@ -74,6 +74,8 @@ struct pcm_setting {
 struct aml_chmap {
 	struct mutex chmap_lock;
 	int chmap_layout;
+	struct snd_pcm_substream *substream;
+	struct snd_pcm_runtime *runtime;
 };
 
 void aml_tdm_enable(

@@ -33,6 +33,7 @@
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_compliance.h>
 #include "hw/common.h"
+#include "hdmi_tx_audio_layout.h"
 
 
 #undef PCM_USE_INFOFRAME
@@ -82,6 +83,11 @@ static void hdmi_tx_construct_aud_packet(
 					AUD_DB[3] = 0x13;
 			} else
 				AUD_DB[3] = 0;
+			if (hdmi_ch != CC_6CH &&
+			    hdmitx_pcm_rear_center_channels(audio_param)) {
+				AUD_DB[0] = hdmitx_pcm_rear_center_channels(audio_param) - 1;
+				AUD_DB[3] = audio_param->layout;
+			}
 			AUD_DB[4] = 0;
 		}
 		if (CHAN_STAT_BUF) {

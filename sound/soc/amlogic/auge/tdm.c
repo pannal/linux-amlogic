@@ -80,20 +80,18 @@ struct channel_speaker_allocation {
 #define TC	SNDRV_CHMAP_TC
 #define FCH	SNDRV_CHMAP_TFC
 
-/*
- * The first ORIG_PCM_LAYOUTS entries are the long-standing CoreELEC set
- * (2.0/3.1/5.1/7.1). The trailing entries are only advertised and matched when
- * the extra_pcm_layouts knob is enabled (see aml_n_pcm_layouts()), so with the
- * knob off the channel map exposed to userspace - and therefore every HDMI
- * channel-allocation byte - is byte-for-byte what it was before.
- */
-#define ORIG_PCM_LAYOUTS 4
+/* Keep the historical maps first; rear-centre 6.x is always available.
+ * Only the trailing 4.0/5.0 maps depend on extra_pcm_layouts. */
+#define BASE_PCM_LAYOUTS 6
 static struct channel_speaker_allocation channel_allocations[] = {
 /*      	       channel:   7     6    5    4    3     2    1    0            CEA CA */
 { .channels = 2,  .speakers = {  NL,   NL,  NL,  NL,  NL,   NL,  FR,  FL }, .ca = 0x00 }, /* 2.0 */
 { .channels = 4,  .speakers = {  NL,   NL,  NL,  NL,  FC,  LFE,  FR,  FL }, .ca = 0x03 }, /* 3.1 */
 { .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x0b }, /* 5.1 */
 { .channels = 8,  .speakers = { RRC,  RLC,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x13 }, /* 7.1 */
+/* Eight transport slots: FL FR NA/LFE FC RL RR RC NA. */
+{ .channels = 8,  .speakers = {  NA,   RC,  RR,  RL,  FC,   NA,  FR,  FL }, .ca = 0x0e }, /* 6.0 */
+{ .channels = 8,  .speakers = {  NA,   RC,  RR,  RL,  FC,  LFE,  FR,  FL }, .ca = 0x0f }, /* 6.1 */
 /* --- extra layouts: advertised/matched only when extra_pcm_layouts=1 ---
  * Carried INSIDE the 6-channel (5.1-shaped) container, not as native 4/5-ch
  * streams. HDMI transmits channels in fixed canonical slots (0:FL 1:FR 2:LFE
@@ -107,14 +105,8 @@ static struct channel_speaker_allocation channel_allocations[] = {
 { .channels = 6,  .speakers = {  NL,   NL,  RR,  RL,  FC,   NA,  FR,  FL }, .ca = 0x0a }, /* 5.0 */
 };
 
-/*
- * Off by default: exposes only the historical 2.0/3.1/5.1/7.1 layouts and
- * leaves the HDMI channel-allocation byte exactly as the channel-count path
- * computes it. Set to 1
- * (echo 1 > /sys/module/<snd_tdm module>/parameters/extra_pcm_layouts)
- * to additionally advertise 4.0/5.0 channel maps and emit their precise CEA
- * channel allocation, so AVRs report the real layout with no silent channels.
- */
+/* Off by default: enable only the additional padded 4.0/5.0 maps.
+ * Native rear-centre 6.0/6.1 does not require this knob. */
 static int extra_pcm_layouts;
 module_param(extra_pcm_layouts, int, 0644);
 MODULE_PARM_DESC(extra_pcm_layouts,
@@ -122,7 +114,7 @@ MODULE_PARM_DESC(extra_pcm_layouts,
 
 static inline int aml_n_pcm_layouts(void)
 {
-	return extra_pcm_layouts ? ARRAY_SIZE(channel_allocations) : ORIG_PCM_LAYOUTS;
+	return extra_pcm_layouts ? ARRAY_SIZE(channel_allocations) : BASE_PCM_LAYOUTS;
 }
 
 static void dump_pcm_setting(struct pcm_setting *setting)
@@ -944,6 +936,9 @@ static void tdm_sharebuffer_reset(struct aml_tdm *p_tdm, int channels)
 				offset);
 }
 
+static void aml_dai_tdm_chmap_reset(struct snd_pcm_substream *substream);
+static int aml_tdm_pcm_new(struct snd_soc_pcm_runtime *rtd);
+
 static int aml_tdm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -985,6 +980,7 @@ static int aml_tdm_open(struct snd_pcm_substream *substream)
 	}
 
 	runtime->private_data = p_tdm;
+	aml_dai_tdm_chmap_reset(substream);
 	return 0;
 
 err_ddr:
@@ -998,6 +994,7 @@ static int aml_tdm_close(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct aml_tdm *p_tdm = runtime->private_data;
 
+	aml_dai_tdm_chmap_reset(substream);
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		aml_audio_unregister_frddr(p_tdm->dev,
 				substream);
@@ -1012,12 +1009,14 @@ static int aml_tdm_close(struct snd_pcm_substream *substream)
 static int aml_tdm_hw_params(struct snd_pcm_substream *substream,
 			 struct snd_pcm_hw_params *hw_params)
 {
+	aml_dai_tdm_chmap_reset(substream);
 	return snd_pcm_lib_malloc_pages(substream,
 					params_buffer_bytes(hw_params));
 }
 
 static int aml_tdm_hw_free(struct snd_pcm_substream *substream)
 {
+	aml_dai_tdm_chmap_reset(substream);
 	return snd_pcm_lib_free_pages(substream);
 }
 
@@ -1114,6 +1113,7 @@ static struct snd_pcm_ops aml_tdm_ops = {
 
 struct snd_soc_platform_driver aml_tdm_platform = {
 	.ops = &aml_tdm_ops,
+	.pcm_new = aml_tdm_pcm_new,
 };
 
 static int aml_dai_tdm_chmap_ctl_tlv(struct snd_kcontrol *kcontrol, int op_flag,
@@ -1181,129 +1181,193 @@ static int aml_dai_tdm_chmap_ctl_tlv(struct snd_kcontrol *kcontrol, int op_flag,
     return 0;
 }
 
-static int aml_dai_tdm_chmap_ctl_get(struct snd_kcontrol *kcontrol,
-                                     struct snd_ctl_elem_value *ucontrol)
+static struct aml_chmap *aml_dai_tdm_chmap_state(struct snd_pcm_chmap *info,
+					      unsigned int idx)
 {
+	struct aml_chmap *states = info ? info->private_data : NULL;
 
-    struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
-    unsigned int idx = snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
-    struct snd_pcm_substream *substream = snd_pcm_chmap_substream(info, idx);
-	struct aml_chmap *prtd = info->private_data;
-//     struct snd_pcm_runtime *runtime = substream->runtime;
-//     struct aml_runtime_data *prtd = (struct aml_runtime_data *)runtime->private_data;
-    int res = 0, channel;
+	if (!states || idx >= info->kctl->count)
+		return NULL;
+	return &states[idx];
+}
 
-    if (mutex_lock_interruptible(&prtd->chmap_lock))
-        return -EINTR;
+static int aml_dai_tdm_chmap_ctl_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
+	unsigned int idx = snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
+	struct snd_pcm_substream *substream = snd_pcm_chmap_substream(info, idx);
+	struct aml_chmap *prtd = aml_dai_tdm_chmap_state(info, idx);
+	int li, channel;
 
-    {
-        /* clamp: chmap_layout is -1 until a map is matched (see _put) */
-        int li = prtd->chmap_layout;
-
-        if (li < 0 || li >= ARRAY_SIZE(channel_allocations))
-            li = 0;
-
-        for (channel = 0; channel < 8; channel++)
-            ucontrol->value.integer.value[7 - channel] =
-                channel_allocations[li].speakers[channel];
-    }
-
-unlock:
-    mutex_unlock(&prtd->chmap_lock);
-    return res;
+	memset(ucontrol->value.integer.value, 0,
+	       sizeof(ucontrol->value.integer.value));
+	if (!prtd || !substream)
+		return -ENODEV;
+	if (mutex_lock_interruptible(&prtd->chmap_lock))
+		return -EINTR;
+	li = prtd->chmap_layout;
+	if (prtd->substream == substream && substream->runtime &&
+	    prtd->runtime == substream->runtime &&
+	    li >= 0 && li < aml_n_pcm_layouts() &&
+	    channel_allocations[li].channels == substream->runtime->channels) {
+		for (channel = 0; channel < substream->runtime->channels; channel++)
+			ucontrol->value.integer.value[channel] =
+				channel_allocations[li].speakers[7 - channel];
+	}
+	mutex_unlock(&prtd->chmap_lock);
+	return 0;
 }
 
 static int aml_dai_tdm_chmap_ctl_put(struct snd_kcontrol *kcontrol,
-                                     struct snd_ctl_elem_value *ucontrol)
+				   struct snd_ctl_elem_value *ucontrol)
 {
+	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
+	unsigned int idx = snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
+	struct snd_pcm_substream *substream = snd_pcm_chmap_substream(info, idx);
+	struct aml_chmap *prtd = aml_dai_tdm_chmap_state(info, idx);
+	struct snd_pcm_runtime *runtime = substream ? substream->runtime : NULL;
+	int channel, layout, matched_layout = -1, ret;
 
-    struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
-    unsigned int idx = snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
-    struct snd_pcm_substream *substream = snd_pcm_chmap_substream(info, idx);
-	struct aml_chmap *prtd = info->private_data;
-    struct snd_pcm_runtime *runtime = substream->runtime;
-//     struct aml_runtime_data *prtd = (struct aml_runtime_data *)runtime->private_data;
-    int res = 0, channel, layout, matches, matched_layout;
-
-    if (mutex_lock_interruptible(&prtd->chmap_lock))
-        return -EINTR;
-
-    // now check if the channel setup matches one of our layouts
-    matches = 0;
-    for (layout = 0; layout < aml_n_pcm_layouts(); layout++)
-    {
-        /* a layout only applies to its own physical channel count */
-        if (channel_allocations[layout].channels != runtime->channels)
-            continue;
-
-        matches = 1;
-
-        for (channel = 0; channel < runtime->channels; channel++)
-        {
-            int sp = ucontrol->value.integer.value[channel];
-            int chan = channel_allocations[layout].speakers[7 - channel];
-
-            if (sp != chan)
-            {
-                matches = 0;
-                break;
-            }
-        }
-
-        if (matches)
-        {
-            matched_layout = layout;
-            break;
-        }
-    }
-
-
-    /*
-     * No match: leave it unresolved (-1) so the prepare hook does not vouch
-     * for a layout and the HDMI-TX keeps its channel-count-based CA. The get
-     * hook clamps -1 back to a valid index.
-     */
-    if (!matches)
-        matched_layout = -1;
-
-    pr_info("Setting a %d channel layout matching layout #%d\n", runtime->channels, matched_layout);
-
-    prtd->chmap_layout = matched_layout;
-
+	if (!prtd || !runtime)
+		return -ENODEV;
+	if (mutex_lock_interruptible(&prtd->chmap_lock))
+		return -EINTR;
+	/* Userspace sets the map after hw_params' automatic prepare. */
+	if (runtime->status->state != SNDRV_PCM_STATE_SETUP &&
+	    runtime->status->state != SNDRV_PCM_STATE_PREPARED) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	for (layout = 0; layout < aml_n_pcm_layouts(); layout++) {
+		if (channel_allocations[layout].channels != runtime->channels)
+			continue;
+		for (channel = 0; channel < runtime->channels; channel++) {
+			if (ucontrol->value.integer.value[channel] !=
+			    channel_allocations[layout].speakers[7 - channel])
+				break;
+		}
+		if (channel == runtime->channels) {
+			matched_layout = layout;
+			break;
+		}
+	}
+	ret = prtd->chmap_layout != matched_layout || prtd->substream != substream ||
+	      prtd->runtime != runtime;
+	prtd->chmap_layout = matched_layout;
+	prtd->substream = matched_layout >= 0 ? substream : NULL;
+	prtd->runtime = matched_layout >= 0 ? runtime : NULL;
+	if (matched_layout < 0)
+		ret = -EINVAL; /* Reject a mismatched map and retire its receipt. */
 unlock:
-    mutex_unlock(&prtd->chmap_lock);
-    return res;
+	mutex_unlock(&prtd->chmap_lock);
+	return ret;
 }
 
 static struct snd_kcontrol *aml_dai_tdm_chmap_kctrl_get(struct snd_pcm_substream *substream)
 {
-    int str;
+	if (!substream || !substream->pcm ||
+	    substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return NULL;
+	return substream->pcm->streams[substream->stream].chmap_kctl;
+}
 
-    if ((substream) && (substream->pcm))
-    {
-        for (str=0; str<2; str++)
-        {
-            if (substream->pcm->streams[str].chmap_kctl)
-            {
-                return substream->pcm->streams[str].chmap_kctl;
-            }
-        }
-    }
+static void aml_dai_tdm_chmap_reset(struct snd_pcm_substream *substream)
+{
+	struct snd_kcontrol *kctl = aml_dai_tdm_chmap_kctrl_get(substream);
+	struct snd_pcm_chmap *info = kctl ? snd_kcontrol_chip(kctl) : NULL;
+	struct aml_chmap *prtd;
 
-    return 0;
+	if (!info)
+		return;
+	prtd = aml_dai_tdm_chmap_state(info, substream->number);
+	if (!prtd)
+		return;
+	mutex_lock(&prtd->chmap_lock);
+	prtd->chmap_layout = -1;
+	prtd->substream = NULL;
+	prtd->runtime = NULL;
+	mutex_unlock(&prtd->chmap_lock);
+}
+
+static void aml_dai_tdm_chmap_layout(struct snd_pcm_substream *substream,
+				   struct aud_para *aud_param)
+{
+	struct snd_kcontrol *kctl = aml_dai_tdm_chmap_kctrl_get(substream);
+	struct snd_pcm_chmap *info = kctl ? snd_kcontrol_chip(kctl) : NULL;
+	struct aml_chmap *prtd;
+	int li;
+
+	aud_param->layout = 0;
+	aud_param->layout_valid = false;
+	if (!info)
+		return;
+	prtd = aml_dai_tdm_chmap_state(info, substream->number);
+	if (!prtd)
+		return;
+	mutex_lock(&prtd->chmap_lock);
+	li = prtd->chmap_layout;
+	if (prtd->substream == substream && substream->runtime &&
+	    prtd->runtime == substream->runtime &&
+	    li >= 0 && li < aml_n_pcm_layouts() &&
+	    channel_allocations[li].channels == substream->runtime->channels) {
+		aud_param->layout = channel_allocations[li].ca;
+		aud_param->layout_valid = true;
+	}
+	mutex_unlock(&prtd->chmap_lock);
+}
+
+static void aml_dai_tdm_chmap_private_free(struct snd_kcontrol *kcontrol)
+{
+	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
+
+	info->pcm->streams[info->stream].chmap_kctl = NULL;
+	kfree(info->private_data);
+	kfree(info);
+}
+
+static int aml_tdm_pcm_new(struct snd_soc_pcm_runtime *rtd)
+{
+	struct snd_pcm *pcm = rtd->pcm;
+	struct snd_pcm_chmap *chmap;
+	struct snd_kcontrol *kctl;
+	struct aml_chmap *states;
+	unsigned int count = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream_count;
+	int ret, i;
+
+	if (!count)
+		return 0;
+	states = kcalloc(count, sizeof(*states), GFP_KERNEL);
+	if (!states)
+		return -ENOMEM;
+	for (i = 0; i < count; i++) {
+		mutex_init(&states[i].chmap_lock);
+		states[i].chmap_layout = -1;
+	}
+	/* Register before the first stream open/query, not in prepare. */
+	ret = snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_PLAYBACK,
+				    NULL, 8, 0, &chmap);
+	if (ret < 0) {
+		kfree(states);
+		return ret;
+	}
+	chmap->private_data = states;
+	kctl = chmap->kctl;
+	for (i = 0; i < kctl->count; i++)
+		kctl->vd[i].access |= SNDRV_CTL_ELEM_ACCESS_WRITE;
+	kctl->get = aml_dai_tdm_chmap_ctl_get;
+	kctl->put = aml_dai_tdm_chmap_ctl_put;
+	kctl->tlv.c = aml_dai_tdm_chmap_ctl_tlv;
+	kctl->private_free = aml_dai_tdm_chmap_private_free;
+	return 0;
 }
 
 static int aml_dai_tdm_prepare(struct snd_pcm_substream *substream,
 			       struct snd_soc_dai *cpu_dai)
 {
-	int ret = 0, i;
+	int ret = 0;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct aml_tdm *p_tdm = snd_soc_dai_get_drvdata(cpu_dai);
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_pcm_chmap *chmap;
-	struct snd_kcontrol *kctl;
-	struct snd_pcm_chmap *info;
-	struct aml_chmap *prtd;
 	int bit_depth, separated = 0;
 	struct aud_para aud_param;
 
@@ -1346,40 +1410,8 @@ static int aml_dai_tdm_prepare(struct snd_pcm_substream *substream,
 				hdmitx_ext_set_i2s_mask(runtime->channels, 0x1);
 			}
 
-			/*
-			 * Resolve the precise CEA channel-allocation from the
-			 * ALSA channel map userspace set before snd_pcm_prepare().
-			 * Only when the knob is on; otherwise layout_valid stays 0
-			 * and the HDMI-TX keeps its channel-count-based CA, so
-			 * default builds are unchanged.
-			 */
-			if (extra_pcm_layouts) {
-				struct snd_kcontrol *ck =
-					aml_dai_tdm_chmap_kctrl_get(substream);
-
-				if (ck) {
-					struct snd_pcm_chmap *cinfo =
-						snd_kcontrol_chip(ck);
-					struct aml_chmap *cprtd =
-						cinfo ? cinfo->private_data : NULL;
-					int li = cprtd ? cprtd->chmap_layout : -1;
-
-					/*
-					 * Only vouch for a layout that actually
-					 * matches this stream's channel count, so a
-					 * stale map left by a previous, differently
-					 * sized stream can never force a wrong CA.
-					 */
-					if (li >= 0 &&
-					    li < ARRAY_SIZE(channel_allocations) &&
-					    channel_allocations[li].channels ==
-						runtime->channels) {
-						aud_param.layout =
-							channel_allocations[li].ca;
-						aud_param.layout_valid = true;
-					}
-				}
-			}
+			/* Snapshot only a current, exactly negotiated stream map. */
+			aml_dai_tdm_chmap_layout(substream, &aud_param);
 
 			aout_notifier_call_chain(AOUT_EVENT_IEC_60958_PCM,
 						 &aud_param);
@@ -1413,37 +1445,6 @@ static int aml_dai_tdm_prepare(struct snd_pcm_substream *substream,
 			bit_depth - 1,
 			tdmout_get_frddr_type(bit_depth));
 		aml_frddr_select_dst(fr, dst);
-		// Alsa Channel Mapping API handling
-		if (!aml_dai_tdm_chmap_kctrl_get(substream))
-		{
-			ret = snd_pcm_add_chmap_ctls(substream->pcm, SNDRV_PCM_STREAM_PLAYBACK, NULL, 8, 0, &chmap);
-
-			if (ret < 0)
-			{
-			pr_err("aml_dai_tdm_startup error %d\n", ret);
-			goto out;
-			}
-
-			kctl = chmap->kctl;
-			for (i = 0; i < kctl->count; i++)
-			kctl->vd[i].access |= SNDRV_CTL_ELEM_ACCESS_WRITE;
-
-			kctl->get = aml_dai_tdm_chmap_ctl_get;
-			kctl->put = aml_dai_tdm_chmap_ctl_put;
-			kctl->tlv.c = aml_dai_tdm_chmap_ctl_tlv;
-
-			info = snd_kcontrol_chip(kctl);
-			prtd = info->private_data;
-			if (prtd == NULL) {
-				prtd = (struct aml_chmap*)kzalloc(sizeof(struct aml_chmap), GFP_KERNEL);
-				info->private_data = prtd;
-				/* unresolved until userspace sets a channel map */
-				if (prtd)
-					prtd->chmap_layout = -1;
-			}
-			mutex_init(&prtd->chmap_lock);
-		}
-	out:
 		return ret;
 
 	} else {
