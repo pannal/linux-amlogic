@@ -956,6 +956,8 @@ static s32 vsync_pts_align;
 /* frame rate calculate */
 static u32 last_frame_count;
 static u32 frame_count;
+/* Passive FPS snapshot uses this owned duration scalar, not a live vframe. */
+static u32 fps_sample_duration;
 static u32 new_frame_count;
 static u32 first_frame_toggled;
 static u32 toggle_count;
@@ -2346,6 +2348,7 @@ static struct vframe_s *vsync_toggle_frame(struct vframe_s *vf, int line)
 	}
 
 	cur_dispbuf = vf;
+	WRITE_ONCE(fps_sample_duration, vf->duration);
 
 	if (cur_dispbuf && omx_secret_mode)
 		cur_disp_omx_index = cur_dispbuf->omx_index;
@@ -7180,6 +7183,9 @@ static void video_vf_unreg_provider(void)
 				sizeof(struct video_frame_detect_s));
 	frame_detect_drop_count = 0;
 	frame_detect_receive_count = 0;
+	WRITE_ONCE(fps_sample_duration, 0);
+	/* Publish the cleared FPS scalar before the new provider lifetime. */
+	smp_wmb();
 	atomic64_inc(&presentation_epoch);
 	presentation_route_invalidate();
 
@@ -7367,6 +7373,9 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 	while (atomic_read(&video_inirq_flag) > 0)
 		schedule();
 
+	WRITE_ONCE(fps_sample_duration, 0);
+	/* Publish the cleared FPS scalar before the new provider lifetime. */
+	smp_wmb();
 	atomic64_inc(&presentation_epoch);
 	presentation_route_invalidate();
 
@@ -11209,11 +11218,19 @@ static ssize_t vframe_ready_cnt_show(struct class *cla,
 static ssize_t fps_info_show(struct class *cla, struct class_attribute *attr,
 			     char *buf)
 {
-	u32 cnt = frame_count - last_frame_count;
-	u32 time = jiffies;
+	u64 epoch = atomic64_read(&presentation_epoch);
+	bool retiring = atomic_read(&video_unreg_flag);
+	u32 frames, duration, cnt, time, tmp;
 	u32 input_fps = 0;
-	u32 tmp = time;
 
+	/* Pair with retirement publication; ongoing IRQ count/tick boundaries
+	 * remain a rate estimate rather than an atomic frame snapshot. */
+	smp_rmb();
+	frames = READ_ONCE(frame_count);
+	duration = READ_ONCE(fps_sample_duration);
+	cnt = frames - last_frame_count;
+	time = jiffies;
+	tmp = time;
 	time -= last_frame_time;
 	last_frame_time = tmp;
 	last_frame_count = frame_count;
@@ -11225,8 +11242,18 @@ static ssize_t fps_info_show(struct class *cla, struct class_attribute *attr,
 			output_fps = input_fps;
 	} else
 		input_fps = output_fps;
-	return sprintf(buf, "input_fps:0x%x output_fps:0x%x drop_fps:0x%x\n",
-		       input_fps, output_fps, input_fps - output_fps);
+	/* Preserve the legacy integer prefix/read-reset behaviour. The versioned
+	 * suffix is a passive consumption observation, unaffected by frame_rate
+	 * readers. It is not an applied/unique-display or cumulative drop count. */
+	smp_rmb();
+	if (retiring || atomic_read(&video_unreg_flag) ||
+	    epoch != atomic64_read(&presentation_epoch))
+		epoch = 0;
+	return scnprintf(buf, PAGE_SIZE,
+		"input_fps:0x%x output_fps:0x%x drop_fps:0x%x "
+		"sample:0x1 frames:0x%x ticks:0x%x hz:0x%x duration:0x%x epoch:0x%llx\n",
+		input_fps, output_fps, input_fps - output_fps,
+		frames, tmp, HZ, duration, epoch);
 }
 
 static ssize_t video_layer1_state_show(struct class *cla,
