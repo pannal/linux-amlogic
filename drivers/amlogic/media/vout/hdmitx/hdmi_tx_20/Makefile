@@ -8,7 +8,7 @@ endif
 
 hdmitx20-objs += hdmi_tx_video.o hdmi_tx_audio.o hdmi_tx_edid.o \
 		 hdmi_tx_audio.o hdmi_tx_hdcp.o hdmi_tx_scdc.o dv_emp_vsem.o hdmi_tx_compliance.o \
-		 hdmi_tx_calibration.o
+		 hdmi_tx_calibration.o hdmi_tx_hdr10_limits.o
 
 obj-$(CONFIG_AMLOGIC_HDMITX) += hw/
 

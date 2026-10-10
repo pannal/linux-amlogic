@@ -17,6 +17,7 @@
 
 #include <linux/version.h>
 #include <linux/module.h>
+#include "../hdmi_tx_hdr10_limits.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
@@ -2392,7 +2393,9 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 		hdmitx_wr_reg(HDMITX_DWC_FC_DATAUTO2, 0x10);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 4, 1);
 		break;
-	case HDMI_PACKET_DRM:
+	case HDMI_PACKET_DRM: {
+		unsigned char hdr10_db[26];
+
 		pkt_data_len = 26;
 		if ((!DB) || (!HB)) {
 			hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 0, 6, 1);
@@ -2400,14 +2403,16 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 				HDMITX_DWC_FC_PACKET_TX_EN, 0, 7, 1);
 			return;
 		}
+		hdmitx_hdr10_limit_packet(hdr10_db, DB, HB);
 		/* Ignore HB[0] */
 		hdmitx_wr_reg(HDMITX_DWC_FC_DRM_HB01, HB[1]);
 		hdmitx_wr_reg(HDMITX_DWC_FC_DRM_HB02, HB[2]);
 		for (i = 0; i < pkt_data_len; i++)
-			hdmitx_wr_reg(HDMITX_DWC_FC_DRM_PB00 + i, DB[i]);
+			hdmitx_wr_reg(HDMITX_DWC_FC_DRM_PB00 + i, hdr10_db[i]);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 1, 6, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 7, 1);
 		break;
+	}
 	case HDMI_AUDIO_INFO:
 		pkt_data_len = 9;
 		break;
