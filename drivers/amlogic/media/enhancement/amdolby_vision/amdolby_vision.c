@@ -4818,14 +4818,11 @@ static int prepare_vsif_pkt
 	
 	vsif->vers.ver2.low_latency = setting->dovi_ll_enable;
 
-	if (src_format == FORMAT_DOVI || src_format == FORMAT_DOVI_LL)
-		vsif->vers.ver2.dobly_vision_signal = 1; /*0b0001*/
-	else if (src_format == FORMAT_HDR10)
-		vsif->vers.ver2.dobly_vision_signal = 3; /*0b0011*/
-	else if (src_format == FORMAT_HLG)
-		vsif->vers.ver2.dobly_vision_signal = 7; /*0b0111*/
-	else if (src_format == FORMAT_SDR || src_format == FORMAT_SDR_2020)
-		vsif->vers.ver2.dobly_vision_signal = 5; /*0b0101*/
+	/* Always signal Dolby Vision (0b0001), like 5.15 (NEW_DOLBY_SIGNAL_TYPE 0):
+	 * some sinks (Hisense) reject the source-type bits (SDR GUI = 0b0101) and
+	 * show a black screen. ver2_l11 shares this byte through the union.
+	 */
+	vsif->vers.ver2.dobly_vision_signal = 1;
 
 	if ((debug_dolby & 2))
 		pr_dolby_dbg("src %d, dobly_vision_signal %d\n",
