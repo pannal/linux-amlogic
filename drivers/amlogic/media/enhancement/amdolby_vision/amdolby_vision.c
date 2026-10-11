@@ -1898,13 +1898,23 @@ static int dolby_core2_set
   (u32 *p_core2_dm_regs,
    u32 *p_core2_lut,
    int hsize,
-   int vsize)
+   int vsize,
+   u32 current_update_flag)
 {
   int i;
   bool set_lut = false;
   bool reset = false;
   u32 *last_dm = (u32 *)&dovi_setting.dm_reg2;
   u32 bypass_flag = 0;
+  u32 update_flags = stb_core_setting_update_flag;
+
+  /* The caller accepts a current CHANGE only when current CONST is absent.
+   * Do not let previous-frame CONST suppress that curve's transfer and leave
+   * the published cache ahead of programming. Keep historical CHANGE retries.
+   */
+  if ((current_update_flag & CP_FLAG_CHANGE_TC2) &&
+      !(current_update_flag & CP_FLAG_CONST_TC2))
+    update_flags &= ~CP_FLAG_CONST_TC2;
 
   if (dolby_vision_on && (dolby_vision_flags & FLAG_DISABE_CORE_SETTING)) return 0;
 
@@ -1994,9 +2004,9 @@ static int dolby_core2_set
       memcmp(p_core2_lut, &dovi_setting.dm_lut2, sizeof(dovi_setting.dm_lut2)))
     set_lut = true;
   /* CONST has priority: this frame's LUT is invalid when both bits are set. */
-  if (stb_core_setting_update_flag & CP_FLAG_CONST_TC2)
+  if (update_flags & CP_FLAG_CONST_TC2)
     set_lut = false;
-  else if (stb_core_setting_update_flag & CP_FLAG_CHANGE_TC2)
+  else if (update_flags & CP_FLAG_CHANGE_TC2)
     set_lut = true;
   if (dv_pending_new && set_lut && !reset &&
       !memcmp(p_core2_lut, &dovi_setting.dm_lut2, sizeof(dovi_setting.dm_lut2)))
@@ -2005,7 +2015,7 @@ static int dolby_core2_set
   if (debug_dolby & 2)
     pr_dolby_dbg("core2a g_potch %x %x, reset %d, set_lut %d, flag %x\n",
                  g_hpotch, g_vpotch, reset, set_lut,
-                 stb_core_setting_update_flag);
+                 update_flags);
 
   /* core2 metadata program done */
 
@@ -2541,7 +2551,8 @@ static void apply_stb_core_settings
         (u32 *)&new_dovi_setting.dm_reg2,
         (u32 *)&new_dovi_setting.dm_lut2,
         graphics_w,
-        graphics_h);
+        graphics_h,
+        update_bk);
   }
 
   if (mask & 4) { // Core 3

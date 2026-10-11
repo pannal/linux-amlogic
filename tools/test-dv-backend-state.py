@@ -116,7 +116,7 @@ static bool is_meson_txlx_stbmode(void){return txlx;}
 static void adjust_vpotch(void){}
 static int get_mute_type(void){return 0;}
 static int get_video_mute(void){return 0;}
-static void dolby_core2_set(u32*a,u32*b,u32 w,u32 h){(void)a;(void)b;(void)w;(void)h;}
+static void dolby_core2_set(u32*a,u32*b,u32 w,u32 h,u32 flags){(void)a;(void)b;(void)w;(void)h;(void)flags;}
 static void dolby_core3_set(u32 size,u32*a,u32*b,u32 w,u32 h,bool tunnel,u8 pps){(void)size;(void)a;(void)b;(void)w;(void)h;(void)tunnel;(void)pps;}
 '''
     for name, guard in zip(['stb_dolby_core1_set', 'dolby_core1_set'], skip_guards):
