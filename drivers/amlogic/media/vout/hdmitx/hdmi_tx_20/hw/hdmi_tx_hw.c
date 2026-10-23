@@ -1910,6 +1910,9 @@ static void hdmitx_set_phy(struct hdmitx_dev *hdev)
 
 	if (!hdev)
 		return;
+	/* Non-DRM callers hold setclk_mutex through the entire enable. */
+	if (hdev->phy_inhibit)
+		return;
 
 	if (hdev->chip_type >= MESON_CPU_ID_SC2)
 		phy_addr = P_ANACTRL_HDMIPHY_CTRL0;
@@ -2072,6 +2075,17 @@ static void hdmitx_set_scdc(struct hdmitx_dev *hdev)
 	set_tmds_clk_div40(hdev->para->tmds_clk_div40);
 	scdc_config(hdev);
 	hdev->div40 = hdev->para->tmds_clk_div40;
+}
+
+/* Caller holds setclk_mutex and has checked HPD, ready, and cur_VIC. */
+void hdmitx_restore_phy(struct hdmitx_dev *hdev)
+{
+	/* div40 records the programmed transport, including effective DV modes.
+	 * Do not infer a new transport from userspace's next mode/attr request.
+	 */
+	set_tmds_clk_div40(hdev->div40);
+	scdc_wr_sink(TMDS_CFG, hdev->div40 ? 0x3 : 0);
+	hdmitx_set_phy(hdev);
 }
 
 void hdmitx_set_enc_hw(struct hdmitx_dev *hdev)
@@ -4301,6 +4315,10 @@ static int hdmitx_tmds_rxsense(void)
 	static int filter_value;
 	static int count;
 	struct hdmitx_dev *hdev = get_hdmitx_device();
+
+	/* All chip variants write PHY registers, even the G12 sensing path. */
+	if (hdev->phy_inhibit)
+		return 0;
 
 	switch (hdev->chip_type) {
 	case MESON_CPU_ID_G12A:
