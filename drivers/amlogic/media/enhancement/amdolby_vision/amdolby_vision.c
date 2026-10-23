@@ -79,7 +79,7 @@ static struct module *dv_new_owner;
 static bool dv_new_blob_enable = true;
 static int dv_new_signal_range = -1;
 static bool xbmc_dv_l11_vsif = true;
-static u32 dv_new_blob_max_hz = 50;
+static u32 dv_new_blob_max_hz = 60;
 static bool xbmc_dv_source_native;
 static uint dv_new_backend_available;
 static uint amdv_multi_dv_mode;
@@ -112,7 +112,7 @@ module_param(dv_new_backend_available, uint, 0444);
 module_param(amdv_multi_dv_mode, uint, 0444);
 MODULE_PARM_DESC(amdv_multi_dv_mode, "Applied backend: 0 legacy, 1 newer native DV");
 MODULE_PARM_DESC(dv_new_blob_enable, "Permit the newer backend for eligible native DV routes");
-MODULE_PARM_DESC(dv_new_blob_max_hz, "Maximum native DV output refresh; default 50 Hz");
+MODULE_PARM_DESC(dv_new_blob_max_hz, "Maximum newer-backend output refresh; default and max 60 Hz");
 MODULE_PARM_DESC(xbmc_dv_source_native, "Kodi source provenance: false for generated/converted RPU");
 
 

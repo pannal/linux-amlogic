@@ -37,7 +37,7 @@ static bool dv_new_route(enum signal_format_enum src,
 		vinfo && vinfo->width && vinfo->height &&
 		vinfo->width <= 16384 && vinfo->height <= 16384 &&
 		vinfo->sync_duration_num && vinfo->sync_duration_den &&
-		READ_ONCE(dv_new_blob_max_hz) && READ_ONCE(dv_new_blob_max_hz) <= 50 &&
+		READ_ONCE(dv_new_blob_max_hz) && READ_ONCE(dv_new_blob_max_hz) <= 60 &&
 		(u64)vinfo->sync_duration_num <=
 		(u64)READ_ONCE(dv_new_blob_max_hz) * vinfo->sync_duration_den;
 }
