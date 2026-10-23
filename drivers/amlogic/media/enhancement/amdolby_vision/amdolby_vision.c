@@ -1977,8 +1977,15 @@ static int dolby_core2_set
                                            ? ((g_vtiming >> 8) & 0xff) 
                                            : g_vwidth));
 
+  /* A native 2160p OSD (core2 graphics 3840 wide) jumps for a frame every
+   * ~15 s at 2160p60 with the 0x20 vpotch adjust_vpotch() picks above
+   * 1080p; 0x10, what the 5.15 driver programs, is clean from 2160p23.98
+   * to 2160p60, GUI and DV/HDR10 playback. A 1080 OSD keeps g_vpotch.
+   */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL4, (g_hpotch << 16) | ((g_vtiming & 0xff) 
                                            ? (g_vtiming & 0xff)
+                                           : (is_meson_g12() && hsize >= 3840)
+                                           ? 0x10
                                            : g_vpotch));
 
   if (is_meson_txlx_stbmode())
