@@ -227,7 +227,7 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 	    (in_format != FORMAT_DOVI && in_format != FORMAT_DOVI_LL))
 		return -EINVAL;
 	if (in_format != FORMAT_INVALID &&
-	    (out_format != FORMAT_DOVI || in_comp_size < 0 || in_comp_size > DV5_COMP_CAPACITY ||
+	    ((out_format != FORMAT_DOVI && out_format != FORMAT_SDR) || in_comp_size < 0 || in_comp_size > DV5_COMP_CAPACITY ||
 	     in_md_size < 0 || in_md_size > DV5_MD_CAPACITY || (in_comp_size && !in_comp) ||
 	     (in_md_size && !in_md) || output->vsvdb_len > sizeof(output->vsvdb_tbl) ||
 	     set_chroma_format < DV5_CP_P420 || set_chroma_format > DV5_CP_I444 ||

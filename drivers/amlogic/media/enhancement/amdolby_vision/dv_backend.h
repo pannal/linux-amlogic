@@ -22,6 +22,17 @@ static void dv_legacy_release(void)
 	spin_unlock_irqrestore(&dovi_lock, flags);
 }
 
+/* Output format the STB core targets for the current dolby_vision_mode. */
+static enum signal_format_enum dv_mode_dst_format(void)
+{
+	if (dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
+	    dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT)
+		return FORMAT_DOVI;
+	if (dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_HDR10)
+		return FORMAT_HDR10;
+	return FORMAT_SDR;
+}
+
 /* Both numerator and denominator must be known; never truncate 50.x to 50. */
 static bool dv_new_route(enum signal_format_enum src,
 			 enum signal_format_enum dst, const struct vinfo_s *vinfo)
@@ -33,7 +44,9 @@ static bool dv_new_route(enum signal_format_enum src,
 		READ_ONCE(dv_new_backend_available) &&
 		READ_ONCE(xbmc_dv_source_native) && is_meson_g12b_cpu() &&
 		(src == FORMAT_DOVI || src == FORMAT_DOVI_LL) &&
-		dst == FORMAT_DOVI && READ_ONCE(xbmc_dv_vp) == 0 &&
+		(dst == FORMAT_DOVI ||
+		 (dst == FORMAT_SDR && READ_ONCE(xbmc_dv_new_sdr_route))) &&
+		READ_ONCE(xbmc_dv_vp) == 0 &&
 		vinfo && vinfo->width && vinfo->height &&
 		vinfo->width <= 16384 && vinfo->height <= 16384 &&
 		vinfo->sync_duration_num && vinfo->sync_duration_den &&
