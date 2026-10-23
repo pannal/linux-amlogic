@@ -71,8 +71,9 @@ static char mp_comp[DV5_COMP_CAPACITY];
 
 struct dv5_last_cp {
 	enum signal_format_enum in, out;
-	u32 use_ll, ll_rgb, width, height;
+	u32 use_ll, ll_rgb, width, height, vsvdb_len;
 	int priority;
+	unsigned char vsvdb[sizeof(((struct dovi_setting_s *)0)->vsvdb_tbl)];
 };
 static struct dv5_last_cp last_cp;
 
@@ -163,6 +164,7 @@ static void cp_forget(void)
 	last_cp.out = FORMAT_INVALID;
 	last_cp.use_ll = ~0U;
 	last_cp.ll_rgb = ~0U;
+	last_cp.vsvdb_len = ~0U;
 	last_cp.priority = -1;
 	last_cp.width = 0;
 	last_cp.height = 0;
@@ -312,6 +314,8 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 
 	need_reset = in_format != last_cp.in || out_format != last_cp.out ||
 		     m->use_ll_flag != last_cp.use_ll || m->ll_rgb_desired != last_cp.ll_rgb ||
+		     m->vsvdb_len != last_cp.vsvdb_len ||
+		     memcmp(m->vsvdb_tbl, last_cp.vsvdb, m->vsvdb_len) ||
 		     (int)set_priority != last_cp.priority || vid->video_width != last_cp.width ||
 		     vid->video_height != last_cp.height;
 	if (need_reset)
@@ -320,6 +324,8 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 	last_cp.out = out_format;
 	last_cp.use_ll = m->use_ll_flag;
 	last_cp.ll_rgb = m->ll_rgb_desired;
+	last_cp.vsvdb_len = m->vsvdb_len;
+	memcpy(last_cp.vsvdb, m->vsvdb_tbl, m->vsvdb_len);
 	last_cp.priority = set_priority;
 	last_cp.width = vid->video_width;
 	last_cp.height = vid->video_height;
