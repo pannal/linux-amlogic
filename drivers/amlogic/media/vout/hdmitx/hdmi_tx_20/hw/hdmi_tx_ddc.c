@@ -33,6 +33,7 @@
 #include <linux/uaccess.h>
 #include <linux/delay.h>
 #include <linux/clk.h>
+#include <linux/iopoll.h>
 
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_ddc.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_info_global.h>
@@ -41,24 +42,44 @@
 #include "hdmi_tx_reg.h"
 
 static DEFINE_MUTEX(ddc_mutex);
+
+/* Caller holds ddc_mutex from programming the operation through completion. */
+static uint32_t ddc_wait_complete(uint8_t slave, uint8_t offset_addr)
+{
+	unsigned int status;
+	int ret;
+
+	/* Keep the existing settling delay, then allow a slow transfer to finish. */
+	mdelay(2);
+	ret = readx_poll_timeout(hdmitx_rd_reg, HDMITX_DWC_IH_I2CM_STAT0,
+		status, status & 0x3, 1000, 18000);
+	if (ret) {
+		/* Abort before releasing the bus to the next DDC operation. */
+		hdmitx_wr_reg(HDMITX_DWC_I2CM_SOFTRSTZ, 0);
+		pr_info("E: ddc timeout 0x%02x 0x%02x status 0x%02x\n",
+			slave, offset_addr, status);
+	} else if (status & (1 << 0)) {
+		pr_info("E: ddc transfer 0x%02x 0x%02x status 0x%02x\n",
+			slave, offset_addr, status);
+	}
+	/* DONE (bit 1) is required; ERROR (bit 0) takes precedence. */
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
+	return !ret && !(status & (1 << 0));
+}
+
 static uint32_t ddc_write_1byte(uint8_t slave, uint8_t offset_addr,
 	uint8_t data)
 {
 	uint32_t st = 0;
 
 	mutex_lock(&ddc_mutex);
+	/* Discard completion/error left by the previous transfer. */
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, slave);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_DATAO, data);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 4);
-	mdelay(2);
-	if (hdmitx_rd_reg(HDMITX_DWC_IH_I2CM_STAT0) & (1 << 0)) {
-		st = 0;
-		pr_info("E: ddc w1b 0x%02x 0x%02x 0x%02x\n",
-			slave, offset_addr, data);
-	} else
-		st = 1;
-	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
+	st = ddc_wait_complete(slave, offset_addr);
 
 	mutex_unlock(&ddc_mutex);
 	return st;
@@ -100,19 +121,15 @@ static uint32_t ddc_read_8byte(uint8_t slave, uint8_t offset_addr,
 	int32_t i;
 
 	mutex_lock(&ddc_mutex);
+	/* Discard completion/error left by the previous transfer. */
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, slave);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 2);
-	mdelay(2);
-	if (hdmitx_rd_reg(HDMITX_DWC_IH_I2CM_STAT0) & (1 << 0)) {
-		st = 0;
-		pr_info("E: ddc rd8b 0x%02x 0x%02x 0x%02x\n",
-			slave, offset_addr, *data);
-	} else
-		st = 1;
-	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
-	for (i = 0; i < 8; i++)
-		data[i] = hdmitx_rd_reg(HDMITX_DWC_I2CM_READ_BUFF0 + i);
+	st = ddc_wait_complete(slave, offset_addr);
+	if (st)
+		for (i = 0; i < 8; i++)
+			data[i] = hdmitx_rd_reg(HDMITX_DWC_I2CM_READ_BUFF0 + i);
 
 	mutex_unlock(&ddc_mutex);
 	return st;
@@ -151,18 +168,14 @@ static uint32_t ddc_read_1byte(uint8_t slave, uint8_t offset_addr,
 	uint32_t st = 0;
 
 	mutex_lock(&ddc_mutex);
+	/* Discard completion/error left by the previous transfer. */
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, slave);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 0);
-	mdelay(2);
-	if (hdmitx_rd_reg(HDMITX_DWC_IH_I2CM_STAT0) & (1 << 0)) {
-		st = 0;
-		pr_info("E: ddc rd8b 0x%02x 0x%02x\n",
-			slave, offset_addr);
-	} else
-		st = 1;
-	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
-	*data = hdmitx_rd_reg(HDMITX_DWC_I2CM_DATAI);
+	st = ddc_wait_complete(slave, offset_addr);
+	if (st)
+		*data = hdmitx_rd_reg(HDMITX_DWC_I2CM_DATAI);
 
 	mutex_unlock(&ddc_mutex);
 	return st;
