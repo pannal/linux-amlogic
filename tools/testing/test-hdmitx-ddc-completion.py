@@ -2,7 +2,8 @@
 """Exercise production DDC helpers with a virtual clock and register model.
 
 This checks transfer completion, not electrical I2C behavior or HDMI receiver
-lock. No kernel build or device access is performed.
+lock. The reactive wake path checks return/clock-restore ordering, not SCL
+frequency or electrical recovery. No kernel build or device access is performed.
 """
 from pathlib import Path
 import argparse
@@ -32,6 +33,16 @@ if 'static uint32_t ddc_wait_complete(' in source:
 for name in ('ddc_write_1byte', 'ddc_read_1byte', 'ddc_read_8byte'):
     production += function('static uint32_t ' + name + '(')
 
+production += function('void edid_read_head_8bytes(')
+hardware = (args.source_root / 'drivers/amlogic/media/vout/hdmitx/hdmi_tx_20/hw/hdmi_tx_hw.c').read_text()
+start = hardware.index('\tcase MISC_I2C_REACTIVE:')
+reactive_case = hardware[start:hardware.index('\t\tbreak;', start) + len('\t\tbreak;')]
+production += '''
+static void run_reactive_case(void) {
+    struct hdmitx_dev device = {0}, *hdev = &device;
+    switch (MISC_I2C_REACTIVE) {
+''' + reactive_case + '\n    }\n}\n'
+
 preamble = r'''
 #include <assert.h>
 #include <errno.h>
@@ -43,7 +54,13 @@ typedef int64_t ktime_t;
 enum { HDMITX_DWC_I2CM_SLAVE, HDMITX_DWC_I2CM_ADDRESS,
        HDMITX_DWC_I2CM_DATAO, HDMITX_DWC_I2CM_OPERATION,
        HDMITX_DWC_IH_I2CM_STAT0, HDMITX_DWC_I2CM_DATAI,
-       HDMITX_DWC_I2CM_SOFTRSTZ, HDMITX_DWC_I2CM_READ_BUFF0 = 16 };
+       HDMITX_DWC_I2CM_SOFTRSTZ, HDMITX_DWC_I2CM_READ_BUFF0 = 16,
+       HDMITX_DWC_I2CM_SS_SCL_HCNT_1 = 32, HDMITX_DWC_I2CM_SS_SCL_HCNT_0,
+       HDMITX_DWC_A_HDCPCFG1, HDMITX_DWC_HDCP22REG_CTRL };
+enum { DDC_MUX_DDC, MISC_I2C_REACTIVE, EDID_SLAVE = 0x50 };
+struct hdmitx_dev { int unused; };
+static int64_t normal_clock_restored;
+static unsigned scl_high;
 static int ddc_mutex, locked, active, resets, reads, reports, failures, checks;
 static unsigned status, completion_status, operation;
 static int64_t now, launched, complete_after;
@@ -66,6 +83,9 @@ static void pr_info(const char *format, ...) {
     reports++;
 }
 static void hdmitx_wr_reg(unsigned reg, unsigned val) {
+    /* Clock setup is in the existing caller, outside the transfer mutex. */
+    if (reg == HDMITX_DWC_I2CM_SS_SCL_HCNT_1) { scl_high = (scl_high & 255) | (val << 8); return; }
+    if (reg == HDMITX_DWC_I2CM_SS_SCL_HCNT_0) { scl_high = (scl_high & 0xff00) | val; return; }
     assert(locked);
     if (reg == HDMITX_DWC_IH_I2CM_STAT0) status &= ~val; /* W1C */
     else if (reg == HDMITX_DWC_I2CM_OPERATION) {
@@ -89,6 +109,19 @@ static unsigned hdmitx_rd_reg(unsigned reg) {
     assert(reg >= HDMITX_DWC_I2CM_READ_BUFF0 && reg < HDMITX_DWC_I2CM_READ_BUFF0 + 8);
     return 0x60 + reg - HDMITX_DWC_I2CM_READ_BUFF0;
 }
+static void hdmitx_ddc_hw_op(int cmd) { CHECK(cmd == DDC_MUX_DDC); }
+static void hdmitx_hdcp_opr(int cmd) { CHECK(cmd == 4); }
+static void hdmitx_set_reg_bits(unsigned reg, int val, int start, int width) {
+    CHECK((reg == HDMITX_DWC_A_HDCPCFG1 && start == 0) ||
+          (reg == HDMITX_DWC_HDCP22REG_CTRL && start == 2));
+    CHECK(val == 0 && width == 1);
+}
+static void hdmi_hwi_init(struct hdmitx_dev *dev) {
+    (void)dev;
+    CHECK(!locked && scl_high == 0xfff6);
+    normal_clock_restored = now;
+    scl_high = 0xcf;
+}
 '''
 cases = r'''
 static void setup(unsigned stale, unsigned completion, int64_t delay) {
@@ -96,6 +129,7 @@ static void setup(unsigned stale, unsigned completion, int64_t delay) {
     active = resets = reads = reports = 0;
     status = stale; completion_status = completion; complete_after = delay;
     now = launched = 0;
+    normal_clock_restored = -1; scl_high = 0xcf;
 }
 static unsigned transfer(int kind, uint8_t *buf) {
     if (kind == 0) return ddc_write_1byte(0x54, 0x20, 3);
@@ -151,6 +185,22 @@ int main(void) {
             check_data(kind, buf, 0);
         }
     }
+    /* Reactive reads must return after the legacy 2 ms, even without DONE.
+     * The production caller then restores normal SCL timing and waits 5 ms.
+     * Delays are adversarial inputs, not measured controller timings. */
+    for (delay = 0; delay < 4; delay++) {
+        const int reactive_delays[] = {1000, 7000, 140000, -1};
+        setup(3, 2, reactive_delays[delay]);
+        run_reactive_case();
+        CHECK(normal_clock_restored == 2000 && now == 7000);
+        CHECK(scl_high == 0xcf && resets == 0 && reports == 0);
+        CHECK(reads == 0 && operation == 4 && !locked && !status);
+        CHECK(active == (reactive_delays[delay] != 1000));
+    }
+    setup(0, 1, 1000);
+    run_reactive_case();
+    CHECK(normal_clock_restored == 2000 && now == 7000);
+    CHECK(reports == 1 && resets == 0 && reads == 0 && !locked);
     printf("DDC completion: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
@@ -162,4 +212,4 @@ with tempfile.TemporaryDirectory(prefix='hdmitx-ddc-') as tmp:
     subprocess.run([os.environ.get('CC', 'gcc'), '-std=gnu11', '-Wall', '-Wextra',
                     '-Werror', '-Wno-unused-function', '-fsanitize=undefined',
                     '-fno-sanitize-recover=all', str(c), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+    subprocess.run([str(exe)], check=True, timeout=15)

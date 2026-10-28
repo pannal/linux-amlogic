@@ -230,13 +230,25 @@ uint32_t hdcp_rd_hdcp22_ver(void)
 	return 0;
 }
 
-/* only for I2C reactive using */
+/*
+ * Start the I2C reactivation sequence, not a checked EDID read. The caller
+ * deliberately slows SCL before this call and restores its normal timing
+ * after we return. Waiting for completion here can hold the slow timing
+ * until a timeout and abort the very transaction used to reactivate the bus.
+ */
 void edid_read_head_8bytes(void)
 {
-	uint8_t head[8] = {0};
-
 	hdmitx_ddc_hw_op(DDC_MUX_DDC);
-	ddc_read_8byte(EDID_SLAVE, 0x00, head);
+	mutex_lock(&ddc_mutex);
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
+	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, EDID_SLAVE);
+	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, 0);
+	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 2);
+	mdelay(2);
+	if (hdmitx_rd_reg(HDMITX_DWC_IH_I2CM_STAT0) & (1 << 0))
+		pr_info("E: ddc I2C reactive read\n");
+	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
+	mutex_unlock(&ddc_mutex);
 }
 
 #define EDID_WAIT_TIMEOUT	10
