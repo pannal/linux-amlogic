@@ -2,8 +2,8 @@
 """Exercise production DDC helpers with a virtual clock and register model.
 
 This checks transfer completion, not electrical I2C behavior or HDMI receiver
-lock. The reactive wake path checks return/clock-restore ordering, not SCL
-frequency or electrical recovery. No kernel build or device access is performed.
+lock. The reactive wake path checks clock-restore ordering and lock ownership until
+completion/abort, not SCL frequency, electrical recovery or hardware lock semantics. No kernel build or device access is performed.
 """
 from pathlib import Path
 import argparse
@@ -14,6 +14,7 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source-root', type=Path, default=Path(__file__).resolve().parents[2])
 parser.add_argument('--source-file', type=Path)
+parser.add_argument('--hardware-source', type=Path)
 args = parser.parse_args()
 source = (args.source_file or args.source_root / 'drivers/amlogic/media/vout/hdmitx/hdmi_tx_20/hw/hdmi_tx_ddc.c').read_text()
 iopoll = (args.source_root / 'include/linux/iopoll.h').read_text()
@@ -33,8 +34,10 @@ if 'static uint32_t ddc_wait_complete(' in source:
 for name in ('ddc_write_1byte', 'ddc_read_1byte', 'ddc_read_8byte'):
     production += function('static uint32_t ' + name + '(')
 
-production += function('void edid_read_head_8bytes(')
-hardware = (args.source_root / 'drivers/amlogic/media/vout/hdmitx/hdmi_tx_20/hw/hdmi_tx_hw.c').read_text()
+production += function('void hdmitx_ddc_reactivate(' if 'void hdmitx_ddc_reactivate(' in source
+                       else 'void edid_read_head_8bytes(')
+hardware = (args.hardware_source or args.source_root /
+            'drivers/amlogic/media/vout/hdmitx/hdmi_tx_20/hw/hdmi_tx_hw.c').read_text()
 start = hardware.index('\tcase MISC_I2C_REACTIVE:')
 reactive_case = hardware[start:hardware.index('\t\tbreak;', start) + len('\t\tbreak;')]
 production += '''
@@ -67,9 +70,17 @@ static int64_t now, launched, complete_after;
 #define CHECK(x) do { checks++; if (!(x)) { \
     fprintf(stderr, "line %d: %s\n", __LINE__, #x); failures++; } } while (0)
 static void mutex_lock(int *p) { (void)p; assert(!locked); locked = 1; }
-static void mutex_unlock(int *p) { (void)p; assert(locked); locked = 0; }
-static void mdelay(int ms) { now += ms * 1000; }
-static void usleep_range(int low, int high) { assert(low <= high); now += high; }
+static void mutex_unlock(int *p) { (void)p; assert(locked); CHECK(!active); locked = 0; }
+/* Completion belongs to the controller clock, not to status-register reads. */
+static void advance_time(int64_t us) {
+    now += us;
+    if (active && complete_after >= 0 && now - launched >= complete_after) {
+        status |= completion_status;
+        active = 0;
+    }
+}
+static void mdelay(int ms) { advance_time(ms * 1000); }
+static void usleep_range(int low, int high) { assert(low <= high); advance_time(high); }
 static ktime_t ktime_get(void) { return now; }
 static ktime_t ktime_add_us(ktime_t t, int us) { return t + us; }
 static int ktime_compare(ktime_t a, ktime_t b) { return (a > b) - (a < b); }
@@ -83,26 +94,21 @@ static void pr_info(const char *format, ...) {
     reports++;
 }
 static void hdmitx_wr_reg(unsigned reg, unsigned val) {
-    /* Clock setup is in the existing caller, outside the transfer mutex. */
+    assert(locked); /* Clock changes belong to the same transaction. */
     if (reg == HDMITX_DWC_I2CM_SS_SCL_HCNT_1) { scl_high = (scl_high & 255) | (val << 8); return; }
     if (reg == HDMITX_DWC_I2CM_SS_SCL_HCNT_0) { scl_high = (scl_high & 0xff00) | val; return; }
     assert(locked);
     if (reg == HDMITX_DWC_IH_I2CM_STAT0) status &= ~val; /* W1C */
     else if (reg == HDMITX_DWC_I2CM_OPERATION) {
         CHECK(!active); active = 1; launched = now; operation = val;
+        advance_time(0);
     } else if (reg == HDMITX_DWC_I2CM_SOFTRSTZ) {
         CHECK(val == 0); active = 0; resets++;
     }
 }
 static unsigned hdmitx_rd_reg(unsigned reg) {
     assert(locked);
-    if (reg == HDMITX_DWC_IH_I2CM_STAT0) {
-        if (active && complete_after >= 0 && now - launched >= complete_after) {
-            status |= completion_status;
-            active = 0;
-        }
-        return status;
-    }
+    if (reg == HDMITX_DWC_IH_I2CM_STAT0) return status;
     reads++;
     CHECK(!active);
     if (reg == HDMITX_DWC_I2CM_DATAI) return 0x5a;
@@ -118,7 +124,7 @@ static void hdmitx_set_reg_bits(unsigned reg, int val, int start, int width) {
 }
 static void hdmi_hwi_init(struct hdmitx_dev *dev) {
     (void)dev;
-    CHECK(!locked && scl_high == 0xfff6);
+    CHECK(locked && scl_high == 0xfff6);
     normal_clock_restored = now;
     scl_high = 0xcf;
 }
@@ -185,22 +191,37 @@ int main(void) {
             check_data(kind, buf, 0);
         }
     }
-    /* Reactive reads must return after the legacy 2 ms, even without DONE.
-     * The production caller then restores normal SCL timing and waits 5 ms.
+    /* Keep the legacy 2 ms slow launch and 5 ms normal-clock settle, but
+     * never publish a free bus while the reactive operation remains active.
      * Delays are adversarial inputs, not measured controller timings. */
-    for (delay = 0; delay < 4; delay++) {
-        const int reactive_delays[] = {1000, 7000, 140000, -1};
-        setup(3, 2, reactive_delays[delay]);
-        run_reactive_case();
-        CHECK(normal_clock_restored == 2000 && now == 7000);
-        CHECK(scl_high == 0xcf && resets == 0 && reports == 0);
-        CHECK(reads == 0 && operation == 4 && !locked && !status);
-        CHECK(active == (reactive_delays[delay] != 1000));
+    for (delay = 0; delay < 6; delay++) {
+        const int reactive_delays[] = {0, 1000, 7000, 19000, 140000, -1};
+        int timeout = reactive_delays[delay] < 0 || reactive_delays[delay] > 25000;
+        for (failed = 1; failed <= 3; failed++) {
+            setup(3, failed, reactive_delays[delay]);
+            run_reactive_case();
+            CHECK(normal_clock_restored == 2000 && now >= 7000 && now <= 27000);
+            CHECK(now >= (timeout ? 25000 : reactive_delays[delay]));
+            CHECK(scl_high == 0xcf && resets == timeout);
+            CHECK(reports == (timeout || (failed & 1)));
+            CHECK(reads == 0 && operation == 4 && !locked && !status && !active);
+            /* A late DONE must not make a subsequent never-completing read
+             * succeed, nor may a checked read start on the reactive transfer. */
+            complete_after = -1; completion_status = 2; reads = reports = 0;
+            memset(buf, 0xa5, sizeof(buf));
+            CHECK(transfer(1, buf) == 0);
+            CHECK(!active && !status && resets == timeout + 1 && reports == 1);
+            check_data(1, buf, 0);
+            /* All checked operation kinds still work after that handoff. */
+            for (kind = 0; kind < 3; kind++) {
+                complete_after = 7000; reads = reports = 0;
+                memset(buf, 0xa5, sizeof(buf));
+                CHECK(transfer(kind, buf) == 1);
+                CHECK(!active && !status && resets == timeout + 1 && !reports);
+                check_data(kind, buf, 1);
+            }
+        }
     }
-    setup(0, 1, 1000);
-    run_reactive_case();
-    CHECK(normal_clock_restored == 2000 && now == 7000);
-    CHECK(reports == 1 && resets == 0 && reads == 0 && !locked);
     printf("DDC completion: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

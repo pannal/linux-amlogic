@@ -49,8 +49,6 @@ static uint32_t ddc_wait_complete(uint8_t slave, uint8_t offset_addr)
 	unsigned int status;
 	int ret;
 
-	/* Keep the existing settling delay, then allow a slow transfer to finish. */
-	mdelay(2);
 	ret = readx_poll_timeout(hdmitx_rd_reg, HDMITX_DWC_IH_I2CM_STAT0,
 		status, status & 0x3, 1000, 18000);
 	if (ret) {
@@ -79,6 +77,7 @@ static uint32_t ddc_write_1byte(uint8_t slave, uint8_t offset_addr,
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_DATAO, data);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 4);
+	mdelay(2);
 	st = ddc_wait_complete(slave, offset_addr);
 
 	mutex_unlock(&ddc_mutex);
@@ -126,6 +125,7 @@ static uint32_t ddc_read_8byte(uint8_t slave, uint8_t offset_addr,
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, slave);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 2);
+	mdelay(2);
 	st = ddc_wait_complete(slave, offset_addr);
 	if (st)
 		for (i = 0; i < 8; i++)
@@ -173,6 +173,7 @@ static uint32_t ddc_read_1byte(uint8_t slave, uint8_t offset_addr,
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, slave);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, offset_addr);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 0);
+	mdelay(2);
 	st = ddc_wait_complete(slave, offset_addr);
 	if (st)
 		*data = hdmitx_rd_reg(HDMITX_DWC_I2CM_DATAI);
@@ -231,23 +232,26 @@ uint32_t hdcp_rd_hdcp22_ver(void)
 }
 
 /*
- * Start the I2C reactivation sequence, not a checked EDID read. The caller
- * deliberately slows SCL before this call and restores its normal timing
- * after we return. Waiting for completion here can hold the slow timing
- * until a timeout and abort the very transaction used to reactivate the bus.
+ * Keep the bus owned through the slow launch, normal-clock restoration and
+ * completion. The callback restores controller timing only; it must not start
+ * a transfer or acquire ddc_mutex. Never wait for DONE at the slow clock.
  */
-void edid_read_head_8bytes(void)
+void hdmitx_ddc_reactivate(struct hdmitx_dev *hdev,
+	void (*restore_timing)(struct hdmitx_dev *))
 {
-	hdmitx_ddc_hw_op(DDC_MUX_DDC);
 	mutex_lock(&ddc_mutex);
+	hdmitx_ddc_hw_op(DDC_MUX_DDC);
+	hdmitx_wr_reg(HDMITX_DWC_I2CM_SS_SCL_HCNT_1, 0xff);
+	hdmitx_wr_reg(HDMITX_DWC_I2CM_SS_SCL_HCNT_0, 0xf6);
 	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_SLAVE, EDID_SLAVE);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_ADDRESS, 0);
 	hdmitx_wr_reg(HDMITX_DWC_I2CM_OPERATION, 1 << 2);
 	mdelay(2);
-	if (hdmitx_rd_reg(HDMITX_DWC_IH_I2CM_STAT0) & (1 << 0))
-		pr_info("E: ddc I2C reactive read\n");
-	hdmitx_wr_reg(HDMITX_DWC_IH_I2CM_STAT0, 0x7);
+	restore_timing(hdev);
+	mdelay(5);
+	/* Preserve early DONE/ERROR until checked; abort a timeout before unlock. */
+	ddc_wait_complete(EDID_SLAVE, 0);
 	mutex_unlock(&ddc_mutex);
 }
 

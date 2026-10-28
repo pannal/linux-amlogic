@@ -4441,11 +4441,7 @@ static int hdmitx_cntl_misc(struct hdmitx_dev *hdev, unsigned int cmd,
 		hdmitx_hdcp_opr(4);
 		hdmitx_set_reg_bits(HDMITX_DWC_A_HDCPCFG1, 0, 0, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_HDCP22REG_CTRL, 0, 2, 1);
-		hdmitx_wr_reg(HDMITX_DWC_I2CM_SS_SCL_HCNT_1, 0xff);
-		hdmitx_wr_reg(HDMITX_DWC_I2CM_SS_SCL_HCNT_0, 0xf6);
-		edid_read_head_8bytes();
-		hdmi_hwi_init(hdev);
-		mdelay(5);
+		hdmitx_ddc_reactivate(hdev, hdmi_hwi_init);
 		break;
 	case MISC_SUSFLAG:
 		if (argv == 1) {
