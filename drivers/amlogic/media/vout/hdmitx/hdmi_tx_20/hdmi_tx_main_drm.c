@@ -57,6 +57,7 @@
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_info_global.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_ddc.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
+#include "hdmi_tx_video_mute.h"
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_config.h>
 #include "hw/tvenc_conf.h"
 #include "hw/common.h"
@@ -1521,12 +1522,7 @@ EXPORT_SYMBOL(hdmitx_audio_mute_op);
 
 void hdmitx_video_mute_op(unsigned int flag)
 {
-	if (flag == 0)
-		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
-					      CONF_VIDEO_MUTE_OP, VIDEO_MUTE);
-	else
-		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
-					      CONF_VIDEO_MUTE_OP, VIDEO_UNMUTE);
+	hdmitx_update_video_mute(&hdmitx_device, false, flag == 0, false);
 }
 EXPORT_SYMBOL(hdmitx_video_mute_op);
 
@@ -2382,26 +2378,11 @@ static ssize_t show_vid_mute(struct device *dev,
 	return pos;
 }
 
-static ssize_t store_vid_mute(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
+static ssize_t store_vid_mute(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
 {
-	atomic_t kref_video_mute = hdmitx_device.kref_video_mute;
-
-	if (buf[0] == '1') {
-		atomic_inc(&kref_video_mute);
-		if (atomic_read(&kref_video_mute) == 1)
-			hdmitx_video_mute_op(0);
-	}
-	if (buf[0] == '0') {
-		if (!(atomic_sub_and_test(0, &kref_video_mute))) {
-			atomic_dec(&kref_video_mute);
-			if (atomic_sub_and_test(0, &kref_video_mute))
-				hdmitx_video_mute_op(1);
-		}
-	}
-
-	hdmitx_device.kref_video_mute = kref_video_mute;
-
+	if (count && (buf[0] == '1' || buf[0] == '0'))
+		hdmitx_update_video_mute(&hdmitx_device, true, buf[0] == '1', false);
 	return count;
 }
 

@@ -28,6 +28,7 @@
 #include <linux/major.h>
 #include <linux/platform_device.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -39,6 +40,7 @@
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
 #include "common.h"
 #include "mach_reg.h"
+#include "tvenc_conf.h"
 
 #define MREG_END_MARKER 0xFFFF
 
@@ -1738,9 +1740,52 @@ static struct vic_tvregs_set tvregsTab_3dfp[] = {
 	{HDMI_1280x720p50_16x9, tvregs_3dfp_720p50},
 };
 
+/* Only the selector write and mute register batch share this IRQ-safe lock.
+ * Never hold it over a full modeset, clock programming or sleeps. */
+static DEFINE_SPINLOCK(video_mute_lock);
+static bool video_mute_applied;
+
+void hdmitx_set_video_mute(struct hdmitx_dev *hdev, unsigned int op)
+{
+	unsigned long flags;
+
+	if (op != VIDEO_MUTE && op != VIDEO_UNMUTE)
+		return;
+	spin_lock_irqsave(&video_mute_lock, flags);
+	if (op == VIDEO_MUTE) {
+		if (hdev->chip_type < MESON_CPU_ID_SC2)
+			hd_set_reg_bits(P_HHI_GCLK_OTHER, 1, 3, 1);
+		hd_set_reg_bits(P_ENCP_VIDEO_MODE_ADV, 0, 3, 1);
+		hd_write_reg(P_VENC_VIDEO_TST_EN, 1);
+		hd_write_reg(P_VENC_VIDEO_TST_MDSEL, 0);
+		hd_write_reg(P_VENC_VIDEO_TST_Y, 0x0);
+		hd_write_reg(P_VENC_VIDEO_TST_CB, 0x200);
+		hd_write_reg(P_VENC_VIDEO_TST_CR, 0x200);
+	} else {
+		hd_set_reg_bits(P_ENCP_VIDEO_MODE_ADV, 1, 3, 1);
+		hd_write_reg(P_VENC_VIDEO_TST_EN, 0);
+	}
+	video_mute_applied = op == VIDEO_MUTE;
+	spin_unlock_irqrestore(&video_mute_lock, flags);
+}
+
 static inline void setreg(const struct reg_s *r)
 {
-	hd_write_reg(r->reg, r->val);
+	unsigned long flags;
+	unsigned int value;
+
+	if (r->reg != P_ENCP_VIDEO_MODE_ADV) {
+		hd_write_reg(r->reg, r->val);
+		return;
+	}
+	/* Preserve black in the table write itself, not after briefly selecting
+	 * normal video. A concurrent unmute must not be undone by a stale read. */
+	spin_lock_irqsave(&video_mute_lock, flags);
+	value = r->val;
+	if (video_mute_applied)
+		value &= ~(1U << 3);
+	hd_write_reg(r->reg, value);
+	spin_unlock_irqrestore(&video_mute_lock, flags);
 }
 
 static const struct reg_s *tvregs_setting_mode(struct hdmitx_dev *hdev)

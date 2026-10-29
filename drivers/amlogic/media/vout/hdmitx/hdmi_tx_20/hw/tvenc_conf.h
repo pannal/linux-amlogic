@@ -19,3 +19,5 @@
 
 
 void set_vmode_enc_hw(struct hdmitx_dev *hdev);
+
+void hdmitx_set_video_mute(struct hdmitx_dev *hdev, unsigned int op);

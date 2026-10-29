@@ -4179,21 +4179,7 @@ static int hdmitx_cntl_config(struct hdmitx_dev *hdev, unsigned int cmd,
 		audio_mute_op(argv == AUDIO_MUTE ? 0 : 1);
 		break;
 	case CONF_VIDEO_MUTE_OP:
-		if (argv == VIDEO_MUTE) {
-			if (hdev->chip_type < MESON_CPU_ID_SC2)
-				hd_set_reg_bits(P_HHI_GCLK_OTHER, 1, 3, 1);
-			hd_set_reg_bits(P_ENCP_VIDEO_MODE_ADV, 0, 3, 1);
-			hd_write_reg(P_VENC_VIDEO_TST_EN, 1);
-			hd_write_reg(P_VENC_VIDEO_TST_MDSEL, 0);
-			/*_Y/CB/CR, 10bits Unsigned/Signed/Signed */
-			hd_write_reg(P_VENC_VIDEO_TST_Y, 0x0);
-			hd_write_reg(P_VENC_VIDEO_TST_CB, 0x200);
-			hd_write_reg(P_VENC_VIDEO_TST_CR, 0x200);
-		}
-		if (argv == VIDEO_UNMUTE) {
-			hd_set_reg_bits(P_ENCP_VIDEO_MODE_ADV, 1, 3, 1);
-			hd_write_reg(P_VENC_VIDEO_TST_EN, 0);
-		}
+		hdmitx_set_video_mute(hdev, argv);
 		break;
 	case CONF_CLR_AVI_PACKET:
 		hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, 0);
