@@ -44,6 +44,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/reboot.h>
+#include <linux/syscore_ops.h>
 #include <linux/extcon.h>
 #include <linux/i2c.h>
 
@@ -103,6 +104,14 @@ static unsigned int hdmitx_get_frame_duration(void);
 
 static DEFINE_MUTEX(setclk_mutex);
 static DEFINE_MUTEX(getedid_mutex);
+
+/* Bumped by syscore resume on each wake from suspend to RAM, before
+ * devices or IRQs resume. A modeset records the generation it started
+ * in, under setclk_mutex, so late resume can tell an output set up
+ * during this wake.
+ */
+static unsigned int hdmitx_wake_gen;
+static unsigned int hdmitx_setup_gen;
 
 static struct hdmitx_dev hdmitx_device = {
 	.frac_rate_policy = 1,
@@ -324,6 +333,7 @@ static void hdmitx_late_resume(struct early_suspend *h)
 {
 	const struct vinfo_s *info = hdmitx_get_current_vinfo();
 	struct hdmitx_dev *phdmi = (struct hdmitx_dev *)h->param;
+	bool restored, pending;
 
 	/*open vpu clk*/
 	if (phdmi->hdmitx_clk_tree.hdmi_clk_vapb != NULL)
@@ -332,7 +342,28 @@ static void hdmitx_late_resume(struct early_suspend *h)
 	if (phdmi->hdmitx_clk_tree.hdmi_clk_vpu != NULL)
 		clk_prepare_enable(phdmi->hdmitx_clk_tree.hdmi_clk_vpu);
 
-	if (info && (hdmitx_is_hdmi_vmode(info->name) == 1))
+	/* hdmi_wq is not freezable, so an HPD pulse latched during suspend
+	 * runs the plugin work during device resume, usually before this
+	 * handler. Setting up that live link again (fake HPLL on the running
+	 * PHY, modeset, controller reset) can leave HDMI 2.0 sinks in
+	 * scrambled modes without signal. Keep an output set up during this
+	 * wake, and leave the setup to plugin work that is still pending.
+	 * Hold setclk_mutex until the fallback is done, so the plugin work
+	 * cannot set the mode in between.
+	 */
+	mutex_lock(&setclk_mutex);
+	restored = phdmi->ready && phdmi->cur_VIC != HDMI_Unknown &&
+		   phdmi->cur_VIC != HDMI_VIC_FAKE &&
+		   hdmitx_setup_gen == READ_ONCE(hdmitx_wake_gen) &&
+		   phdmi->hwop.cntlmisc(phdmi, MISC_HPD_GPI_ST, 0);
+	pending = !restored && (phdmi->hdmitx_event & HDMI_TX_HPD_PLUGIN);
+	if (restored)
+		pr_info(SYS "late resume: keep output set since wake, VIC %d\n",
+			phdmi->cur_VIC);
+	else if (pending)
+		pr_info(SYS "late resume: leave setup to pending plugin\n");
+
+	if (!restored && info && (hdmitx_is_hdmi_vmode(info->name) == 1))
 		phdmi->hwop.cntlmisc(&hdmitx_device, MISC_HPLL_FAKE, 0);
 
 	phdmi->hpd_lock = 0;
@@ -346,15 +377,17 @@ static void hdmitx_late_resume(struct early_suspend *h)
 	pr_info("hdmitx hpd state: %d\n", hdmitx_device.hpd_state);
 
 	/*force to get EDID after resume for Amplifer Power case*/
-	if (hdmitx_device.hpd_state)
+	if (hdmitx_device.hpd_state && !restored && !pending)
 		hdmitx_get_edid(phdmi);
 	hdmitx_notify_hpd(hdmitx_device.hpd_state,
 			  hdmitx_device.edid_parsing ?
 			  hdmitx_device.edid_ptr : NULL);
 
-	hdmitx_device.hwop.cntlconfig(&hdmitx_device,
-		CONF_AUDIO_MUTE_OP, AUDIO_MUTE);
-	set_disp_mode_auto();
+	if (!restored && !pending) {
+		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
+			CONF_AUDIO_MUTE_OP, AUDIO_MUTE);
+		set_disp_mode_auto_locked();
+	}
 
 	extcon_set_state_sync(hdmitx_extcon_hdmi, EXTCON_DISP_HDMI,
 		hdmitx_device.hpd_state);
@@ -367,11 +400,23 @@ static void hdmitx_late_resume(struct early_suspend *h)
 	hdmitx_set_uevent(HDMITX_AUDIO_EVENT, hdmitx_device.hpd_state);
 
 	pr_info("amhdmitx: late resume module %d\n", __LINE__);
-	phdmi->hwop.cntl((struct hdmitx_dev *)h->param,
-		HDMITX_EARLY_SUSPEND_RESUME_CNTL, HDMITX_LATE_RESUME);
+	/* The controller reset would disturb the link kept above. */
+	if (!restored)
+		phdmi->hwop.cntl((struct hdmitx_dev *)h->param,
+			HDMITX_EARLY_SUSPEND_RESUME_CNTL, HDMITX_LATE_RESUME);
+	mutex_unlock(&setclk_mutex);
 	phdmi->hwop.cntlmisc(phdmi, MISC_SUSFLAG, 0);
 	pr_info(SYS "HDMITX: Late Resume\n");
 }
+
+static void hdmitx_syscore_resume(void)
+{
+	WRITE_ONCE(hdmitx_wake_gen, hdmitx_wake_gen + 1);
+}
+
+static struct syscore_ops hdmitx_syscore_ops = {
+	.resume = hdmitx_syscore_resume,
+};
 
 /* Set avmute_set signal to HDMIRX */
 static int hdmitx_reboot_notifier(struct notifier_block *nb,
@@ -621,6 +666,7 @@ static void edidinfo_detach_to_vinfo(struct hdmitx_dev *hdev)
 static int set_disp_mode_auto_locked(void)
 {
 	int ret =  -1;
+	const unsigned int gen = READ_ONCE(hdmitx_wake_gen);
 
 	struct vinfo_s *info = NULL;
 	struct hdmitx_dev *hdev = &hdmitx_device;
@@ -859,6 +905,7 @@ static int set_disp_mode_auto_locked(void)
 		hdev->cur_VIC = vic;
 		hdev->audio_param_update_flag = 1;
 		hdev->auth_process_timer = AUTH_PROCESS_TIME;
+		hdmitx_setup_gen = gen;
 	}
 	if (hdev->cur_VIC == HDMI_Unknown) {
 		if (hdev->hpdmode == 2) {
@@ -7335,6 +7382,7 @@ static int amhdmitx_probe(struct platform_device *pdev)
 
 #ifdef CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND
 	register_early_suspend(&hdmitx_early_suspend_handler);
+	register_syscore_ops(&hdmitx_syscore_ops);
 #endif
 	hdmitx_device.nb.notifier_call = hdmitx_reboot_notifier;
 	register_reboot_notifier(&hdmitx_device.nb);
@@ -7383,6 +7431,9 @@ static int amhdmitx_remove(struct platform_device *pdev)
 {
 	struct device *dev = hdmitx_device.hdtx_dev;
 
+#ifdef CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND
+	unregister_syscore_ops(&hdmitx_syscore_ops);
+#endif
 	hdmitx_cancel_dv_reconnect(&hdmitx_device);
 	cancel_work_sync(&hdmitx_device.work_hdr);
 
