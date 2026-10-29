@@ -1,0 +1,20 @@
+What:           /sys/class/amhdmitx/amhdmitx0/vid_mute_kodi
+Date:           October 2026
+Contact:        p3i maintainers
+Description:
+                Dedicated boolean video-mute request for a single Kodi instance.
+                Write 1 to hold or 0 to release; repeated writes are idempotent.
+                Input is one digit, optionally followed by a newline. Reading
+                returns this slot's requested state, not physical output status.
+
+                A new Kodi process may write 0 once before creating its holds to
+                recover its predecessor's request after a crash. This does not
+                release HDR's internal request or decrement references owned by
+                clients of the existing vid_mute interface. Output is unmuted
+                only when all three owner classes release it. The normal driver
+                applies requests at vsync; the DRM variant dispatches directly.
+
+                This is an exclusive client slot, not a per-process lease. Do
+                not share it between concurrent Kodi instances or other clients.
+                It does not identify or clear references leaked through legacy
+                vid_mute, and does not auto-release while Kodi remains stopped.

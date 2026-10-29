@@ -43,6 +43,8 @@ def main():
 #define IRQ_HANDLED 1
 typedef int irqreturn_t;
 #define xchg(p,v) __atomic_exchange_n(p,v,__ATOMIC_SEQ_CST)
+#define READ_ONCE(p) __atomic_load_n(&(p),__ATOMIC_SEQ_CST)
+#define PAGE_SIZE 4096
 #define WRITE_ONCE(p,v) __atomic_store_n(&(p),v,__ATOMIC_SEQ_CST)
 static __thread int lock_depth;static bool check_selector_lock;
 #define DEFINE_SPINLOCK(n) pthread_mutex_t n=PTHREAD_MUTEX_INITIALIZER
@@ -82,10 +84,11 @@ static int configure(struct hdmitx_dev* hdev,unsigned cmd,unsigned argv){switch(
 static void drain(void){vsync_intr_handler(0,&hdmitx_device);}
 static bool muted(void){return !(regfile[P_ENCP_VIDEO_MODE_ADV]&8)&&regfile[P_VENC_VIDEO_TST_EN]==1;}
 static void user(bool on){assert(store_vid_mute(NULL,NULL,on?"1":"0",1)==1);drain();}
+static void kodi(bool on){assert(store_vid_mute_kodi(NULL,NULL,on?"1":"0",1)==1);drain();}
 static void internal(bool on){hdmitx_video_mute_op(on?0:1);drain();}
 static void reset(void){
  hdmitx_device=(struct hdmitx_dev){.hwop={configure},.hdmi_init=1};
- internal(false);assert(!muted());
+ internal(false);kodi(false);assert(!muted());
 }
 static void* add_users(void* unused){for(int i=0;i<10000;i++)store_vid_mute(NULL,NULL,"1",1);return NULL;}
 static void* remove_users(void* unused){for(int i=0;i<10000;i++)store_vid_mute(NULL,NULL,"0",1);return NULL;}
@@ -99,6 +102,25 @@ static void test_owners(void){
  pthread_join(a,NULL);pthread_join(b,NULL);assert(atomic_read(&hdmitx_device.kref_video_mute)==20000);drain();assert(muted());
  pthread_create(&a,NULL,remove_users,NULL);pthread_create(&b,NULL,remove_users,NULL);
  pthread_join(a,NULL);pthread_join(b,NULL);assert(atomic_read(&hdmitx_device.kref_video_mute)==0);drain();assert(!muted());
+}
+static void test_kodi_slot(void){
+ char buf[PAGE_SIZE];reset();
+ kodi(true);assert(muted());assert(atomic_read(&hdmitx_device.kref_video_mute)==0);
+ kodi(true);assert(show_vid_mute_kodi(NULL,NULL,buf)==2 && !strcmp(buf,"1\n"));
+ kodi(false);assert(!muted()); // repeated true is not a second reference
+ kodi(true);user(true);user(true);internal(true);
+ kodi(false);assert(muted()&&atomic_read(&hdmitx_device.kref_video_mute)==2);
+ internal(false);assert(muted());user(false);assert(muted());user(false);assert(!muted());
+ kodi(true);internal(true);kodi(false);assert(muted());internal(false);assert(!muted());
+ kodi(true);internal(true);internal(false);assert(muted());
+ user(true);user(false);assert(muted());
+ kodi(false);assert(!muted()); // a new process can clear only its predecessor's slot
+ assert(store_vid_mute_kodi(NULL,NULL,"1\n",2)==2);drain();assert(muted());
+ for(unsigned i=0;i<4;i++) {
+  const char* bad[]={"", "x", "10", "1\n0"};
+  assert(store_vid_mute_kodi(NULL,NULL,bad[i],strlen(bad[i]))==-EINVAL);drain();assert(muted());
+ }
+ kodi(false);assert(show_vid_mute_kodi(NULL,NULL,buf)==2 && !strcmp(buf,"0\n"));
 }
 static void* toggle_mute(void* unused){for(int i=0;i<10000;i++)configure(&hdmitx_device,CONF_VIDEO_MUTE_OP,i%2?VIDEO_MUTE:VIDEO_UNMUTE);return NULL;}
 static void* write_selector(void* unused){struct reg_s r={P_ENCP_VIDEO_MODE_ADV,0x18};for(int i=0;i<10000;i++)setreg(&r);return NULL;}
@@ -118,12 +140,12 @@ static void test_mode(enum hdmi_vic mode, bool framepacking){
  hdmitx_device.bist_lock=0;set_vmode_enc_hw(&hdmitx_device);assert(regfile[P_ENCP_VIDEO_MODE_ADV]&8);
 }
 int main(void){
- test_owners();
+ test_owners();test_kodi_slot();
  @MODES@
  test_selector_race();
  reset();hdmitx_device.vid_mute_op=VIDEO_MUTE;inject_request=true;drain();
  assert(hdmitx_device.vid_mute_op==VIDEO_UNMUTE);drain();assert(!muted());
- puts("PASS: complete production mode tables, mute/IRQ ordering, HDR/userspace ownership and concurrent references");
+ puts("PASS: complete production mode tables, mute/IRQ ordering, HDR/userspace/Kodi ownership, restart recovery and concurrent references");
 }
 '''
     # Exercise every progressive encoder table through its actual VIC selection.
@@ -138,7 +160,7 @@ int main(void){
             else:assert r.returncode==0,r.stdout+r.stderr;print(r.stdout.strip())
     for main in ['hdmi_tx_main.c','hdmi_tx_main_drm.c']:
         s=read(main)
-        full=source+function(s,'void hdmitx_video_mute_op(')+function(s,'static ssize_t store_vid_mute(')+tests
+        full=source+function(s,'void hdmitx_video_mute_op(')+function(s,'static ssize_t store_vid_mute(')+function(s,'static ssize_t store_vid_mute_kodi(')+function(s,'static ssize_t show_vid_mute_kodi(')+tests
         print(main,flush=True);run(full)
         if args.negative_controls:
             unlocked=full.replace('spin_lock_irqsave(&video_mute_lock, flags);','flags=0;').replace('spin_unlock_irqrestore(&video_mute_lock, flags);','(void)flags;')
@@ -146,9 +168,13 @@ int main(void){
             unlocked=unlocked.replace('static DEFINE_SPINLOCK(video_mute_lock);','')
             run(unlocked,True);print('REJECTED: unserialized selector',flush=True)
             for label,old,new in [
+                ('ignore Kodi owner','video_mute_internal || video_mute_kodi ||','video_mute_internal ||'),
+                ('Kodi reset releases HDR','WRITE_ONCE(video_mute_kodi, mute);','WRITE_ONCE(video_mute_kodi, mute); if(!mute) video_mute_internal=false;'),
+                ('Kodi reset drains others','WRITE_ONCE(video_mute_kodi, mute);','WRITE_ONCE(video_mute_kodi, mute); if(!mute) hdev->kref_video_mute.counter=0;'),
+                ('Kodi writes refcounted','WRITE_ONCE(video_mute_kodi, mute);','WRITE_ONCE(video_mute_kodi, mute); if(mute) atomic_inc(&hdev->kref_video_mute);'),
                 ('overwrite selector','value &= ~(1U << 3);','value |= (1U << 3);'),
-                ('HDR overrides userspace','video_mute_internal || atomic_read(&hdev->kref_video_mute) > 0','video_mute_internal'),
-                ('userspace overrides HDR','video_mute_internal || atomic_read(&hdev->kref_video_mute) > 0','atomic_read(&hdev->kref_video_mute) > 0'),
+                ('HDR overrides userspace','video_mute_internal || video_mute_kodi ||\n\t\tatomic_read(&hdev->kref_video_mute) > 0','video_mute_internal'),
+                ('userspace overrides HDR','video_mute_internal || video_mute_kodi ||\n\t\tatomic_read(&hdev->kref_video_mute) > 0','atomic_read(&hdev->kref_video_mute) > 0'),
                 ('allow underflow','else if (atomic_read(&hdev->kref_video_mute) > 0)','else'),
                 ('lose IRQ request','hdev->hwop.cntlconfig(hdev, CONF_VIDEO_MUTE_OP, mute_op);','{ hdev->hwop.cntlconfig(hdev, CONF_VIDEO_MUTE_OP, mute_op); hdev->vid_mute_op=VIDEO_NONE_OP; }')]:
                 assert old in full,label
