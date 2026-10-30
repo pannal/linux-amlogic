@@ -22,6 +22,7 @@
 #include <linux/platform_device.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/lcm.h>
 #include <linux/of_device.h>
 
 #include <linux/notifier.h>
@@ -1533,6 +1534,56 @@ void aml_frddr_enable(struct frddr *fr, bool enable)
 			aml_audiobus_write(actrl, reg, 0x0);
 		}
 	}
+}
+
+/*
+ * Turning the FRDDR off for a pause clears its settings and sends its read
+ * pointer back to INIT_ADDR. Keep what aml_frddr_pause_restore() needs.
+ */
+void aml_frddr_pause_save(struct frddr *fr)
+{
+	struct aml_audio_controller *actrl = fr->actrl;
+	unsigned int reg_base = fr->reg_base;
+
+	fr->pause_ctrl0 = aml_audiobus_read(actrl,
+		calc_frddr_address(EE_AUDIO_FRDDR_A_CTRL0, reg_base));
+	if (fr->chipinfo && fr->chipinfo->src_sel_ctrl)
+		fr->pause_ctrl2 = aml_audiobus_read(actrl,
+			calc_frddr_address(EE_AUDIO_FRDDR_A_CTRL2, reg_base));
+	fr->pause_pos = aml_frddr_get_position(fr);
+}
+
+/*
+ * Put back the settings the pause cleared and continue at the first frame
+ * boundary at or after the paused read pointer, so channels stay in place and
+ * the position never goes backwards. Call before turning the FRDDR on.
+ */
+void aml_frddr_pause_restore(struct frddr *fr, unsigned int start,
+			     unsigned int bytes, unsigned int frame_bytes)
+{
+	struct aml_audio_controller *actrl = fr->actrl;
+	unsigned int reg_base = fr->reg_base;
+	unsigned int unit = lcm(frame_bytes, FIFO_BURST);
+	unsigned int offset = 0;
+
+	if (fr->pause_pos >= start && fr->pause_pos < start + bytes)
+		offset = fr->pause_pos - start;
+	offset = roundup(offset, unit);
+	if (offset >= bytes)
+		offset = 0;
+
+	/* Chips that start at START_ADDR (int_start_same_addr) restart there. */
+	if (fr->chipinfo && !fr->chipinfo->int_start_same_addr)
+		aml_audiobus_write(actrl,
+			calc_frddr_address(EE_AUDIO_FRDDR_A_INIT_ADDR, reg_base),
+			start + offset);
+	if (fr->chipinfo && fr->chipinfo->src_sel_ctrl)
+		aml_audiobus_write(actrl,
+			calc_frddr_address(EE_AUDIO_FRDDR_A_CTRL2, reg_base),
+			fr->pause_ctrl2);
+	aml_audiobus_write(actrl,
+		calc_frddr_address(EE_AUDIO_FRDDR_A_CTRL0, reg_base),
+		fr->pause_ctrl0 & ~(1u << 31));
 }
 
 void aml_frddr_select_dst(struct frddr *fr, enum frddr_dest dst)

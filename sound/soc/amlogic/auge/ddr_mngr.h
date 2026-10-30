@@ -266,6 +266,11 @@ struct frddr {
 	struct ddr_chipinfo *chipinfo;
 
 	bool reserved;
+
+	/* kept by aml_frddr_pause_save() for aml_frddr_pause_restore() */
+	unsigned int pause_ctrl0;
+	unsigned int pause_ctrl2;
+	unsigned int pause_pos;
 };
 
 struct ddr_info {
@@ -328,6 +333,9 @@ int aml_frddr_set_buf(struct frddr *fr, unsigned int start,
 int aml_frddr_set_intrpt(struct frddr *fr, unsigned int intrpt);
 unsigned int aml_frddr_get_position(struct frddr *fr);
 void aml_frddr_enable(struct frddr *fr, bool enable);
+void aml_frddr_pause_save(struct frddr *fr);
+void aml_frddr_pause_restore(struct frddr *fr, unsigned int start,
+			     unsigned int bytes, unsigned int frame_bytes);
 void aml_frddr_select_dst(struct frddr *fr, enum frddr_dest);
 extern void aml_frddr_select_dst_ss(struct frddr *fr,
 	enum frddr_dest dst, int sel, bool enable);
