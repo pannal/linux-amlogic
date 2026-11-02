@@ -10349,6 +10349,20 @@ void osd_init_hw(u32 logo_loaded, u32 osd_probe,
 		for (idx = 0; idx < osd_hw.osd_meson_dev.viu1_osd_count; idx++)
 			osd_reg_write(
 				hw_osd_reg_array[idx].osd_ctrl_stat, data32);
+	} else if (osd_hw.osd_meson_dev.cpu_id ==
+		   __MESON_CPU_MAJOR_ID_G12B) {
+		/*
+		 * The boot logo keeps the bootloader's OSD FIFO setup, whose
+		 * depth (32) is half of what the driver sets without a logo.
+		 * A native 2160p GUI at 60 Hz then runs the OSD FIFO dry
+		 * under memory load and the whole picture shifts sideways.
+		 * Set only the depth; the other fields stay as the logo
+		 * runs with them.
+		 */
+		for (idx = 0; idx < osd_hw.osd_meson_dev.viu1_osd_count; idx++)
+			osd_reg_set_bits(
+				hw_osd_reg_array[idx].osd_fifo_ctrl_stat,
+				osd_hw.osd_meson_dev.osd_fifo_len, 12, 7);
 	}
 	if (osd_hw.osd_meson_dev.osd_ver <= OSD_NORMAL) {
 		osd_vpp_misc =
