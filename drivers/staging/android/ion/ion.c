@@ -38,6 +38,10 @@
 #include <linux/dma-buf.h>
 #include <linux/idr.h>
 
+#ifdef CONFIG_ARM64
+#include <asm/cacheflush.h>
+#endif
+
 #include "ion.h"
 #include "ion_priv.h"
 #include "compat_ion.h"
@@ -864,6 +868,40 @@ void ion_pages_sync_for_device(struct device *dev, struct page *page,
 {
 	struct scatterlist sg;
 
+#ifdef CONFIG_ARM64
+	/*
+	 * Legacy heap/page-pool callers have no DMA device. On arm64,
+	 * get_dma_ops(NULL) selects dummy_dma_ops, whose sync is a no-op.
+	 * Clean and invalidate the cached linear alias before these pages
+	 * are handed to an uncached mapping or an external DMA consumer.
+	 * In particular, alloc_pages(__GFP_ZERO) may leave dirty zeros in
+	 * that alias which must not write back over later device writes.
+	 */
+	if (!dev) {
+		char *addr = page_address(page);
+		size_t offset = 0, mapped = 0;
+
+		/* Reserved heaps can include no-map RAM: it has no cached
+		 * linear alias to flush. Coalesce only valid mapped pages.
+		 */
+		while (offset < size) {
+			size_t len = min_t(size_t, PAGE_SIZE, size - offset);
+
+			if (virt_addr_valid(addr + offset)) {
+				mapped += len;
+			} else if (mapped) {
+				__dma_flush_area(addr + offset - mapped, mapped);
+				mapped = 0;
+			}
+			offset += len;
+		}
+		if (mapped)
+			__dma_flush_area(addr + offset - mapped, mapped);
+		pr_info_once("ion: ARM64 device-less page cache sync enabled\n");
+		return;
+	}
+#endif
+
 	sg_init_table(&sg, 1);
 	sg_set_page(&sg, page, size, 0);
 	/*
@@ -872,6 +910,7 @@ void ion_pages_sync_for_device(struct device *dev, struct page *page,
 	 * hardware.
 	 */
 	sg_dma_address(&sg) = page_to_phys(page);
+	sg_dma_len(&sg) = size;
 	dma_sync_sg_for_device(dev, &sg, 1, dir);
 }
 
