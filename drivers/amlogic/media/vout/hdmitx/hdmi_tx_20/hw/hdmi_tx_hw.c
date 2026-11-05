@@ -663,7 +663,25 @@ static irqreturn_t intr_handler(int irq, void *dev)
 	hdmitx_wr_reg(HDMITX_TOP_INTR_STAT_CLR, ~0);
 	hdmitx_wr_reg(HDMITX_DWC_HDCP22REG_STAT, 0xff);
 
-	pr_info(SYS "irq %x %x\n", dat_top, dat_dwc);
+	if (hdev->chip_type == MESON_CPU_ID_G12B && (dat_top & 0x6)) {
+		unsigned int phy = hdmitx_rd_reg(HDMITX_DWC_PHY_STAT0);
+		/* G12B GPIOH_2: GPIO base 0xff634440, input word 11. */
+		unsigned int pad = hd_read_reg(PERIPHS_REG_ADDR(0x1b));
+		unsigned int mux = hd_read_reg(P_PERIPHS_PIN_MUX_B);
+		unsigned int filter = hdmitx_rd_reg(HDMITX_TOP_HPD_FILTER);
+
+		/*
+		 * Sequential samples after ack, before changing cached HPD state.
+		 * Do not use the RXSENSE getter: it reprograms the G12B PHY.
+		 */
+		pr_info(SYS "irq %x %x hpd_diag=1 phy=%x pad=%u mux=%x filter=%x old=%u/%u ready=%d lock=%u\n",
+			dat_top, dat_dwc, phy, (pad >> 2) & 1,
+			(mux >> 8) & 0xf, filter,
+			READ_ONCE(hdev->hpd_state), READ_ONCE(hdev->rhpd_state),
+			READ_ONCE(hdev->ready), READ_ONCE(hdev->hpd_lock));
+	} else {
+		pr_info(SYS "irq %x %x\n", dat_top, dat_dwc);
+	}
 
 	if (hdev->hpd_lock == 1) {
 		pr_info(HW "HDMI hpd locked\n");
@@ -4370,6 +4388,9 @@ static int hdmitx_cntl_misc(struct hdmitx_dev *hdev, unsigned int cmd,
 	case MISC_HPD_GPI_ST:
 		return hdmitx_hpd_hw_op(HPD_READ_HPD_GPIO);
 	case MISC_TRIGGER_HPD:
+		if (hdev->chip_type == MESON_CPU_ID_G12B)
+			pr_info(SYS "hpd-sw-trigger level=%u caller=%pS\n",
+				argv == 1, (void *)_RET_IP_);
 		if (argv == 1)
 			hdmitx_wr_reg(HDMITX_TOP_INTR_STAT, 1 << 1);
 		else
