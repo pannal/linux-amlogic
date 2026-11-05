@@ -1496,9 +1496,13 @@ static int aml_dai_tdm_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_restore(p_tdm->fddr, runtime->dma_addr,
+				runtime->dma_bytes, frames_to_bytes(runtime, 1));
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 
 		if ((substream->stream == SNDRV_PCM_STREAM_CAPTURE) &&
 		    vad_tdm_is_running(p_tdm->id) &&
@@ -1558,9 +1562,12 @@ static int aml_dai_tdm_trigger(struct snd_pcm_substream *substream, int cmd,
 				substream->stream, p_tdm->id, true);
 		}
 		break;
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_save(p_tdm->fddr);
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		if ((substream->stream == SNDRV_PCM_STREAM_CAPTURE) &&
 		    vad_tdm_is_running(p_tdm->id) &&
 		    pm_audio_is_suspend()) {
