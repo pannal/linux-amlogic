@@ -1,0 +1,37 @@
+What:           /sys/class/amhdmitx/amhdmitx0/phy_inhibit
+Date:           October 2026
+Contact:        CoreELEC maintainers
+Description:
+                Persistent HDMI PHY output inhibition in the non-DRM HDMI 2.0
+                driver. Read returns 0 or 1. Write accepts exactly 0 or 1, with
+                an optional trailing newline. Initially 0.
+
+                Writing 1 synchronously disables the PHY and prevents queued
+                hotplug work, modesets, direct phy requests, receiver-sense
+                probes, and resume from enabling it. HPD and EDID processing
+                continue. Writes and PHY enable paths serialize on setclk_mutex.
+                The PRBS diagnostic returns EBUSY while inhibited. Receiver-sense
+                sampling pauses; rxsense_state reads 0 during inhibition.
+
+                The existing SM1, TM2, and SC2 HPD interrupt handlers may still
+                set PHY bandgap bias while inhibited. This is not a full PHY
+                enable sequence; inhibition does not promise zero bias power.
+
+                Writing 0 clears the inhibit. If hpd_state and ready are both 1
+                and cur_VIC is known, the driver restores the programmed
+                transport's SCDC and TX scrambling before enabling the PHY.
+                Otherwise output stays off until a later ordinary modeset.
+                Repeated writes of the same state are no-ops. Invalid input
+                returns EINVAL.
+
+                Switching to null or a non-HDMI output clears ready and
+                cur_VIC under setclk_mutex. Consequently disp_mode reports
+                VIC:0, and release cannot restore a disabled transport until
+                an ordinary modeset establishes valid state again.
+
+                This control does not select a resolution, validate sink video
+                compatibility, or guarantee that the display has a picture.
+                In particular, it does not recover an applied timing/format
+                that becomes unsupported after a display capability change.
+                Userspace must release the inhibit during exit and system sleep;
+                a service supervisor should also release it after abnormal exit.

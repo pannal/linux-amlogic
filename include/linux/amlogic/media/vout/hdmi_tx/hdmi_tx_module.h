@@ -510,6 +510,8 @@ struct hdmitx_dev {
 	spinlock_t edid_spinlock; /* edid hdr/dv cap lock */
 	struct st_debug_param debug_param;
 	unsigned int cec_func_config;
+	/* Protected by setclk_mutex in the non-DRM driver. Keep existing offsets. */
+	bool phy_inhibit;
 };
 
 #define CMD_DDC_OFFSET          (0x10 << 24)
@@ -777,6 +779,7 @@ void __attribute__((weak))rx_set_receive_hdcp(unsigned char *data, int len,
 {
 }
 
+void hdmitx_restore_phy(struct hdmitx_dev *hdev);
 extern int hdmitx_set_display(struct hdmitx_dev *hdmitx_device,
 	enum hdmi_vic VideoCode);
 
