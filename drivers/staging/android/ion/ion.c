@@ -37,6 +37,7 @@
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
 #include <linux/idr.h>
+#include <linux/moduleparam.h>
 
 #ifdef CONFIG_ARM64
 #include <asm/cacheflush.h>
@@ -862,6 +863,19 @@ static void ion_unmap_dma_buf(struct dma_buf_attachment *attachment,
 			      enum dma_data_direction direction)
 {
 }
+
+#ifdef CONFIG_ARM64
+/*
+ * Read-only marker for user space: device-less page syncs below clean and
+ * invalidate the cached linear alias. Without this, GPU users of ION
+ * buffers on arm64 cannot tell whether dirty cache lines may later
+ * overwrite their writes.
+ */
+static bool arm64_deviceless_sync = true;
+module_param(arm64_deviceless_sync, bool, 0444);
+MODULE_PARM_DESC(arm64_deviceless_sync,
+		 "Device-less page syncs clean and invalidate the arm64 cache");
+#endif
 
 void ion_pages_sync_for_device(struct device *dev, struct page *page,
 			       size_t size, enum dma_data_direction dir)
