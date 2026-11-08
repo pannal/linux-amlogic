@@ -646,9 +646,15 @@ static int extn_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	enum toddr_src src = toddr_src_get();
 
 	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_restore(p_extn->fddr,
+				substream->runtime->dma_addr,
+				substream->runtime->dma_bytes,
+				frames_to_bytes(substream->runtime, 1));
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			dev_info(substream->pcm->card->dev, "External Playback enable\n");
 
@@ -665,9 +671,12 @@ static int extn_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 			aml_toddr_enable(p_extn->tddr, true);
 		}
 		break;
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_save(p_extn->fddr);
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			dev_info(substream->pcm->card->dev, "External Playback disable\n");
 

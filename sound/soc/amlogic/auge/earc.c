@@ -887,9 +887,15 @@ static int earc_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct earc *p_earc = snd_soc_dai_get_drvdata(cpu_dai);
 
 	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_restore(p_earc->fddr,
+				substream->runtime->dma_addr,
+				substream->runtime->dma_bytes,
+				frames_to_bytes(substream->runtime, 1));
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			dev_info(substream->pcm->card->dev, "eARC/ARC TX enable\n");
 
@@ -908,9 +914,12 @@ static int earc_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 				      true);
 		}
 		break;
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			aml_frddr_pause_save(p_earc->fddr);
+		/* fall through */
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			dev_info(substream->pcm->card->dev, "eARC/ARC TX disable\n");
 
