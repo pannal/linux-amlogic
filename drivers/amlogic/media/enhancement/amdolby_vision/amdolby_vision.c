@@ -82,6 +82,16 @@ static bool xbmc_dv_l11_vsif = true;
 static u32 dv_new_blob_max_hz = 60;
 static bool xbmc_dv_source_native;
 static bool xbmc_dv_new_sdr_route;
+/* VS10 SDR for every source: SDR, HDR10, HLG, HDR10+ and converted DV
+ * (generated RPU) also go to the newer library when the output is SDR,
+ * as the 5.15 driver does with the same library. */
+static bool xbmc_dv_new_vs10_route;
+/* VS10 ->SDR on the newer library: declare a 0-nit source black. Dolby DM maps
+ * the declared source black to the target black, so HDR10's mastering min
+ * (typically 0.005 nit) and the L1 min Kodi derives from it for the HDR10+ ->
+ * DV conversion crush the steps below ~0.02 nit, where native DV (L1 min 0)
+ * keeps them. Only the bottom of the core1 curve moves. */
+static bool xbmc_dv_new_src_black0;
 /* The newer library does no display management for SDR output in video
  * priority (identity core1 tone curve, everything above 100 nits clips);
  * in graphics priority it tone-maps to the metadata like the 5.15 driver,
@@ -116,6 +126,10 @@ module_param(dv_new_blob_max_hz, uint, 0664);
 module_param(xbmc_dv_source_native, bool, 0664);
 module_param(xbmc_dv_new_sdr_route, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_new_sdr_route, "Experimental: also permit the newer backend for native DV to SDR output");
+module_param(xbmc_dv_new_vs10_route, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_vs10_route, "Experimental: newer backend for every source to SDR output (needs xbmc_dv_new_sdr_route)");
+module_param(xbmc_dv_new_src_black0, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_src_black0, "Newer backend, to SDR: 0-nit source black for HDR10 (mastering min) and converted HDR10+ (L1 min)");
 module_param(xbmc_dv_new_sdr_gpr, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_new_sdr_gpr, "Run the newer backend in graphics priority for SDR output");
 module_param(dv_new_backend_available, uint, 0444);
@@ -1248,6 +1262,11 @@ static bool need_skip_cvm(unsigned int is_graphic)
 {
 	if (dolby_vision_flags & FLAG_CERTIFICAION) return false;
 	if (dolby_vision_flags & FLAG_FORCE_CVM) return false;
+	/* The newer library builds the core1 matrices around its own LUTs (SDR
+	 * read as ~300 nits, mapped back to 100): skipping CVM there keeps the
+	 * matrices but drops the mapping and over-exposes SDR->SDR. The skip only
+	 * suits the original library, whose SDR->SDR LUTs are identity. */
+	if (!is_graphic && dv_pending_new) return false;
 
 	return skip_cvm_tbl[is_graphic]
 		[dolby_vision_graphics_priority]
@@ -6697,7 +6716,7 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 
 	if (drop_flag) {
 		if (dv_new_route(src_format, dv_mode_dst_format(), vinfo))
-			dv_prepare_new(&req, true, false);
+			dv_prepare_new(&req, true, false, src_format);
 		pr_dolby_dbg("drop frame_count %d\n", frame_count);
 		return 1;
 	}
@@ -6878,8 +6897,13 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 		destroy_context();
 	}
 
-	use_new = dv_new_route(src_format, dst_format, vinfo);
-	if (use_new && !dv_prepare_new(&req, false, toggle_mode == 2)) {
+	/* Graphics-only processing (no vf: GUI, or before the first frame of a
+	 * playback) has no video size, which the newer library rejects (-EINVAL).
+	 * Keep it on legacy instead of marking the newer backend failed: that
+	 * flag clears only on the next provider change, so one such call after
+	 * playback start ran the whole playback on legacy. */
+	use_new = video_frame && dv_new_route(src_format, dst_format, vinfo);
+	if (use_new && !dv_prepare_new(&req, false, toggle_mode == 2, src_format)) {
 		dv_new_runtime_failed = true;
 		dv_retire_new();
 		use_new = false;
@@ -7186,7 +7210,11 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 		 * HDR10 stream - so SET the assumed peak deterministically;
 		 * best-effort, the library may assume the nominal 1000-nit
 		 * HLG peak and ignore it. */
-		if (xbmc_dv_sdr_src_max_nits && (dst_format == FORMAT_SDR) &&
+		/* Legacy only: the newer library already tone-maps to the real
+		 * statics (= the 5.15 curve); the cap pushes its curve past
+		 * SDR white and clips the highlights. DV skips it the same way
+		 * (the boost edits md_buf, never dv_new_md). */
+		if (!use_new && xbmc_dv_sdr_src_max_nits && (dst_format == FORMAT_SDR) &&
 		    ((src_format == FORMAT_HDR10) || (src_format == FORMAT_HLG))) {
 			u32 nits = sdr_src_boost_nits(src_format == FORMAT_HLG ?
 				0 : hdr10_param_use.max_content_light_level);
@@ -7211,6 +7239,18 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 					    hdr10_param_use.max_frame_avg_light_level > nits)
 						hdr10_param_use.max_frame_avg_light_level = nits;
 				}
+			}
+		}
+
+		if (use_new && xbmc_dv_new_src_black0 && (dst_format == FORMAT_SDR)) {
+			if (src_format == FORMAT_HDR10)
+				hdr10_param_use.min_display_mastering_lum = 0;
+			else if ((src_format == FORMAT_DOVI) &&
+				 !READ_ONCE(xbmc_dv_source_native)) {
+				int old = dv_new_zero_l1_min(dv_new_md, dv_new_md_size);
+
+				if (debug_dolby & 4)
+					pr_info("DOLBY: src_black0 L1 min %d -> 0\n", old);
 			}
 		}
 
