@@ -210,5 +210,8 @@ int parse_sei_and_meta_ext(
 	char *md_buf,
 	char *comp_buf);
 void dolby_vision_clear_buf(void);
+/* cb1: per-picture L1 (12-bit PQ codes) from the decoder, keyed by vf->pts */
+void dv_cb1_put_l1(u32 pts, u16 min, u16 avg, u16 max);
+void dv_cb1_flush(void);
 
 #endif

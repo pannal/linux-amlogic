@@ -154,6 +154,161 @@ MODULE_PARM_DESC(dv_new_blob_enable, "Permit the newer backend for eligible nati
 MODULE_PARM_DESC(dv_new_blob_max_hz, "Maximum newer-backend output refresh; default and max 60 Hz");
 MODULE_PARM_DESC(xbmc_dv_source_native, "Kodi source provenance: false for generated/converted RPU");
 
+/*
+ * cb1: per-picture L1 computed ahead of display by the HEVC decoder (vh265
+ * cb1_meas, temporal per-shot L1 with ~0.4-1 s of lookahead), keyed by the
+ * 90 kHz vf->pts. The table lives here (built in) so the decoder module only
+ * calls in: a decoder that never calls dv_cb1_put_l1() leaves this inert.
+ * Read when a converted RPU (static L1) is parsed for SDR output on the newer
+ * library; no entry for the pts = keep the last L1 for up to xbmc_dv_cb1_hold_ms
+ * of pts (end of file: the decoder has no lookahead left), else the RPU's own
+ * static L1 (start, seek). Writers: decoder thread; reader: vsync irq.
+ */
+#define DV_CB1_SLOTS 64
+struct dv_cb1_l1 {
+	u32 pts;
+	u16 min, avg, max;
+	bool valid;
+};
+static struct dv_cb1_l1 dv_cb1_ring[DV_CB1_SLOTS];
+static struct dv_cb1_l1 dv_cb1_last;
+static u32 dv_cb1_head;
+static DEFINE_SPINLOCK(dv_cb1_lock);
+static bool xbmc_dv_cb1_l1;
+static uint xbmc_dv_cb1_hold_ms = 2000;
+static uint dv_cb1_puts, dv_cb1_hits, dv_cb1_holds, dv_cb1_misses;
+/* Last lookup gave a per-picture L1 (hit or hold); cleared by a flush or a
+ * write of xbmc_dv_cb1_l1, so a new playback starts as not active. */
+static bool dv_cb1_used;
+
+static int dv_cb1_l1_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	WRITE_ONCE(dv_cb1_used, false);
+	return ret;
+}
+
+static const struct kernel_param_ops dv_cb1_l1_ops = {
+	.set = dv_cb1_l1_set,
+	.get = param_get_bool,
+};
+
+/* Read-only: Y while the per-picture L1 reaches the converted RPU (for the player). */
+static int dv_cb1_active_get(char *buffer, const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%c\n",
+		       READ_ONCE(xbmc_dv_cb1_l1) && READ_ONCE(dv_cb1_used) ?
+		       'Y' : 'N');
+}
+
+static const struct kernel_param_ops dv_cb1_active_ops = {
+	.get = dv_cb1_active_get,
+};
+module_param_cb(dv_cb1_active, &dv_cb1_active_ops, NULL, 0444);
+
+/*
+ * Read-only: the per-picture L1 last applied, "min max avg" in 12-bit PQ, or
+ * "-" while none is (the player then shows the RPU's own static L1).
+ */
+static int dv_cb1_l1_cur_get(char *buffer, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	struct dv_cb1_l1 l;
+	bool used;
+
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	l = dv_cb1_last;
+	used = dv_cb1_used;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+	if (!READ_ONCE(xbmc_dv_cb1_l1) || !used || !l.valid)
+		return sprintf(buffer, "-\n");
+	return sprintf(buffer, "%u %u %u\n", l.min, l.max, l.avg);
+}
+
+static const struct kernel_param_ops dv_cb1_l1_cur_ops = {
+	.get = dv_cb1_l1_cur_get,
+};
+module_param_cb(dv_cb1_l1_cur, &dv_cb1_l1_cur_ops, NULL, 0444);
+MODULE_PARM_DESC(dv_cb1_active, "cb1: Y while the decoder's per-picture L1 is used");
+module_param_cb(xbmc_dv_cb1_l1, &dv_cb1_l1_ops, &xbmc_dv_cb1_l1, 0664);
+MODULE_PARM_DESC(xbmc_dv_cb1_l1, "Newer backend, converted DV to SDR: replace the static L1 by the decoder's per-picture L1 (cb1)");
+module_param(xbmc_dv_cb1_hold_ms, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_cb1_hold_ms, "cb1: keep the last L1 this long (pts) when a picture has none, then the static L1");
+module_param(dv_cb1_puts, uint, 0444);
+module_param(dv_cb1_hits, uint, 0444);
+module_param(dv_cb1_holds, uint, 0444);
+module_param(dv_cb1_misses, uint, 0444);
+
+void dv_cb1_put_l1(u32 pts, u16 min, u16 avg, u16 max)
+{
+	struct dv_cb1_l1 *e;
+	unsigned long flags;
+
+	if (!pts || max > 4095 || min > avg || avg > max)
+		return;
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	e = &dv_cb1_ring[dv_cb1_head++ % DV_CB1_SLOTS];
+	e->pts = pts;
+	e->min = min;
+	e->avg = avg;
+	e->max = max;
+	e->valid = true;
+	dv_cb1_puts++;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+}
+EXPORT_SYMBOL(dv_cb1_put_l1);
+
+/* Decoder reset (seek, pts going back, release): forget every entry. */
+void dv_cb1_flush(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	memset(dv_cb1_ring, 0, sizeof(dv_cb1_ring));
+	dv_cb1_last.valid = false;
+	dv_cb1_used = false;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+}
+EXPORT_SYMBOL(dv_cb1_flush);
+
+/* 1 = entry for pts, 2 = held last L1, 0 = none (keep the static L1). */
+static int dv_cb1_get_l1(u32 pts, struct dv_cb1_l1 *out)
+{
+	unsigned long flags;
+	int i, ret = 0;
+	u32 hold = READ_ONCE(xbmc_dv_cb1_hold_ms) * 90;
+
+	if (!pts)
+		return 0;
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	for (i = 1; i <= DV_CB1_SLOTS; i++) {
+		struct dv_cb1_l1 *e =
+			&dv_cb1_ring[(dv_cb1_head - i) % DV_CB1_SLOTS];
+
+		if (e->valid && e->pts == pts) {
+			*out = *e;
+			dv_cb1_last = *e;
+			ret = 1;
+			break;
+		}
+	}
+	if (!ret && dv_cb1_last.valid && pts > dv_cb1_last.pts &&
+	    pts - dv_cb1_last.pts <= hold) {
+		*out = dv_cb1_last;
+		ret = 2;
+	}
+	dv_cb1_used = ret != 0;
+	if (ret == 1)
+		dv_cb1_hits++;
+	else if (ret == 2)
+		dv_cb1_holds++;
+	else
+		dv_cb1_misses++;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+	return ret;
+}
+
 
 /* Module registration is sleepable. Wait for the whole producer/presenter
  * transaction, including metadata forwarding and pending/applied publication;
@@ -7266,6 +7421,26 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 				meas = clamp_t(u32, meas, 100, 10000) * 10000;
 				hdr10_param_use.max_display_mastering_lum =
 					min_t(u32, hdr10_param.max_display_mastering_lum, meas);
+			}
+		}
+
+		/* before src_black0, which may zero the min set here */
+		if (use_new && READ_ONCE(xbmc_dv_cb1_l1) && vf &&
+		    (dst_format == FORMAT_SDR) && (src_format == FORMAT_DOVI) &&
+		    !READ_ONCE(xbmc_dv_source_native)) {
+			struct dv_cb1_l1 l1;
+			int got = dv_cb1_get_l1(vf->pts, &l1);
+
+			if (got) {
+				int old = dv_new_set_l1(dv_new_md, dv_new_md_size,
+							l1.min, l1.avg, l1.max);
+
+				if (debug_dolby & 4)
+					pr_info("DOLBY: cb1 pts %u %s l1 %u %u %u (max was %d)\n",
+						vf->pts, got == 1 ? "hit" : "hold",
+						l1.min, l1.avg, l1.max, old);
+			} else if (debug_dolby & 4) {
+				pr_info("DOLBY: cb1 pts %u static\n", vf->pts);
 			}
 		}
 

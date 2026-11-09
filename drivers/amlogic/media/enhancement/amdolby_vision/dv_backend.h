@@ -152,6 +152,34 @@ static int dv_new_zero_l1_min(char *md, int size)
 	return old;
 }
 
+/* Overwrite min/max/avg_pq in every L1 block (same layout as above). Returns
+ * the old max_pq of the first L1 block, -1 when there is none. */
+static int dv_new_set_l1(char *md, int size, u16 min, u16 avg, u16 max)
+{
+	u8 *p, *end;
+	int old = -1;
+
+	if (size < ETSI_META_OFFSET || size > DV5_MD_CAPACITY)
+		return old;
+	p = (u8 *)md + ETSI_META_OFFSET;
+	end = (u8 *)md + size;
+	while (end - p >= 5) {
+		u32 len = get_unaligned_be32(p);
+
+		if (len > end - p - 5)
+			return old;
+		if (p[4] == 1 && len >= 6) {
+			if (old < 0)
+				old = get_unaligned_be16(p + 7);
+			put_unaligned_be16(min, p + 5);
+			put_unaligned_be16(max, p + 7);
+			put_unaligned_be16(avg, p + 9);
+		}
+		p += len + 5;
+	}
+	return old;
+}
+
 /* Insert a 100-nit L2 trim when the metadata has none: no L2 for target 2081
  * and no CMv4.0 L8. Same values as Kodi's HDR10 static RPU, the median 100-nit
  * trim of graded titles (slope 1680, offset 2020, power 1475, chroma/saturation/
