@@ -20,6 +20,7 @@
 #include <linux/amlogic/media/frame_provider/tvin/tvin.h>
 #include <linux/amlogic/media/vpu/vpu.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
@@ -2762,6 +2763,21 @@ void vdin_set_vframe_prop_info(struct vframe_s *vf,
 			BLKBAR_LEFT_POS_BIT, BLKBAR_LEFT_POS_WID);
 	bbar.right      = rd_bits(offset, VDIN_BLKBAR_STATUS1,
 			BLKBAR_RIGHT_POS_BIT, BLKBAR_RIGHT_POS_WID);
+	if (READ_ONCE(devp->report_active_area) &&
+	    devp->parm.port == TVIN_PORT_VIU1_WB0_VD1 &&
+	    rd_bits(offset, VDIN_BLKBAR_STATUS0,
+		    BLKBAR_DET_DONE_BIT, BLKBAR_DET_DONE_WID)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&devp->hist_lock, flags);
+		devp->active_area.stamp = jiffies;
+		devp->active_area.width = vf->width;
+		devp->active_area.height = vf->height;
+		devp->active_area.bounds = bbar;
+		devp->active_area.luma_min = vf->prop.hist.luma_min;
+		devp->active_area.luma_max = vf->prop.hist.luma_max;
+		spin_unlock_irqrestore(&devp->hist_lock, flags);
+	}
 	if (bbar.top > bbar.bottom) {
 		bbar.top = 0;
 		bbar.bottom = vf->height - 1;

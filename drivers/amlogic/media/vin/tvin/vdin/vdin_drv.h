@@ -430,6 +430,15 @@ struct vdin_event_info {
 	u32 event_sts;
 };
 
+struct vdin_active_area {
+	unsigned long stamp;
+	u32 width;
+	u32 height;
+	struct vframe_bbar_s bounds;
+	u8 luma_min;
+	u8 luma_max;
+};
+
 struct vdin_dev_s {
 	struct cdev cdev;
 	struct device *dev;
@@ -456,6 +465,8 @@ struct vdin_dev_s {
 	struct timer_list timer;
 	spinlock_t isr_lock;
 	spinlock_t hist_lock;
+	struct vdin_active_area active_area;
+	bool report_active_area;
 	struct mutex fe_lock;
 	struct clk *msr_clk;
 	unsigned int msr_clk_val;

@@ -58,6 +58,7 @@
 #include <linux/amlogic/media/frame_sync/timestamp.h>
 #include <linux/amlogic/media/frame_sync/tsync.h>
 #include <linux/amlogic/media/frame_provider/tvin/tvin_v4l2.h>
+#include <linux/amlogic/media/vout/vout_notify.h>
 
 /* Local Headers */
 #include "../tvin_global.h"
@@ -83,6 +84,11 @@
 #define PROVIDER_NAME		"vdin"
 
 #define VDIN_DV_NAME		"dv_vdin"
+
+/* Opt in while validating the video-only loopback on G12B. */
+static bool p3i_active_area;
+module_param(p3i_active_area, bool, 0400);
+MODULE_PARM_DESC(p3i_active_area, "Enable the p3i VDIN1 active-area interface");
 
 #define VDIN_PUT_INTERVAL (HZ/100)   /* 10ms, #define HZ 100 */
 
@@ -670,6 +676,13 @@ void vdin_start_dec(struct vdin_dev_s *devp)
 
 	vdin_get_format_convert(devp);
 	devp->curr_wr_vfe = NULL;
+	if (READ_ONCE(devp->report_active_area)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&devp->hist_lock, flags);
+		devp->active_area.width = 0;
+		spin_unlock_irqrestore(&devp->hist_lock, flags);
+	}
 	devp->frame_drop_num = 0;
 	devp->vfp->skip_vf_num = devp->prop.skip_vf_num;
 	if (devp->vfp->skip_vf_num >= VDIN_CANVAS_MAX_CNT)
@@ -3816,6 +3829,41 @@ static ssize_t vdin_param_store(struct device *dev,
 
 static DEVICE_ATTR(param, 0644, vdin_param_show, vdin_param_store);
 
+/* Read-only, versioned sample from an already running video-only session. */
+static ssize_t active_area_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct vdin_dev_s *devp = dev_get_drvdata(dev);
+	struct vdin_active_area sample;
+	const struct vinfo_s *vinfo;
+	unsigned long flags;
+
+	mutex_lock(&devp->fe_lock);
+	if (!(devp->flags & VDIN_FLAG_DEC_STARTED) ||
+	    devp->parm.port != TVIN_PORT_VIU1_WB0_VD1 ||
+	    READ_ONCE(devp->matrix_pattern_mode) ||
+	    (unsigned int)READ_ONCE(devp->vd1_fmt) > SIGNAL_HDR10PLUS) {
+		mutex_unlock(&devp->fe_lock);
+		return -ENODATA;
+	}
+	spin_lock_irqsave(&devp->hist_lock, flags);
+	sample = devp->active_area;
+	spin_unlock_irqrestore(&devp->hist_lock, flags);
+	mutex_unlock(&devp->fe_lock);
+
+	vinfo = get_current_vinfo();
+	if (!vinfo || !sample.width || sample.width != vinfo->width ||
+	    sample.height != vinfo->height || vinfo->height != vinfo->field_height ||
+	    time_after(jiffies, sample.stamp + HZ / 2))
+		return -ENODATA;
+
+	return sprintf(buf, "1 %lu %u %u %u %u %u %u %u %u\n", sample.stamp,
+		       sample.width, sample.height, sample.bounds.top,
+		       sample.bounds.bottom, sample.bounds.left, sample.bounds.right,
+		       sample.luma_min, sample.luma_max);
+}
+static DEVICE_ATTR_RO(active_area);
+
 int vdin_create_dev_class_files(struct device *dev)
 {
 	int ret = 0;
@@ -4424,6 +4472,12 @@ static int vdin_drv_probe(struct platform_device *pdev)
 
 	if (vdevp->index)
 		vd_signal_register_client(&vdin_signal_notifier);
+	if (p3i_active_area && vdevp->index == 1 && is_meson_g12b_cpu()) {
+		if (device_create_file(vdevp->dev, &dev_attr_active_area))
+			dev_warn(vdevp->dev, "cannot expose active_area\n");
+		else
+			WRITE_ONCE(vdevp->report_active_area, true);
+	}
 
 	pr_info("%s: driver initialized ok\n", __func__);
 	return 0;
@@ -4452,6 +4506,8 @@ static int vdin_drv_remove(struct platform_device *pdev)
 
 	struct vdin_dev_s *vdevp;
 	vdevp = platform_get_drvdata(pdev);
+	if (vdevp->report_active_area)
+		device_remove_file(vdevp->dev, &dev_attr_active_area);
 
 	ret = cancel_delayed_work(&vdevp->vlock_dwork);
 	ret = cancel_delayed_work(&vdevp->event_dwork);
