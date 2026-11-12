@@ -76,6 +76,7 @@
 
 #include "osd_hw.h"
 #include "osd_hw_def.h"
+#include "osd_rdma.h"
 #include "osd_fb.h"
 #include "osd_sw_sync.h"
 
@@ -110,6 +111,11 @@ static DECLARE_WAIT_QUEUE_HEAD(osd_rdma_vpp0_done_wq);
 static DECLARE_WAIT_QUEUE_HEAD(osd_rdma_vpp1_done_wq);
 
 static bool vsync_hit[VIU_COUNT];
+/* Counts the vsyncs whose register writes have been applied (with RDMA, the
+ * table's done interrupts).
+ */
+static u32 osd_rdma_done_seq[VIU_COUNT];
+static unsigned long osd_rdma_done_jiffies[VIU_COUNT];
 static bool osd_update_window_axis;
 static int osd_afbc_dec_enable;
 static int ext_canvas_id[HW_OSD_COUNT];
@@ -1748,13 +1754,13 @@ static inline void wait_vsync_wakeup_viu2(void)
 static inline void wait_rdma_done_wakeup(void)
 {
 	vsync_hit[VIU1] = true;
-	wake_up_interruptible_all(&osd_rdma_vpp0_done_wq);
+	wake_up_all(&osd_rdma_vpp0_done_wq);
 }
 
 static inline void wait_rdma_done_wakeup_viu2(void)
 {
 	vsync_hit[VIU2] = true;
-	wake_up_interruptible_all(&osd_rdma_vpp1_done_wq);
+	wake_up_all(&osd_rdma_vpp1_done_wq);
 }
 
 static s64 get_adjust_vsynctime(u32 output_index)
@@ -1833,6 +1839,9 @@ void osd_update_vsync_timestamp_viu2(void)
 
 void osd_update_vsync_hit(void)
 {
+	/* Counted here, not in the wakeups at suspend and shutdown. */
+	WRITE_ONCE(osd_rdma_done_jiffies[VIU1], jiffies);
+	WRITE_ONCE(osd_rdma_done_seq[VIU1], osd_rdma_done_seq[VIU1] + 1);
 #ifdef FIQ_VSYNC
 	fiq_bridge_pulse_trigger(&osd_hw.fiq_handle_item);
 #else
@@ -1842,6 +1851,8 @@ void osd_update_vsync_hit(void)
 
 void osd_update_vsync_hit_viu2(void)
 {
+	WRITE_ONCE(osd_rdma_done_jiffies[VIU2], jiffies);
+	WRITE_ONCE(osd_rdma_done_seq[VIU2], osd_rdma_done_seq[VIU2] + 1);
 #ifdef FIQ_VSYNC
 	fiq_bridge_pulse_trigger(&osd_hw.fiq_handle_item);
 #else
@@ -2608,6 +2619,8 @@ static void check_reg_changed(void)
 		reg_value_pre[i] = reg_value[i];
 }
 
+static void osd_afbc_scanout_rdma_check(void);
+
 #ifdef FIQ_VSYNC
 static irqreturn_t vsync_isr(int irq, void *dev_id)
 {
@@ -2640,6 +2653,7 @@ static irqreturn_t vsync_isr(int irq, void *dev_id)
 	} else {
 		osd_update_vsync_timestamp();
 		osd_rdma_interrupt_done_clear();
+		osd_afbc_scanout_rdma_check();
 	}
 	if (osd_hw.osd_reg_check)
 		check_reg_changed();
@@ -2695,6 +2709,344 @@ u32 osd_get_afbc(u32 index)
 	else
 		afbc_type = 0;
 	return afbc_type;
+}
+
+/* AFBC scanout session: one complete Mali AFBC frame per flip, decoded by the
+ * VPU's Mali AFBC decoder instead of read as a linear canvas. The linear
+ * framebuffer stays configured underneath: pans requested while a session is
+ * shown are recorded and applied in the vsync that ends it.
+ */
+static struct {
+	bool active;
+	bool used;	/* has flipped since the driver started */
+	bool disable_on_pan;
+	u32 change_seq;	/* see osd_afbc_scanout_change_seq() */
+	/* Transparent until its next frame, the global alpha saved meanwhile:
+	 * the linear framebuffer underneath is stale (see osd_afbc_scanout_hide).
+	 */
+	bool hidden;
+	u32 alpha;
+	u32 xoffset;
+	u32 yoffset;
+	u32 pan_w;
+	u32 pan_h;
+	u32 reverse;
+	const struct color_bit_define_s *color;
+} osd_afbc_scanout[HW_OSD_COUNT];
+
+/* An RDMA restart drops the table and the plane writes queued in it, while the
+ * done interrupts that follow still count vsyncs. Each drop starts a new
+ * generation (osd_rdma_reset_count). Once a session has used the plane, no
+ * change counts as on screen until the plane's state has been queued again
+ * for the current generation (osd_afbc_scanout_replay), and changes count
+ * from the vsync that carries that replay.
+ */
+static u32 osd_afbc_scanout_resets;	/* the last generation the vsync saw */
+static u32 osd_afbc_scanout_replayed;	/* the generation last replayed */
+static u32 osd_afbc_scanout_replay_seq;
+static void osd_afbc_scanout_apply(u32 index);
+static void osd_afbc_scanout_replay(struct work_struct *work);
+static DECLARE_WORK(osd_afbc_scanout_replay_work, osd_afbc_scanout_replay);
+
+bool osd_afbc_scanout_active(u32 index)
+{
+	return index < HW_OSD_COUNT && osd_afbc_scanout[index].active;
+}
+
+/* Caller holds osd_lock. */
+static void osd_afbc_scanout_set_hidden(u32 index, bool hidden)
+{
+	if (osd_afbc_scanout[index].hidden == hidden)
+		return;
+	osd_afbc_scanout[index].hidden = hidden;
+	if (hidden) {
+		osd_afbc_scanout[index].alpha = osd_hw.gbl_alpha[index];
+		osd_hw.gbl_alpha[index] = 0;
+	} else {
+		osd_hw.gbl_alpha[index] = osd_afbc_scanout[index].alpha;
+	}
+	osd_hw.reg[OSD_GBL_ALPHA].update_func(index);
+}
+
+/* A mode set or the session's end returned the plane to the linear
+ * framebuffer, which holds whatever was drawn before the session, in a
+ * geometry that may no longer match. Keep the plane transparent until it
+ * gets a frame: a flip, a linear pan, or a mode set by a new client.
+ */
+void osd_afbc_scanout_hide(u32 index)
+{
+	if (index >= HW_OSD_COUNT)
+		return;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	osd_afbc_scanout_set_hidden(index, true);
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+}
+
+void osd_afbc_scanout_unhide(u32 index)
+{
+	if (index >= HW_OSD_COUNT)
+		return;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	osd_afbc_scanout_set_hidden(index, false);
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+}
+
+static u32 osd_afbc_scanout_seq_now(u32 index)
+{
+	return READ_ONCE(osd_rdma_done_seq[get_output_device_id(index)]);
+}
+
+/* Caller holds osd_lock and has just queued the plane's writes. Returns the
+ * applied-vsync count after which the next applied vsync carries them: one
+ * more while a table that may lack them is still to be counted. The status
+ * is read before the count, so an interrupt handled in between only makes
+ * the result later. Without RDMA, count one vsync more.
+ */
+static u32 osd_afbc_scanout_seq_queued(u32 index)
+{
+	u32 late = osd_hw.hw_rdma_en ? osd_rdma_table_pending() : 1;
+
+	rmb(); /* the count is read after the status */
+	return osd_afbc_scanout_seq_now(index) + late;
+}
+
+/* A vsync was counted within the last @ms: the display is scanning out, not
+ * off or between modes.
+ */
+bool osd_afbc_scanout_scanning(u32 index, u32 ms)
+{
+	unsigned long last =
+		READ_ONCE(osd_rdma_done_jiffies[get_output_device_id(index)]);
+
+	return READ_ONCE(osd_rdma_done_seq[get_output_device_id(index)]) &&
+		time_before(jiffies, last + msecs_to_jiffies(ms));
+}
+
+/* The applied-vsync count after which the next applied vsync carries the
+ * last flip or disable of the plane.
+ */
+u32 osd_afbc_scanout_change_seq(u32 index)
+{
+	u32 seq;
+
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	seq = osd_afbc_scanout[index].change_seq;
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+	return seq;
+}
+
+/* At least @count vsyncs have applied their writes since @seq. One means a
+ * change recorded at @seq is on screen.
+ */
+bool osd_afbc_scanout_settled(u32 index, u32 seq, u32 count)
+{
+	u32 gen = osd_rdma_reset_count();
+	u32 replay;
+	bool settled;
+
+	/* Read like a seqlock: a generation that changes while the counts are
+	 * read may have dropped the change they would certify.
+	 */
+	smp_rmb();
+	if (READ_ONCE(osd_afbc_scanout[OSD1].used) &&
+	    READ_ONCE(osd_afbc_scanout_replayed) != gen)
+		return false;
+	smp_rmb(); /* the replay's count is read after its generation */
+	replay = READ_ONCE(osd_afbc_scanout_replay_seq);
+	if ((s32)(replay - seq) > 0)
+		seq = replay;
+	settled = (s32)(osd_afbc_scanout_seq_now(index) - seq) >= (s32)count;
+	smp_rmb(); /* the generation is read again after the count */
+	return settled && osd_rdma_reset_count() == gen;
+}
+
+/* Vsync interrupt, after a possible RDMA restart: the plane's state is queued
+ * again for the new generation, once a session has used the plane. Queuing it
+ * again is harmless if the dropped table held none of it.
+ */
+static void osd_afbc_scanout_rdma_check(void)
+{
+	u32 resets = osd_rdma_reset_count();
+
+	if (resets == osd_afbc_scanout_resets)
+		return;
+	osd_afbc_scanout_resets = resets;
+	schedule_work(&osd_afbc_scanout_replay_work);
+}
+
+/* Queue the plane's current state again: the buffer shown or the linear
+ * framebuffer, with its global alpha. It covers the generation read before
+ * its writes are queued: a restart after that read leaves the generation
+ * newer than the one recorded, and the vsync schedules another replay.
+ */
+static void osd_afbc_scanout_replay(struct work_struct *work)
+{
+	u32 index = OSD1;
+	u32 gen;
+
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	gen = osd_rdma_reset_count();
+	smp_rmb(); /* the writes below are queued after the generation is read */
+	if (osd_afbc_scanout[index].used) {
+		osd_hw.reg[OSD_GBL_ALPHA].update_func(index);
+		osd_afbc_scanout_apply(index);
+		osd_afbc_scanout[index].change_seq =
+			osd_afbc_scanout_seq_queued(index);
+		WRITE_ONCE(osd_afbc_scanout_replay_seq,
+			   osd_afbc_scanout[index].change_seq);
+		smp_wmb(); /* the count is visible before its generation */
+	}
+	WRITE_ONCE(osd_afbc_scanout_replayed, gen);
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+	pr_info("osd: AFBC scanout plane queued again after an RDMA restart\n");
+	wake_up_all(&osd_rdma_vpp0_done_wq);
+}
+
+/* Not interruptible: callers rely on the plane having left a buffer. */
+int osd_afbc_scanout_wait(u32 index, u32 seq, u32 count, u32 timeout_ms)
+{
+	wait_queue_head_t *wq = get_output_device_id(index) == VIU2 ?
+		&osd_rdma_vpp1_done_wq : &osd_rdma_vpp0_done_wq;
+
+	if (!wait_event_timeout(*wq, osd_afbc_scanout_settled(index, seq, count),
+				msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+	return 0;
+}
+
+/* Caller holds osd_lock. While the display is suspended, writes still go
+ * through the RDMA table, as the stock driver's do, but the plane stays off:
+ * resume enables it and the Mali decoder surface from what is saved here.
+ */
+static void osd_afbc_scanout_apply(u32 index)
+{
+	osd_hw.reg[OSD_COLOR_MODE].update_func(index);
+	osd_hw.reg[DISP_GEOMETRY].update_func(index);
+	osd_hw.reg[DISP_OSD_REVERSE].update_func(index);
+	if (!suspend_flag) {
+		osd_hw.reg[OSD_ENABLE].update_func(index);
+		if (osd_hw.hw_rdma_en)
+			osd_mali_afbc_start();
+		return;
+	}
+	if (osd_hw.osd_afbcd[index].enable) {
+		osd_hw.reg_status_save4 |= 1 << index;
+	} else {
+		osd_hw.reg_status_save4 &= ~(1 << index);
+		osd_hw.osd_afbcd[index].afbc_start = 0;
+	}
+}
+
+int osd_afbc_scanout_flip(u32 index, u32 phy_addr, u32 width, u32 height,
+			  u32 inter_format, u32 reverse)
+{
+	u32 output_index;
+	bool wide = inter_format & SUPER_BLOCK_ASPECT;
+	u32 pad = 0;
+
+	if (index != OSD1 || osd_hw.osd_meson_dev.afbc_type != MALI_AFBC ||
+	    osd_hw.osd_meson_dev.osd_ver != OSD_HIGH_ONE)
+		return -ENODEV;
+	if (!phy_addr || !width || !height || reverse >= REVERSE_MAX)
+		return -EINVAL;
+	output_index = get_output_device_id(index);
+
+	/* The decoder is told every superblock Mali wrote, while the window
+	 * stays on the real pixels. Told 720 columns of 32x8 superblocks, it
+	 * reads 22 per row where Mali wrote 23, and the picture wraps
+	 * sideways. A vertical reverse flips the whole buffer the decoder is
+	 * told about: told 1080 lines of 16x16 superblocks rather than 1088,
+	 * the shown picture starts with the padding rows and sits 8 lines low.
+	 */
+	if (reverse == REVERSE_Y || reverse == REVERSE_TRUE)
+		pad = ALIGN(height, wide ? 8 : 16) - height;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	if (!osd_afbc_scanout[index].active) {
+		osd_afbc_scanout[index].xoffset = osd_hw.pandata[index].x_start;
+		osd_afbc_scanout[index].yoffset = osd_hw.pandata[index].y_start;
+		osd_afbc_scanout[index].pan_w = osd_hw.pandata[index].x_end -
+			osd_hw.pandata[index].x_start;
+		osd_afbc_scanout[index].pan_h = osd_hw.pandata[index].y_end -
+			osd_hw.pandata[index].y_start;
+		osd_afbc_scanout[index].reverse = osd_hw.osd_reverse[index];
+		osd_afbc_scanout[index].color = osd_hw.color_info[index];
+		osd_afbc_scanout[index].active = true;
+		if (!osd_afbc_scanout[index].used) {
+			WRITE_ONCE(osd_afbc_scanout_replayed,
+				   osd_rdma_reset_count());
+			smp_wmb(); /* used is set after the generation */
+			WRITE_ONCE(osd_afbc_scanout[index].used, true);
+		}
+	}
+	osd_afbc_scanout[index].disable_on_pan = false;
+	osd_hw.osd_afbcd[index].enable = ENABLE;
+	osd_hw.osd_afbcd[index].phy_addr = phy_addr;
+	osd_hw.osd_afbcd[index].frame_width = ALIGN(width, wide ? 32 : 16);
+	osd_hw.osd_afbcd[index].frame_height = height + pad;
+	osd_hw.osd_afbcd[index].out_addr_id = index + 1;
+	osd_hw.osd_afbcd[index].format = COLOR_INDEX_32_ABGR;
+	osd_hw.osd_afbcd[index].inter_format = inter_format;
+	osd_hw.color_info[index] =
+		&default_color_format_array[COLOR_INDEX_32_ABGR];
+	osd_hw.osd_reverse[index] = reverse;
+	osd_hw.pandata[index].x_start = 0;
+	osd_hw.pandata[index].x_end = width - 1;
+	osd_hw.pandata[index].y_start = 0;
+	osd_hw.pandata[index].y_end = height - 1;
+	osd_hw.src_data[index].x = 0;
+	osd_hw.src_data[index].y = 0;
+	osd_hw.src_data[index].w = width;
+	osd_hw.src_data[index].h = height;
+	osd_afbc_scanout_set_hidden(index, false);
+	osd_afbc_scanout_apply(index);
+	if (osd_hw.osd_fps_start[output_index])
+		osd_hw.osd_fps[output_index]++;
+	osd_afbc_scanout[index].change_seq = osd_afbc_scanout_seq_queued(index);
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+	return 0;
+}
+
+void osd_afbc_scanout_disable(u32 index)
+{
+	if (index >= HW_OSD_COUNT)
+		return;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	if (!osd_afbc_scanout[index].active) {
+		spin_unlock_irqrestore(&osd_lock, lock_flags);
+		return;
+	}
+	osd_afbc_scanout[index].active = false;
+	osd_afbc_scanout[index].disable_on_pan = false;
+	osd_hw.osd_afbcd[index].enable = DISABLE;
+	osd_hw.osd_afbcd[index].phy_addr = 0;
+	osd_hw.color_info[index] = osd_afbc_scanout[index].color;
+	osd_hw.osd_reverse[index] = osd_afbc_scanout[index].reverse;
+	osd_hw.pandata[index].x_start = osd_afbc_scanout[index].xoffset;
+	osd_hw.pandata[index].x_end = osd_afbc_scanout[index].xoffset +
+		osd_afbc_scanout[index].pan_w;
+	osd_hw.pandata[index].y_start = osd_afbc_scanout[index].yoffset;
+	osd_hw.pandata[index].y_end = osd_afbc_scanout[index].yoffset +
+		osd_afbc_scanout[index].pan_h;
+	osd_hw.src_data[index].x = osd_hw.pandata[index].x_start;
+	osd_hw.src_data[index].y = osd_hw.pandata[index].y_start;
+	osd_hw.src_data[index].w = osd_afbc_scanout[index].pan_w + 1;
+	osd_hw.src_data[index].h = osd_afbc_scanout[index].pan_h + 1;
+	osd_afbc_scanout_apply(index);
+	osd_afbc_scanout[index].change_seq = osd_afbc_scanout_seq_queued(index);
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
+}
+
+/* End the session with the next linear pan, in the same vsync: the caller has
+ * drawn a linear frame and its (asynchronous) swap is still on the way.
+ */
+void osd_afbc_scanout_disable_on_pan(u32 index)
+{
+	if (index >= HW_OSD_COUNT)
+		return;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	if (osd_afbc_scanout[index].active)
+		osd_afbc_scanout[index].disable_on_pan = true;
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
 }
 
 u32 osd_get_reset_status(void)
@@ -2961,6 +3313,13 @@ void  osd_set_gbl_alpha_hw(u32 index, u32 gbl_alpha)
 	/* normalized */
 	if (gbl_alpha == 0xff)
 		gbl_alpha = 0x100;
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	if (osd_afbc_scanout[index].hidden) {
+		osd_afbc_scanout[index].alpha = gbl_alpha;
+		spin_unlock_irqrestore(&osd_lock, lock_flags);
+		return;
+	}
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
 	if (osd_hw.gbl_alpha[index] != gbl_alpha) {
 		osd_hw.gbl_alpha[index] = gbl_alpha;
 		add_to_update_list(index, OSD_GBL_ALPHA);
@@ -5578,6 +5937,21 @@ void osd_pan_display_hw(u32 index, unsigned int xoffset, unsigned int yoffset)
 	if (index >= HW_OSD_COUNT)
 		return;
 	output_index = get_output_device_id(index);
+	spin_lock_irqsave(&osd_lock, lock_flags);
+	if (osd_afbc_scanout[index].active) {
+		bool end = osd_afbc_scanout[index].disable_on_pan;
+
+		/* Shown again by the vsync that ends the AFBC session. */
+		osd_afbc_scanout[index].xoffset = xoffset;
+		osd_afbc_scanout[index].yoffset = yoffset;
+		spin_unlock_irqrestore(&osd_lock, lock_flags);
+		if (end) {
+			osd_afbc_scanout_disable(index);
+			osd_afbc_scanout_unhide(index);
+		}
+		return;
+	}
+	spin_unlock_irqrestore(&osd_lock, lock_flags);
 	if (xoffset != osd_hw.pandata[index].x_start
 	    || yoffset != osd_hw.pandata[index].y_start) {
 		diff_x = xoffset - osd_hw.pandata[index].x_start;
@@ -5597,6 +5971,8 @@ void osd_pan_display_hw(u32 index, unsigned int xoffset, unsigned int yoffset)
 			osd_hw.osd_fps[output_index]++;
 		/* osd_wait_vsync_hw(); */
 	}
+	/* After the geometry: a vsync in between must not show stale lines. */
+	osd_afbc_scanout_unhide(index);
 #ifdef CONFIG_AMLOGIC_MEDIA_FB_EXT
 	osd_ext_clone_pan(index);
 #endif

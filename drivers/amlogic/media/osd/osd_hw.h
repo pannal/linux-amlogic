@@ -165,6 +165,18 @@ extern void osd_ext_clone_pan(u32 index);
 extern void osd_set_pxp_mode(u32 mode);
 extern void osd_set_afbc(u32 index, u32 enable);
 extern u32 osd_get_afbc(u32 index);
+void osd_wait_vsync_hw(u32 index);
+bool osd_afbc_scanout_active(u32 index);
+int osd_afbc_scanout_flip(u32 index, u32 phy_addr, u32 width, u32 height,
+			  u32 inter_format, u32 reverse);
+void osd_afbc_scanout_disable(u32 index);
+void osd_afbc_scanout_hide(u32 index);
+void osd_afbc_scanout_unhide(u32 index);
+u32 osd_afbc_scanout_change_seq(u32 index);
+bool osd_afbc_scanout_settled(u32 index, u32 seq, u32 count);
+bool osd_afbc_scanout_scanning(u32 index, u32 ms);
+int osd_afbc_scanout_wait(u32 index, u32 seq, u32 count, u32 timeout_ms);
+void osd_afbc_scanout_disable_on_pan(u32 index);
 extern u32 osd_get_reset_status(void);
 extern void osd_switch_free_scale(
 	u32 pre_index, u32 pre_enable, u32 pre_scale,

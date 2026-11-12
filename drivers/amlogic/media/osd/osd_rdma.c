@@ -78,6 +78,8 @@ static unsigned int rdma_irq_count;
 static unsigned int rdma_lost_count;
 static unsigned int dump_reg_trigger;
 static unsigned int rdma_recovery_count;
+/* Tables discarded with whatever they held: see osd_rdma_reset_count(). */
+static u32 rdma_table_resets;
 #ifdef OSD_RDMA_ISR
 static unsigned int second_rdma_irq;
 #endif
@@ -1112,6 +1114,36 @@ static void osd_reset_rdma_irq(void *arg)
 {
 }
 
+/* A table has started that writes appended before this call may miss,
+ * though its done interrupt still counts its vsync: one still running (its
+ * first item sets the reject flag, its last clears it), which an append that
+ * gave up waiting for it does not extend, or one that ran and whose
+ * interrupt has not counted it yet (the interrupt clears the done status
+ * after its callback, which counts the vsync). Either way the writes reach
+ * the hardware with the next table. A table that ends between two reads
+ * clears the flag before it sets the done status, so the status is read on
+ * both sides of the flag.
+ */
+bool osd_rdma_table_pending(void)
+{
+	u32 done;
+
+	if (!rdma_enable || osd_rdma_handle < 0)
+		return false;
+	done = 1 << (24 + OSD_RDMA_CHANNEL_INDEX);
+	return (osd_reg_read(RDMA_STATUS) & done) ||
+		OSD_RDMA_STATUS_IS_REJECT ||
+		(osd_reg_read(RDMA_STATUS) & done);
+}
+
+/* Changes each time the table is dropped with the writes queued in it: by
+ * the restart after an RDMA watchdog reset, or when RDMA is set up again.
+ */
+u32 osd_rdma_reset_count(void)
+{
+	return READ_ONCE(rdma_table_resets);
+}
+
 static void osd_rdma_irq(void *arg)
 {
 	u32 rdma_status;
@@ -1234,6 +1266,7 @@ void enable_line_n_rdma(void)
 	osd_reg_write(START_ADDR, table_paddr);
 	osd_reg_write(END_ADDR, table_paddr - 1);
 	item_count = 0;
+	WRITE_ONCE(rdma_table_resets, rdma_table_resets + 1);
 	spin_unlock_irqrestore(&rdma_lock, flags);
 	reset_rdma_table();
 	rdma_config(OSD_RDMA_CHANNEL_INDEX,
@@ -1252,6 +1285,7 @@ void enable_vsync_rdma(void)
 	osd_reg_write(START_ADDR, table_paddr);
 	osd_reg_write(END_ADDR, table_paddr - 1);
 	item_count = 0;
+	WRITE_ONCE(rdma_table_resets, rdma_table_resets + 1);
 	spin_unlock_irqrestore(&rdma_lock, flags);
 	reset_rdma_table();
 	rdma_config(OSD_RDMA_CHANNEL_INDEX,
@@ -1320,6 +1354,7 @@ int osd_rdma_enable(u32 enable)
 		osd_reg_write(START_ADDR, table_paddr);
 		osd_reg_write(END_ADDR, table_paddr - 1);
 		item_count = 0;
+		WRITE_ONCE(rdma_table_resets, rdma_table_resets + 1);
 		spin_unlock_irqrestore(&rdma_lock, flags);
 		reset_rdma_table();
 		start_osd_rdma(OSD_RDMA_CHANNEL_INDEX);
