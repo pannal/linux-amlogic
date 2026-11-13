@@ -68,6 +68,8 @@ extern int osd_rdma_reset_and_flush(u32 reset_bit);
 extern int rdma_reset_tigger_flag;
 extern int rdma_mgr_irq_request;
 extern void osd_rdma_interrupt_done_clear(void);
+bool osd_rdma_table_pending(void);
+u32 osd_rdma_reset_count(void);
 extern int osd_rdma_uninit(void);
 void set_reset_rdma_trigger_line(void);
 void enable_line_n_rdma(void);

@@ -381,6 +381,7 @@ static size_t fb_rmem_afbc_size[OSD_COUNT][OSD_MAX_BUF_NUM];
 struct ion_client *fb_ion_client;
 
 struct ion_handle *fb_ion_handle[OSD_COUNT][OSD_MAX_BUF_NUM];
+#include "osd_afbc_scanout.h"
 #if 0
 = {
 	{NULL, NULL, NULL}, {NULL, NULL, NULL}
@@ -703,6 +704,7 @@ static int osd_set_par(struct fb_info *info)
 		osd_ctrl->disp_end_y = vinfo->height - 1;
 	else
 		osd_ctrl->disp_end_y = virt_end_y - 1;
+	osd_afbc_scanout_invalidate(info->node);
 	osddev_setup((struct osd_fb_dev_s *)info->par);
 
 	return 0;
@@ -786,6 +788,8 @@ static int osd_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 		break;
 	case FBIOGET_GUI_WAIT_LEASE:
 		return osd_gui_wait_create(info->node, argp);
+	case FBIOGET_OSD_AFBC_SCANOUT:
+		return osd_afbc_scanout_create(info->node, argp);
 	case FBIO_WAITFORVSYNC:
 		/* Preserve legacy synchronous video pacing. Independent presentation
 		 * opts this process/framebuffer into the native GUI wait through a
