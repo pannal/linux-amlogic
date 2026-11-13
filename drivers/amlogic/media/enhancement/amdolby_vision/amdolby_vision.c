@@ -551,9 +551,9 @@ static bool xbmc_detect_active_area;
 module_param(xbmc_detect_active_area, bool, 0664);
 MODULE_PARM_DESC(xbmc_detect_active_area, "\n xbmc_detect_active_area\n");
 
-static bool xbmc_live_frame_l5;
+static bool xbmc_live_frame_l5 = true;
 module_param(xbmc_live_frame_l5, bool, 0644);
-MODULE_PARM_DESC(xbmc_live_frame_l5, "Opt in to same-picture native P8.1 L5 fill");
+MODULE_PARM_DESC(xbmc_live_frame_l5, "Allow same-picture native P8.1 L5 fill");
 
 static bool xbmc_live_frame_l5_trace;
 module_param(xbmc_live_frame_l5_trace, bool, 0644);
