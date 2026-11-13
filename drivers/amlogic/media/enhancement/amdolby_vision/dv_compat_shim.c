@@ -223,8 +223,13 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 
 	if (!output || !blob_funcs || !blob_funcs->multi_control_path)
 		return -ENODEV;
+	/* Non-DV input (VS10) only toward SDR output; HDR10+ goes in as HDR10. */
+	if (in_format == FORMAT_HDR10PLUS)
+		in_format = FORMAT_HDR10;
 	if (in_format != FORMAT_INVALID &&
-	    (in_format != FORMAT_DOVI && in_format != FORMAT_DOVI_LL))
+	    in_format != FORMAT_DOVI && in_format != FORMAT_DOVI_LL &&
+	    !(out_format == FORMAT_SDR &&
+	      (in_format == FORMAT_SDR || in_format == FORMAT_HDR10 || in_format == FORMAT_HLG)))
 		return -EINVAL;
 	if (in_format != FORMAT_INVALID &&
 	    ((out_format != FORMAT_DOVI && out_format != FORMAT_SDR) || in_comp_size < 0 || in_comp_size > DV5_COMP_CAPACITY ||
@@ -267,6 +272,8 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 	m->vsvdb_len = output->vsvdb_len;
 	m->vsvdb_changed = output->vsvdb_changed;
 	m->mode_changed = output->mode_changed;
+	if (m->vsvdb_len != last_cp.vsvdb_len)
+		m->vsvdb_changed = 1;
 	m->set_graphic_min_lum = set_graphic_min_lum;
 	m->set_graphic_max_lum = set_graphic_max_lum;
 	m->set_target_min_lum = set_target_min_lum;
@@ -280,6 +287,9 @@ static int cp_adapter(enum signal_format_enum in_format, enum signal_format_enum
 	vid->el_halfsize_flag = output->el_halfsize_flag;
 	vid->video_width = output->video_width >> 16;
 	vid->video_height = output->video_height >> 16;
+	/* Core1 always gets the composer's 12 bits, also for non-DV input:
+	 * declaring the decoder's 10 bits shifts the library's input range
+	 * (HDR10 white came out grey). */
 	vid->set_bit_depth = DV5_VIDEO_BIT_DEPTH;
 	vid->set_chroma_format = set_chroma_format;
 	vid->set_yuv_range = set_yuv_range;
