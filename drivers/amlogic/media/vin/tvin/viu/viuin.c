@@ -515,6 +515,8 @@ static int viuin_probe(struct platform_device *pdev)
 	sprintf(viuin_devp->frontend.name, "%s", DEVICE_NAME);
 	if (!tvin_frontend_init(&viuin_devp->frontend,
 		&viu_dec_ops, &viu_sm_ops, 0)) {
+		/* VDIN holds this module while it uses the frontend */
+		viuin_devp->frontend.owner = THIS_MODULE;
 		if (tvin_reg_frontend(&viuin_devp->frontend))
 			pr_info("[viuin..]%s register viu frontend error.\n",
 					__func__);
@@ -539,6 +541,10 @@ static struct platform_driver viuin_driver = {
 	.remove	= viuin_remove,
 	.driver	= {
 		.name	= DEVICE_NAME,
+		/* removal only with the module, which VDIN holds while it uses
+		 * the frontend: a sysfs unbind would free it under VDIN
+		 */
+		.suppress_bind_attrs = true,
 	}
 };
 
