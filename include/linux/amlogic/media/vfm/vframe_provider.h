@@ -43,6 +43,14 @@ struct vframe_states {
 #define VFRAME_EVENT_RECEIVER_NEED_NO_COMP		0x400
 #define VFRAME_EVENT_RECEIVER_BUF_COUNT		0x800
 #define VFRAME_EVENT_RECEIVER_REQ_STATE		0x1000
+#define VFRAME_EVENT_RECEIVER_GET_ACTIVE_AREA		0x2000
+
+/* Optional per-picture measurement from the provider of a held vframe. */
+struct provider_active_area_req_s {
+	const struct vframe_s *vf;
+	bool valid;
+	u16 top, bottom, left, right;
+};
 
 enum req_state_type_e {
 	REQ_STATE_INVALID = 0,

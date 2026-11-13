@@ -551,6 +551,13 @@ static bool xbmc_detect_active_area;
 module_param(xbmc_detect_active_area, bool, 0664);
 MODULE_PARM_DESC(xbmc_detect_active_area, "\n xbmc_detect_active_area\n");
 
+static bool xbmc_live_frame_l5;
+module_param(xbmc_live_frame_l5, bool, 0644);
+MODULE_PARM_DESC(xbmc_live_frame_l5, "Opt in to same-picture native P8.1 L5 fill");
+
+static bool xbmc_live_frame_l5_trace;
+module_param(xbmc_live_frame_l5_trace, bool, 0644);
+
 static u16 xbmc_detected_l5_top;
 module_param(xbmc_detected_l5_top, ushort, 0664);
 MODULE_PARM_DESC(xbmc_detected_l5_top, "\n xbmc_detected_l5_top\n");
@@ -6094,10 +6101,13 @@ static inline void build_level_5_additive_data(unsigned char *dst,
 /* Selector — picks override or detect helper based on the force flag.
  * Used by the L5-append paths (out-of-order and end-of-loop) so the
  * override correctly drives them too, not just the in-stream substitution. */
-static inline void build_level_5_data_select(unsigned char *dst)
+static inline void build_level_5_data_select(unsigned char *dst,
+					    const struct provider_active_area_req_s *area)
 {
   if (xbmc_force_l5_override)
     build_level_5_override_data(dst);
+  else if (area && area->valid)
+    build_level_5_data_from(dst, area->top, area->bottom, area->left, area->right);
   else
     build_level_5_data(dst);
 }
@@ -6113,11 +6123,28 @@ static inline bool is_level_5_all_zero(const unsigned char *l5_block)
   return true;
 }
 
+/* A late source L5 must still take precedence over a synthesized block. */
+static bool source_has_level_5(const u8 *block, size_t size)
+{
+	while (size >= 5) {
+		size_t payload = get_unaligned_be32(block);
+
+		if (payload > size - 5)
+			break;
+		if (block[4] == 5)
+			return true;
+		block += payload + 5;
+		size -= payload + 5;
+	}
+	return false;
+}
+
 // replace core register format meta levels in core_meta with orig meta from source.
 static inline void source_meta_copy(
   unsigned char* orig_meta_buffer, 
   size_t orig_meta_size,
-  struct md_reg_ipcore3 *core_meta)
+  struct md_reg_ipcore3 *core_meta,
+  const struct provider_active_area_req_s *area)
 {
   if (!orig_meta_buffer || !core_meta) {
     pr_err("source_meta_copy: Invalid input parameters (null pointers)\n");
@@ -6156,6 +6183,7 @@ static inline void source_meta_copy(
   // Validate buffer sizes upfront
   size_t remaining_space = CORE_META_LENGTH - ETSI_META_OFFSET;
   size_t remaining_input = orig_meta_size - ETSI_META_OFFSET;
+  bool live_source_l5 = area && source_has_level_5(orig_index, remaining_input);
 
   unsigned int num_levels = 0;
   uint8_t level = 0;
@@ -6187,11 +6215,11 @@ static inline void source_meta_copy(
     if (level_size > remaining_space)
       return;
 
-    if ((level > 5) && !level_5_done && level_1_done)
+    if ((level > 5) && !level_5_done && level_1_done && !live_source_l5)
     {
       if (remaining_space < LEVEL_5_LENGTH || num_levels == 255)
         return;
-      build_level_5_data_select(combo_index);
+      build_level_5_data_select(combo_index, area);
       combo_index += LEVEL_5_LENGTH;
       combo_meta_size += LEVEL_5_LENGTH;
       remaining_space -= LEVEL_5_LENGTH;
@@ -6240,9 +6268,10 @@ static inline void source_meta_copy(
               build_level_5_override_data(combo_index);
             substituted = true;
           } else if (is_level_5_all_zero(orig_index) &&
-                     (xbmc_detected_l5_top || xbmc_detected_l5_bottom ||
-                      xbmc_detected_l5_left || xbmc_detected_l5_right)) {
-            build_level_5_data(combo_index);
+                     ((area && area->valid) || xbmc_detected_l5_top ||
+                      xbmc_detected_l5_bottom || xbmc_detected_l5_left ||
+                      xbmc_detected_l5_right)) {
+            build_level_5_data_select(combo_index, area);
             substituted = true;
           }
         }
@@ -6298,7 +6327,7 @@ static inline void source_meta_copy(
   {
     if (remaining_space < LEVEL_5_LENGTH || num_levels == 255)
       return;
-    build_level_5_data_select(combo_index);
+    build_level_5_data_select(combo_index, area);
     combo_index += LEVEL_5_LENGTH;
     combo_meta_size += LEVEL_5_LENGTH;
     num_levels++;
@@ -6311,6 +6340,33 @@ static inline void source_meta_copy(
 
   // push back into the core format raw_metadata.
   prepare_dv_meta(core_meta, combo_meta_buffer, combo_meta_size);
+}
+
+static void trace_live_frame_l5(const struct vframe_s *vf,
+				const struct md_reg_ipcore3 *core_meta,
+				const struct provider_active_area_req_s *area)
+{
+	size_t size, pos;
+
+	size = reverse_dv_meta(reversed_meta_buffer, core_meta);
+	for (pos = ETSI_META_OFFSET; pos + 5 <= size;) {
+		const u8 *block = reversed_meta_buffer + pos;
+		size_t payload = get_unaligned_be32(block);
+
+		if (payload > size - pos - 5)
+			break;
+		if (block[4] == 5 && payload >= 8) {
+			pr_info("p3i-frame-l5 pts=%u head=%x index=%u sample=%u in=%u/%u/%u/%u out=%u/%u/%u/%u\n",
+				vf->pts, vf->compHeadAddr, vf->index_disp, area->valid,
+				area->top, area->bottom, area->left, area->right,
+				get_unaligned_be16(block + 9), get_unaligned_be16(block + 11),
+				get_unaligned_be16(block + 5), get_unaligned_be16(block + 7));
+			return;
+		}
+		pos += payload + 5;
+	}
+	pr_info("p3i-frame-l5 pts=%u head=%x index=%u absent\n",
+		vf->pts, vf->compHeadAddr, vf->index_disp);
 }
 
 static u32 last_total_md_size;
@@ -7251,9 +7307,24 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 		// Copy original source metadata for standard DV (non-LL) output
 		if (flag >= 0 && (src_format == FORMAT_DOVI) && (dst_format == FORMAT_DOVI) &&
 		    !((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
-		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422))
+		      dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422)) {
+			struct provider_active_area_req_s area = { .vf = vf };
+			bool live_l5 = READ_ONCE(xbmc_live_frame_l5) && vf &&
+				toggle_mode != 2 && (use_new || !meta_flag_bl) &&
+				!vf->discard_dv_data && !req.dv_enhance_exist &&
+				xbmc_dv_profile == 8 && xbmc_dv_source_native &&
+				xbmc_detect_active_area && xbmc_meta_level_5 &&
+				w == 3840 && h == 2160;
+
+			if (live_l5)
+				vf_notify_provider_by_name(dv_provider,
+					VFRAME_EVENT_RECEIVER_GET_ACTIVE_AREA, &area);
 			source_meta_copy((unsigned char *)(use_new ? dv_new_md : md_buf[current_id]),
-				 use_new ? dv_new_md_size : total_md_size, &new_dovi_setting.md_reg3);
+				 use_new ? dv_new_md_size : total_md_size, &new_dovi_setting.md_reg3,
+				 live_l5 ? &area : NULL);
+			if (live_l5 && READ_ONCE(xbmc_live_frame_l5_trace))
+				trace_live_frame_l5(vf, &new_dovi_setting.md_reg3, &area);
+		}
 
 		if (graphics_trace_cp)
 			dv_graphics_probe_metadata("post", graphics_trace_cp,
