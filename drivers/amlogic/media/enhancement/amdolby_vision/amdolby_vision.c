@@ -896,6 +896,15 @@ static unsigned int frame_count;
 static struct hdr10_parameter hdr10_param;
 static struct master_display_info_s hdr10_data;
 
+/* HDR10 DRM infoframe sent with player-led LLDV on a non-DV display:
+ * 0 = avdvplus buckets (mastering 600/1000/2000/4000, MaxCLL one grid step above the target)
+ * 1 = exact (mastering = MaxCLL = the target's grid value)
+ * 2 = zero (all static metadata unknown, as CPM's injection path does by default)
+ */
+static unsigned int dv_ll_hdr10_drm_mode = 1;
+module_param(dv_ll_hdr10_drm_mode, uint, 0664);
+MODULE_PARM_DESC(dv_ll_hdr10_drm_mode, "\n dv_ll_hdr10_drm_mode 0 buckets, 1 exact, 2 zero\n");
+
 static char *md_buf[2];
 static char *comp_buf[2];
 static char *drop_md_buf[2];
@@ -5192,6 +5201,7 @@ static inline void set_hdr10_data_for_dv_ll(void)
 	u16 vsvdb_max = 0;
 	u16 vsvdb_min = 0;
 	u8 vsvdb_max_idx = 0;
+	u8 step = (dv_ll_hdr10_drm_mode == 1) ? 0 : 1;
 
 	hdr10_data.features =
 		  (1 << 29)   /* 1 video available / present */
@@ -5211,7 +5221,7 @@ static inline void set_hdr10_data_for_dv_ll(void)
 		(vsvdb_max < 3389) ? 0x07D0 :
 		(vsvdb_max < 3697) ? 0x0FA0 : 0x2710;
 
-	switch (vsvdb_max) {
+	switch (step ? vsvdb_max : 0) {
 	case 3079:
 		hdr10_data.max_content = 0x041A;
 		break;
@@ -5230,14 +5240,14 @@ static inline void set_hdr10_data_for_dv_ll(void)
 		const unsigned char v = (x[0] >> 5) & 0x07;
 		switch (v) {
 		case 1:
-			vsvdb_max_idx = xbmc_find_closest_lut_index(vsvdb_max, xbmc_max_direct_to_pq_lut, 128) + 1;
+			vsvdb_max_idx = xbmc_find_closest_lut_index(vsvdb_max, xbmc_max_direct_to_pq_lut, 128) + step;
 			if (vsvdb_max_idx > 127)
 				hdr10_data.max_content = 0x2710;
 			else
 				hdr10_data.max_content = xbmc_max_direct_to_nits_lut[vsvdb_max_idx];
 			break;
 		case 2:
-			vsvdb_max_idx = xbmc_find_closest_lut_index(vsvdb_max, xbmc_max_direct_to_pq_lut_2, 32) + 1;
+			vsvdb_max_idx = xbmc_find_closest_lut_index(vsvdb_max, xbmc_max_direct_to_pq_lut_2, 32) + step;
 			if (vsvdb_max_idx > 30)
 				hdr10_data.max_content = 0x2710;
 			else
@@ -5258,6 +5268,17 @@ static inline void set_hdr10_data_for_dv_ll(void)
 		(vsvdb_min < 26) ? 0x0005 :
 		(vsvdb_min < 38) ? 0x000A :
 		(vsvdb_min < 62) ? 0x0014 : 0x0032;
+
+	if (dv_ll_hdr10_drm_mode == 1 && hdr10_data.max_content) {
+		hdr10_data.luminance[0] = hdr10_data.max_content;
+	} else if (dv_ll_hdr10_drm_mode == 2) {
+		memset(hdr10_data.primaries, 0, sizeof(hdr10_data.primaries));
+		memset(hdr10_data.white_point, 0, sizeof(hdr10_data.white_point));
+		hdr10_data.luminance[0] = 0;
+		hdr10_data.luminance[1] = 0;
+		hdr10_data.max_content = 0;
+		hdr10_data.max_frame_average = 0;
+	}
 
 	xbmc_dv_hdr10_for_dv_ll_inject_num += 1;
 }
