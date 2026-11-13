@@ -291,7 +291,10 @@ struct vf_pool *vf_pool_alloc(int size)
 {
 	struct vf_pool *p;
 
-	p = kmalloc(sizeof(struct vf_pool), GFP_KERNEL);
+	/* zeroed: size and the log stay unset until a session's
+	 * vf_pool_init(), and vf_pool_free() logs over them
+	 */
+	p = kzalloc(sizeof(struct vf_pool), GFP_KERNEL);
 	if (!p)
 		return NULL;
 

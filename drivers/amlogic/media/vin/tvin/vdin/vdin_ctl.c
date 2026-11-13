@@ -1734,14 +1734,22 @@ void vdin_set_hdr(struct vdin_dev_s *devp)
 		hdr_set(5, 0x9);
 		break;
 
+	/* VDIN1's HLG_SDR leaves an HLG loopback all but black: pass it
+	 * through for the reader to decode.
+	 */
 	case SIGNAL_HLG:
-		/* HLG_SDR(bit4) */
-		hdr_set(5, 0x10);
+		/* HDR_BYPASS(bit0) | HLG_BYPASS(bit3) */
+		hdr_set(5, 0x9);
 		break;
 
-	/* VDIN DON'T support dv loopback currently */
+	/* VDIN has no Dolby Vision conversion. A loopback carries the DV
+	 * core's input codes (VD1) or its tunnelled output (VPP): pass it
+	 * through, rather than through whatever the previous session set up.
+	 */
 	case SIGNAL_DOVI:
-		pr_err("err:  don't support dv signal loopback");
+		pr_info("vdin_set_hdr: dv loopback passed through\n");
+		/* HDR_BYPASS(bit0) | HLG_BYPASS(bit3) */
+		hdr_set(5, 0x9);
 		break;
 
 	default:

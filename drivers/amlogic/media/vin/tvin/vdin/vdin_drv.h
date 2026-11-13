@@ -439,6 +439,12 @@ struct vdin_active_area {
 	u8 luma_max;
 };
 
+/* an open file of the device that mapped its frame memory */
+struct vdin_map_file {
+	struct list_head list;
+	struct file *file;
+};
+
 struct vdin_dev_s {
 	struct cdev cdev;
 	struct device *dev;
@@ -468,6 +474,34 @@ struct vdin_dev_s {
 	struct vdin_active_area active_area;
 	bool report_active_area;
 	struct mutex fe_lock;
+	/* The loopback reader's ownership: held through open and release, and
+	 * around every attr debug command on the loopback VDIN. Taken before
+	 * fe_lock.
+	 */
+	struct mutex reader_lock;
+	/* Orders the frame memory's allocation and release with vdin_mmap()
+	 * and its faults; held over no user access, so taken under mmap_sem
+	 * and fe_lock alike.
+	 */
+	struct mutex mem_lock;
+	/* The files that mapped the frame memory (struct vdin_map_file), whose
+	 * mappings vdin_cma_release() takes down before the memory goes back
+	 * to the CMA pool: vdin0 has several open at once. A file leaves it at
+	 * its release, after the last of its mappings.
+	 */
+	struct list_head map_files;
+	/* the extra interrupts an open of the device requested, which its
+	 * release frees whatever a stop did with the main one
+	 */
+	bool crash_irq_req;
+	bool wr_done_irq_req;
+	/* start_tvin_service() opened the frontend: whichever path stops the
+	 * session or closes the frontend takes down the whole of it, with
+	 * service_fmt and the interrupt (vdin_stop_service())
+	 */
+	bool service;
+	/* the format start_tvin_service() allocated for its session */
+	struct tvin_format_s *service_fmt;
 	struct clk *msr_clk;
 	unsigned int msr_clk_val;
 
@@ -750,7 +784,7 @@ void vdin_remove_debug_files(struct device *dev);
 int vdin_open_fe(enum tvin_port_e port, int index,
 		struct vdin_dev_s *devp);
 void vdin_close_fe(struct vdin_dev_s *devp);
-void vdin_start_dec(struct vdin_dev_s *devp);
+int vdin_start_dec(struct vdin_dev_s *devp);
 void vdin_stop_dec(struct vdin_dev_s *devp);
 irqreturn_t vdin_isr_simple(int irq, void *dev_id);
 irqreturn_t vdin_isr(int irq, void *dev_id);

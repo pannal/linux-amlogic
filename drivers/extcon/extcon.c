@@ -1041,6 +1041,7 @@ struct extcon_dev *extcon_dev_allocate(const unsigned int *supported_cable)
 
 	return edev;
 }
+EXPORT_SYMBOL_GPL(extcon_dev_allocate);
 
 /*
  * extcon_dev_free() - Free the memory of extcon device.

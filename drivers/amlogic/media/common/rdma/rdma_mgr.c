@@ -40,6 +40,7 @@
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/reset.h>
+#include <linux/delay.h>
 
 #include <linux/amlogic/cpu_version.h>
 #include <linux/amlogic/media/utils/vdec_reg.h>
@@ -61,6 +62,8 @@
 /* #define SKIP_OSD_CHANNEL */
 
 int rdma_mgr_irq_request;
+/* the interrupt rdma_mgr_isr() runs on, which rdma_unregister() syncs */
+static int rdma_mgr_irq;
 int rdma_reset_tigger_flag;
 
 struct reset_control *rdma_rst;
@@ -75,6 +78,8 @@ static int rdma_force_reset = -1;
 
 #define RDMA_NUM 8
 #define RDMA_TABLE_SIZE (16 * (PAGE_SIZE))
+/* longer than a frame at 24 Hz: see rdma_drain() */
+#define RDMA_DRAIN_MS 50
 #define MAX_TRACE_NUM  16
 #define RDMA_MGR_CLASS_NAME  "rdma_mgr"
 static int rdma_trace_num;
@@ -108,6 +113,8 @@ struct rdma_instance_s {
 	int rdma_write_count;
 	unsigned char keep_buf;
 	unsigned char used;
+	/* rdma_quiesce() keeps rdma_config() from arming it until rdma_resume() */
+	bool quiesced;
 	int prev_trigger_type;
 	/* Optional video receipt: pending software batch != armed hardware batch. */
 	bool frame_tracking;
@@ -279,6 +286,7 @@ int rdma_register(struct rdma_op_s *rdma_op, void *op_arg, int table_size)
 		info->rdma_ins[i].op_arg = op_arg;
 		info->rdma_ins[i].rdma_item_count = 0;
 		info->rdma_ins[i].rdma_write_count = 0;
+		info->rdma_ins[i].quiesced = false;
 		if (info->rdma_ins[i].rdma_table_size == 0) {
 			info->rdma_ins[i].rdma_table_addr =
 				dma_alloc_coherent(
@@ -325,6 +333,74 @@ int rdma_register(struct rdma_op_s *rdma_op, void *op_arg, int table_size)
 }
 EXPORT_SYMBOL(rdma_register);
 
+/* The channel off: its trigger, the writes queued for it, and its frame
+ * receipt. rdma_lock is held.
+ */
+static void rdma_disarm(struct rdma_instance_s *ins)
+{
+	WRITE_VCBUS_REG_BITS(ins->rdma_regadr->trigger_mask_reg, 0,
+			     ins->rdma_regadr->trigger_mask_reg_bitpos,
+			     rdma_meson_dev.trigger_mask_len);
+	rdma_frame_invalidate(ins);
+	ins->rdma_item_count = 0;
+	ins->rdma_write_count = 0;
+}
+
+/* Once a channel is disarmed and cannot be armed again, waits until neither
+ * its callback nor a transfer it started runs. The channel has no idle
+ * status: a transfer starts only on a trigger and runs to the end of its
+ * table within the blanking it was triggered for, so one started before the
+ * trigger went off is over after a frame at the slowest rate (24 Hz).
+ * Process context.
+ */
+static void rdma_drain(void)
+{
+	/* rdma_mgr_isr() calls irq_cb outside rdma_lock */
+	if (rdma_mgr_irq_request)
+		synchronize_irq(rdma_mgr_irq);
+	msleep(RDMA_DRAIN_MS);
+}
+
+/* For a client about to reset what its queued writes program, or release
+ * the memory they point to: disarms its channel, drops the writes queued for
+ * it, and keeps rdma_config() from arming it again, from the client's
+ * callback too, until rdma_resume(). Returns once no callback or transfer of
+ * the channel runs. Process context.
+ */
+int rdma_quiesce(int handle)
+{
+	unsigned long flags;
+	struct rdma_instance_s *ins;
+
+	if (handle <= 0 || handle >= RDMA_NUM)
+		return -1;
+	ins = &rdma_info.rdma_ins[handle];
+	spin_lock_irqsave(&rdma_lock, flags);
+	if (!ins->op) {
+		spin_unlock_irqrestore(&rdma_lock, flags);
+		return -1;
+	}
+	ins->quiesced = true;
+	rdma_disarm(ins);
+	spin_unlock_irqrestore(&rdma_lock, flags);
+	rdma_drain();
+	return 0;
+}
+EXPORT_SYMBOL(rdma_quiesce);
+
+/* lets rdma_config() arm the channel again */
+void rdma_resume(int handle)
+{
+	unsigned long flags;
+
+	if (handle <= 0 || handle >= RDMA_NUM)
+		return;
+	spin_lock_irqsave(&rdma_lock, flags);
+	rdma_info.rdma_ins[handle].quiesced = false;
+	spin_unlock_irqrestore(&rdma_lock, flags);
+}
+EXPORT_SYMBOL(rdma_resume);
+
 void rdma_unregister(int i)
 {
 	unsigned long flags;
@@ -332,7 +408,24 @@ void rdma_unregister(int i)
 
 	pr_info("%s(%d)\r\n", __func__, i);
 	if (i > 0 && i < RDMA_NUM && info->rdma_ins[i].op) {
-		/*rdma_clear(i);*/
+		struct rdma_instance_s *ins = &info->rdma_ins[i];
+
+		/* No callback runs and no transfer reads the table once this
+		 * returns, so that the client may free what its callback uses,
+		 * or be unloaded, and the table can go. rdma_config() refuses
+		 * the handle from here, and the slot stays taken until its
+		 * buffers are freed.
+		 */
+		spin_lock_irqsave(&rdma_lock, flags);
+		WRITE_ONCE(ins->op, NULL);
+		ins->used = 1;
+		/* The hardware too: a callback may have re-armed the channel
+		 * since the client's rdma_clear(), and a trigger would then
+		 * fetch the freed table as register writes.
+		 */
+		rdma_disarm(ins);
+		spin_unlock_irqrestore(&rdma_lock, flags);
+		rdma_drain();
 		info->rdma_ins[i].op_arg = NULL;
 		if (!info->rdma_ins[i].keep_buf) {
 			kfree(info->rdma_ins[i].reg_buf);
@@ -348,8 +441,7 @@ void rdma_unregister(int i)
 		}
 		info->rdma_ins[i].rdma_table_size = 0;
 		spin_lock_irqsave(&rdma_lock, flags);
-		rdma_frame_invalidate(&info->rdma_ins[i]);
-		info->rdma_ins[i].op = NULL;
+		info->rdma_ins[i].used = 0;
 		spin_unlock_irqrestore(&rdma_lock, flags);
 	}
 }
@@ -516,8 +608,16 @@ QUERY:
 					1 << ins->rdma_regadr->clear_irq_bitpos);
 				spin_unlock_irqrestore(&rdma_lock, flags);
 			}
-			if (ins->op && ins->op->irq_cb)
-				ins->op->irq_cb(ins->op->arg);
+			{
+				/* Read once: rdma_unregister() clears it outside
+				 * this handler, then waits for the handler, so one
+				 * read here stays valid until it returns.
+				 */
+				struct rdma_op_s *op = READ_ONCE(ins->op);
+
+				if (op && op->irq_cb)
+					op->irq_cb(op->arg);
+			}
 
 			if (!ins->frame_tracking)
 				WRITE_VCBUS_REG(RDMA_CTRL,
@@ -577,6 +677,13 @@ int rdma_config(int handle, int trigger_type)
 		pr_info("%s: handle (%d) not register\n",
 			__func__, handle);
 		return -1;
+	}
+
+	/* disarmed by rdma_quiesce() until rdma_resume(), whoever calls */
+	if (ins->quiesced) {
+		ins->rdma_item_count = 0;
+		spin_unlock_irqrestore(&rdma_lock, flags);
+		return 0;
 	}
 
 	/* Do not let the completion callback copy a partially generated video
@@ -1373,6 +1480,7 @@ static int rdma_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	rdma_mgr_irq = int_rdma;
 	rdma_mgr_irq_request = 1;
 	data32  = 0;
 	data32 |= 1 << 7; /* wrtie ddr urgent */

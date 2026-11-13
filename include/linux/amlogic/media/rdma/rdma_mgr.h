@@ -57,10 +57,19 @@ u32 is_meson_g12b_revb(void);
 int rdma_register(struct rdma_op_s *rdma_op, void *op_arg, int table_size);
 
 /*
- *	if keep_buf is 0, rdma_unregister can only be called in its irq_cb.
- *	in normal case, keep_buf is 1, so rdma_unregister can be called anywhere
+ *	rdma_unregister() waits for the RDMA interrupt and for the channel's
+ *	last transfer, and sleeps: process context only, never in its irq_cb
+ *	(keep_buf, 1 for every channel, keeps the register buffer for reuse)
  */
 void rdma_unregister(int i);
+
+/*
+ *	rdma_quiesce() disarms the channel and keeps rdma_config() from arming
+ *	it again until rdma_resume(); it returns once no irq_cb or transfer of
+ *	the channel runs, and sleeps: process context only
+ */
+int rdma_quiesce(int handle);
+void rdma_resume(int handle);
 
 int rdma_config(int handle, int trigger_type);
 
