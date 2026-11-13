@@ -82,6 +82,27 @@ static bool xbmc_dv_l11_vsif = true;
 static u32 dv_new_blob_max_hz = 60;
 static bool xbmc_dv_source_native;
 static bool xbmc_dv_new_sdr_route;
+/* VS10 SDR for every source: SDR, HDR10, HLG, HDR10+ and converted DV
+ * (generated RPU) also go to the newer library when the output is SDR,
+ * as the 5.15 driver does with the same library. */
+static bool xbmc_dv_new_vs10_route;
+/* VS10 ->SDR on the newer library: declare a 0-nit source black. Dolby DM maps
+ * the declared source black to the target black, so HDR10's mastering min
+ * (typically 0.005 nit) and the L1 min Kodi derives from it for the HDR10+ ->
+ * DV conversion crush the steps below ~0.02 nit, where native DV (L1 min 0)
+ * keeps them. Only the bottom of the core1 curve moves. */
+static bool xbmc_dv_new_src_black0;
+/* VS10 HDR10->SDR on the newer library: source peak in nits measured on the
+ * decoded picture by userspace (0 = off), written live. Clamped to 100..the
+ * mastering peak; it takes precedence over the MaxCLL peak. HDR10 carries no
+ * per-scene peak, so Dolby DM otherwise tone-maps for the mastering display
+ * while the DV grade of the same title states its real scene peak in L1. */
+static uint xbmc_dv_new_hdr10_meas_peak;
+/* DV (native or converted) to SDR on the newer library: when the metadata
+ * carries no 100-nit trim (no L2 for target 2081, no CMv4.0 L8), add the same
+ * static L2 trim as Kodi's HDR10 static RPU. Converted HDR10+ and RPUs made
+ * without a trim pass then render like HDR10; graded DV keeps its own trims. */
+static bool xbmc_dv_new_static_trim;
 /* The newer library does no display management for SDR output in video
  * priority (identity core1 tone curve, everything above 100 nits clips);
  * in graphics priority it tone-maps to the metadata like the 5.15 driver,
@@ -116,6 +137,14 @@ module_param(dv_new_blob_max_hz, uint, 0664);
 module_param(xbmc_dv_source_native, bool, 0664);
 module_param(xbmc_dv_new_sdr_route, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_new_sdr_route, "Experimental: also permit the newer backend for native DV to SDR output");
+module_param(xbmc_dv_new_vs10_route, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_vs10_route, "Experimental: newer backend for every source to SDR output (needs xbmc_dv_new_sdr_route)");
+module_param(xbmc_dv_new_src_black0, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_src_black0, "Newer backend, to SDR: 0-nit source black for HDR10 (mastering min) and converted HDR10+ (L1 min)");
+module_param(xbmc_dv_new_hdr10_meas_peak, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_hdr10_meas_peak, "Newer backend, HDR10 to SDR: measured source peak in nits from userspace (0 off, clamped 100..mastering)");
+module_param(xbmc_dv_new_static_trim, bool, 0664);
+MODULE_PARM_DESC(xbmc_dv_new_static_trim, "Newer backend, DV to SDR: add a static 100-nit L2 trim when the metadata has none");
 module_param(xbmc_dv_new_sdr_gpr, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_new_sdr_gpr, "Run the newer backend in graphics priority for SDR output");
 module_param(dv_new_backend_available, uint, 0444);
@@ -124,6 +153,161 @@ MODULE_PARM_DESC(amdv_multi_dv_mode, "Applied backend: 0 legacy, 1 newer native 
 MODULE_PARM_DESC(dv_new_blob_enable, "Permit the newer backend for eligible native DV routes");
 MODULE_PARM_DESC(dv_new_blob_max_hz, "Maximum newer-backend output refresh; default and max 60 Hz");
 MODULE_PARM_DESC(xbmc_dv_source_native, "Kodi source provenance: false for generated/converted RPU");
+
+/*
+ * cb1: per-picture L1 computed ahead of display by the HEVC decoder (vh265
+ * cb1_meas, temporal per-shot L1 with ~0.4-1 s of lookahead), keyed by the
+ * 90 kHz vf->pts. The table lives here (built in) so the decoder module only
+ * calls in: a decoder that never calls dv_cb1_put_l1() leaves this inert.
+ * Read when a converted RPU (static L1) is parsed for SDR output on the newer
+ * library; no entry for the pts = keep the last L1 for up to xbmc_dv_cb1_hold_ms
+ * of pts (end of file: the decoder has no lookahead left), else the RPU's own
+ * static L1 (start, seek). Writers: decoder thread; reader: vsync irq.
+ */
+#define DV_CB1_SLOTS 64
+struct dv_cb1_l1 {
+	u32 pts;
+	u16 min, avg, max;
+	bool valid;
+};
+static struct dv_cb1_l1 dv_cb1_ring[DV_CB1_SLOTS];
+static struct dv_cb1_l1 dv_cb1_last;
+static u32 dv_cb1_head;
+static DEFINE_SPINLOCK(dv_cb1_lock);
+static bool xbmc_dv_cb1_l1;
+static uint xbmc_dv_cb1_hold_ms = 2000;
+static uint dv_cb1_puts, dv_cb1_hits, dv_cb1_holds, dv_cb1_misses;
+/* Last lookup gave a per-picture L1 (hit or hold); cleared by a flush or a
+ * write of xbmc_dv_cb1_l1, so a new playback starts as not active. */
+static bool dv_cb1_used;
+
+static int dv_cb1_l1_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	WRITE_ONCE(dv_cb1_used, false);
+	return ret;
+}
+
+static const struct kernel_param_ops dv_cb1_l1_ops = {
+	.set = dv_cb1_l1_set,
+	.get = param_get_bool,
+};
+
+/* Read-only: Y while the per-picture L1 reaches the converted RPU (for the player). */
+static int dv_cb1_active_get(char *buffer, const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%c\n",
+		       READ_ONCE(xbmc_dv_cb1_l1) && READ_ONCE(dv_cb1_used) ?
+		       'Y' : 'N');
+}
+
+static const struct kernel_param_ops dv_cb1_active_ops = {
+	.get = dv_cb1_active_get,
+};
+module_param_cb(dv_cb1_active, &dv_cb1_active_ops, NULL, 0444);
+
+/*
+ * Read-only: the per-picture L1 last applied, "min max avg" in 12-bit PQ, or
+ * "-" while none is (the player then shows the RPU's own static L1).
+ */
+static int dv_cb1_l1_cur_get(char *buffer, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	struct dv_cb1_l1 l;
+	bool used;
+
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	l = dv_cb1_last;
+	used = dv_cb1_used;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+	if (!READ_ONCE(xbmc_dv_cb1_l1) || !used || !l.valid)
+		return sprintf(buffer, "-\n");
+	return sprintf(buffer, "%u %u %u\n", l.min, l.max, l.avg);
+}
+
+static const struct kernel_param_ops dv_cb1_l1_cur_ops = {
+	.get = dv_cb1_l1_cur_get,
+};
+module_param_cb(dv_cb1_l1_cur, &dv_cb1_l1_cur_ops, NULL, 0444);
+MODULE_PARM_DESC(dv_cb1_active, "cb1: Y while the decoder's per-picture L1 is used");
+module_param_cb(xbmc_dv_cb1_l1, &dv_cb1_l1_ops, &xbmc_dv_cb1_l1, 0664);
+MODULE_PARM_DESC(xbmc_dv_cb1_l1, "Newer backend, converted DV to SDR: replace the static L1 by the decoder's per-picture L1 (cb1)");
+module_param(xbmc_dv_cb1_hold_ms, uint, 0664);
+MODULE_PARM_DESC(xbmc_dv_cb1_hold_ms, "cb1: keep the last L1 this long (pts) when a picture has none, then the static L1");
+module_param(dv_cb1_puts, uint, 0444);
+module_param(dv_cb1_hits, uint, 0444);
+module_param(dv_cb1_holds, uint, 0444);
+module_param(dv_cb1_misses, uint, 0444);
+
+void dv_cb1_put_l1(u32 pts, u16 min, u16 avg, u16 max)
+{
+	struct dv_cb1_l1 *e;
+	unsigned long flags;
+
+	if (!pts || max > 4095 || min > avg || avg > max)
+		return;
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	e = &dv_cb1_ring[dv_cb1_head++ % DV_CB1_SLOTS];
+	e->pts = pts;
+	e->min = min;
+	e->avg = avg;
+	e->max = max;
+	e->valid = true;
+	dv_cb1_puts++;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+}
+EXPORT_SYMBOL(dv_cb1_put_l1);
+
+/* Decoder reset (seek, pts going back, release): forget every entry. */
+void dv_cb1_flush(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	memset(dv_cb1_ring, 0, sizeof(dv_cb1_ring));
+	dv_cb1_last.valid = false;
+	dv_cb1_used = false;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+}
+EXPORT_SYMBOL(dv_cb1_flush);
+
+/* 1 = entry for pts, 2 = held last L1, 0 = none (keep the static L1). */
+static int dv_cb1_get_l1(u32 pts, struct dv_cb1_l1 *out)
+{
+	unsigned long flags;
+	int i, ret = 0;
+	u32 hold = READ_ONCE(xbmc_dv_cb1_hold_ms) * 90;
+
+	if (!pts)
+		return 0;
+	spin_lock_irqsave(&dv_cb1_lock, flags);
+	for (i = 1; i <= DV_CB1_SLOTS; i++) {
+		struct dv_cb1_l1 *e =
+			&dv_cb1_ring[(dv_cb1_head - i) % DV_CB1_SLOTS];
+
+		if (e->valid && e->pts == pts) {
+			*out = *e;
+			dv_cb1_last = *e;
+			ret = 1;
+			break;
+		}
+	}
+	if (!ret && dv_cb1_last.valid && pts > dv_cb1_last.pts &&
+	    pts - dv_cb1_last.pts <= hold) {
+		*out = dv_cb1_last;
+		ret = 2;
+	}
+	dv_cb1_used = ret != 0;
+	if (ret == 1)
+		dv_cb1_hits++;
+	else if (ret == 2)
+		dv_cb1_holds++;
+	else
+		dv_cb1_misses++;
+	spin_unlock_irqrestore(&dv_cb1_lock, flags);
+	return ret;
+}
 
 
 /* Module registration is sleepable. Wait for the whole producer/presenter
@@ -1255,6 +1439,11 @@ static bool need_skip_cvm(unsigned int is_graphic)
 {
 	if (dolby_vision_flags & FLAG_CERTIFICAION) return false;
 	if (dolby_vision_flags & FLAG_FORCE_CVM) return false;
+	/* The newer library builds the core1 matrices around its own LUTs (SDR
+	 * read as ~300 nits, mapped back to 100): skipping CVM there keeps the
+	 * matrices but drops the mapping and over-exposes SDR->SDR. The skip only
+	 * suits the original library, whose SDR->SDR LUTs are identity. */
+	if (!is_graphic && dv_pending_new) return false;
 
 	return skip_cvm_tbl[is_graphic]
 		[dolby_vision_graphics_priority]
@@ -6753,7 +6942,7 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 
 	if (drop_flag) {
 		if (dv_new_route(src_format, dv_mode_dst_format(), vinfo))
-			dv_prepare_new(&req, true, false);
+			dv_prepare_new(&req, true, false, src_format);
 		pr_dolby_dbg("drop frame_count %d\n", frame_count);
 		return 1;
 	}
@@ -6934,8 +7123,13 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 		destroy_context();
 	}
 
-	use_new = dv_new_route(src_format, dst_format, vinfo);
-	if (use_new && !dv_prepare_new(&req, false, toggle_mode == 2)) {
+	/* Graphics-only processing (no vf: GUI, or before the first frame of a
+	 * playback) has no video size, which the newer library rejects (-EINVAL).
+	 * Keep it on legacy instead of marking the newer backend failed: that
+	 * flag clears only on the next provider change, so one such call after
+	 * playback start ran the whole playback on legacy. */
+	use_new = video_frame && dv_new_route(src_format, dst_format, vinfo);
+	if (use_new && !dv_prepare_new(&req, false, toggle_mode == 2, src_format)) {
 		dv_new_runtime_failed = true;
 		dv_retire_new();
 		use_new = false;
@@ -7242,7 +7436,11 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 		 * HDR10 stream - so SET the assumed peak deterministically;
 		 * best-effort, the library may assume the nominal 1000-nit
 		 * HLG peak and ignore it. */
-		if (xbmc_dv_sdr_src_max_nits && (dst_format == FORMAT_SDR) &&
+		/* Legacy only: the newer library already tone-maps to the real
+		 * statics (= the 5.15 curve); the cap pushes its curve past
+		 * SDR white and clips the highlights. DV skips it the same way
+		 * (the boost edits md_buf, never dv_new_md). */
+		if (!use_new && xbmc_dv_sdr_src_max_nits && (dst_format == FORMAT_SDR) &&
 		    ((src_format == FORMAT_HDR10) || (src_format == FORMAT_HLG))) {
 			u32 nits = sdr_src_boost_nits(src_format == FORMAT_HLG ?
 				0 : hdr10_param_use.max_content_light_level);
@@ -7268,6 +7466,60 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 						hdr10_param_use.max_frame_avg_light_level = nits;
 				}
 			}
+		}
+
+		if (use_new && (dst_format == FORMAT_SDR) && (src_format == FORMAT_HDR10)) {
+			u32 meas = READ_ONCE(xbmc_dv_new_hdr10_meas_peak);
+
+			/* from the stream's own mastering peak, so it also replaces
+			 * a MaxCLL peak set above */
+			if (meas) {
+				meas = clamp_t(u32, meas, 100, 10000) * 10000;
+				hdr10_param_use.max_display_mastering_lum =
+					min_t(u32, hdr10_param.max_display_mastering_lum, meas);
+			}
+		}
+
+		/* before src_black0, which may zero the min set here */
+		if (use_new && READ_ONCE(xbmc_dv_cb1_l1) && vf &&
+		    (dst_format == FORMAT_SDR) && (src_format == FORMAT_DOVI) &&
+		    !READ_ONCE(xbmc_dv_source_native)) {
+			struct dv_cb1_l1 l1;
+			int got = dv_cb1_get_l1(vf->pts, &l1);
+
+			if (got) {
+				int old = dv_new_set_l1(dv_new_md, dv_new_md_size,
+							l1.min, l1.avg, l1.max);
+
+				if (debug_dolby & 4)
+					pr_info("DOLBY: cb1 pts %u %s l1 %u %u %u (max was %d)\n",
+						vf->pts, got == 1 ? "hit" : "hold",
+						l1.min, l1.avg, l1.max, old);
+			} else if (debug_dolby & 4) {
+				pr_info("DOLBY: cb1 pts %u static\n", vf->pts);
+			}
+		}
+
+		if (use_new && xbmc_dv_new_src_black0 && (dst_format == FORMAT_SDR)) {
+			if (src_format == FORMAT_HDR10)
+				hdr10_param_use.min_display_mastering_lum = 0;
+			else if ((src_format == FORMAT_DOVI) &&
+				 !READ_ONCE(xbmc_dv_source_native)) {
+				int old = dv_new_zero_l1_min(dv_new_md, dv_new_md_size);
+
+				if (debug_dolby & 4)
+					pr_info("DOLBY: src_black0 L1 min %d -> 0\n", old);
+			}
+		}
+
+		if (use_new && READ_ONCE(xbmc_dv_new_static_trim) &&
+		    (dst_format == FORMAT_SDR) && (src_format == FORMAT_DOVI)) {
+			int trim = dv_new_add_l2_trim(dv_new_md, &dv_new_md_size);
+
+			if (debug_dolby & 4)
+				pr_info("DOLBY: static trim %s (%d), md %d\n",
+					trim > 0 ? "added" : trim == 0 ? "present" : "error",
+					trim, dv_new_md_size);
 		}
 
 		dv_graphics_stability_begin();
