@@ -1207,7 +1207,8 @@ void ceca_rx_buf_clear(void)
 
 void ceca_hw_reset(void)
 {
-	write_ao(AO_CEC_GEN_CNTL, 0x1);
+	/* Preserve the system clock, input filter and shared-pin selection. */
+	cec_set_reg_bits(AO_CEC_GEN_CNTL, 1, 0, 3);
 	/* Enable gated clock (Normal mode). */
 	cec_set_reg_bits(AO_CEC_GEN_CNTL, 1, 1, 1);
 	/* Release SW reset */
