@@ -1077,13 +1077,15 @@ void hdmirx_get_emp_info(struct tvin_sig_property_s *prop)
 
 void rx_set_sig_info(void)
 {
-	struct tvin_frontend_s *fe = tvin_get_frontend(TVIN_PORT_HDMI0,
+	/* VDIN's own frontend, in the VDIN module: held for the call */
+	struct tvin_frontend_s *fe = tvin_hold_frontend(TVIN_PORT_HDMI0,
 		VDIN_FRONTEND_IDX);
 
-	if (fe->sm_ops && fe->sm_ops->vdin_set_property)
+	if (fe && fe->sm_ops && fe->sm_ops->vdin_set_property)
 		fe->sm_ops->vdin_set_property(fe);
 	else
 		rx_pr("hdmi notify err\n");
+	tvin_put_frontend(fe);
 }
 
 void rx_update_sig_info(void)

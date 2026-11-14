@@ -239,12 +239,32 @@ static const struct vframe_operations_s vdin_vf_ops = {
  */
 int vdin_open_fe(enum tvin_port_e port, int index,  struct vdin_dev_s *devp)
 {
-	struct tvin_frontend_s *fe = tvin_get_frontend(port, index);
+	struct tvin_frontend_s *fe;
 	int ret = 0;
 
+	/* One frontend at a time: another open would replace it while it is
+	 * still open and held.
+	 */
+	if (devp->frontend) {
+		pr_err("%s(%d): port 0x%x is open already\n",
+		       __func__, devp->index, devp->parm.port);
+		return -1;
+	}
+	/* held until vdin_close_fe() has closed it */
+	fe = tvin_hold_frontend(port, index);
 	if (!fe) {
 		pr_err("%s(%d): not supported port 0x%x\n",
 				__func__, devp->index, port);
+		return -1;
+	}
+	/* The timer below runs the input state machine, which calls these
+	 * unchecked; the VIU loopback has none and starts through
+	 * start_tvin_service() instead.
+	 */
+	if (!fe->sm_ops || !fe->sm_ops->nosig || !fe->sm_ops->fmt_changed) {
+		pr_err("%s(%d): port 0x%x has no input state machine\n",
+		       __func__, devp->index, port);
+		tvin_put_frontend(fe);
 		return -1;
 	}
 
@@ -273,8 +293,13 @@ int vdin_open_fe(enum tvin_port_e port, int index,  struct vdin_dev_s *devp)
 	if (devp->frontend->dec_ops && devp->frontend->dec_ops->open)
 		ret = devp->frontend->dec_ops->open(devp->frontend, port);
 	/* check open status */
-	if (ret)
+	if (ret) {
+		if (devp->msr_clk != NULL)
+			clk_disable_unprepare(devp->msr_clk);
+		devp->frontend = NULL;
+		tvin_put_frontend(fe);
 		return 1;
+	}
 
 	devp->flags |= VDIN_FLAG_DEC_OPENED;
 	/* init vdin state machine */
@@ -308,10 +333,11 @@ void vdin_close_fe(struct vdin_dev_s *devp)
 		clk_disable_unprepare(devp->msr_clk);
 
 	del_timer_sync(&devp->timer);
-	if (devp->frontend && devp->frontend->dec_ops->close) {
+	if (devp->frontend->dec_ops->close)
 		devp->frontend->dec_ops->close(devp->frontend);
-		devp->frontend = NULL;
-	}
+	/* after its close has returned */
+	tvin_put_frontend(devp->frontend);
+	devp->frontend = NULL;
 	devp->parm.port = TVIN_PORT_NULL;
 	devp->parm.info.fmt  = TVIN_SIG_FMT_NULL;
 	devp->parm.info.status = TVIN_SIG_STATUS_NULL;
@@ -604,14 +630,20 @@ static void vdin_double_write_confirm(struct vdin_dev_s *devp)
  * 5. call the callback function of the frontend to start.
  * 6. enable irq .
  */
-void vdin_start_dec(struct vdin_dev_s *devp)
+int vdin_start_dec(struct vdin_dev_s *devp)
 {
 	struct tvin_state_machine_ops_s *sm_ops;
 
 	/* avoid null pointer oops */
 	if (!devp || !devp->fmt_info_p) {
 		pr_info("[vdin]%s null error.\n", __func__);
-		return;
+		return -EINVAL;
+	}
+	/* vdin_stop_dec() needs the frontend to stop what this starts */
+	if (!devp->frontend) {
+		pr_err("vdin%d %s: no frontend is open\n", devp->index,
+		       __func__);
+		return -ENODEV;
 	}
 
 	/* refuse start dec during suspend period,
@@ -620,7 +652,7 @@ void vdin_start_dec(struct vdin_dev_s *devp)
 	if (devp->flags & VDIN_FLAG_SUSPEND) {
 		pr_info("err:[vdin.%d]%s when suspend.\n",
 			devp->index, __func__);
-		return;
+		return -EBUSY;
 	}
 
 	if (devp->frontend && devp->frontend->sm_ops) {
@@ -729,7 +761,13 @@ void vdin_start_dec(struct vdin_dev_s *devp)
 	if (vdin_cma_alloc(devp)) {
 		pr_err("\nvdin%d %s fail for cma alloc fail!!!\n",
 			devp->index, __func__);
-		return;
+		/* nothing to write into: turn off what was turned on above */
+		vdin_clk_onoff(devp, false);
+		if (is_meson_gxl_cpu() || is_meson_gxm_cpu() ||
+		    is_meson_gxbb_cpu() || is_meson_txhd_cpu())
+			switch_vpu_clk_gate_vmod(VPU_VPU_CLKB,
+						 VPU_CLK_GATE_OFF);
+		return -ENOMEM;
 	}
 #endif
 
@@ -864,6 +902,7 @@ void vdin_start_dec(struct vdin_dev_s *devp)
 		pr_info("vdin.%d start time: %ums, run time:%ums.\n",
 				devp->index, jiffies_to_msecs(jiffies),
 				jiffies_to_msecs(jiffies)-devp->start_time);
+	return 0;
 }
 
 /*
@@ -1079,6 +1118,15 @@ int start_tvin_service(int no, struct vdin_parm_s  *para)
 			return -EBUSY;
 		}
 	}
+	/* A frontend another path opened (TVIN_IOC_OPEN, open_port) would be
+	 * replaced while still open and held.
+	 */
+	if (devp->frontend) {
+		pr_err("vdin%d %s: port 0x%x is open already\n", devp->index,
+		       __func__, devp->parm.port);
+		mutex_unlock(&devp->fe_lock);
+		return -EBUSY;
+	}
 
 	devp->parm.port = para->port;
 	devp->parm.info.fmt = para->fmt;
@@ -1128,11 +1176,14 @@ int start_tvin_service(int no, struct vdin_parm_s  *para)
 		return -1;
 	}
 
+	/* Held until stop_tvin_service() has closed it: the frontend may be
+	 * in a module (VIUIN), which must stay loaded while VDIN calls it.
+	 */
 	if ((is_meson_gxbb_cpu()) && (para->bt_path == BT_PATH_GPIO_B)) {
 		devp->bt_path = para->bt_path;
-		fe = tvin_get_frontend(para->port, 1);
+		fe = tvin_hold_frontend(para->port, 1);
 	} else
-		fe = tvin_get_frontend(para->port, 0);
+		fe = tvin_hold_frontend(para->port, 0);
 
 	if (fe) {
 		fe->private_data = para;
@@ -1143,18 +1194,54 @@ int start_tvin_service(int no, struct vdin_parm_s  *para)
 		if (devp->msr_clk != NULL)
 			clk_prepare_enable(devp->msr_clk);
 
-		if (fe->dec_ops->open)
-			fe->dec_ops->open(fe, fe->port);
+		ret = fe->dec_ops->open ? fe->dec_ops->open(fe, fe->port) : 0;
+		if (ret) {
+			pr_err("vdin%d %s: port 0x%x did not open (%d)\n",
+			       devp->index, __func__, para->port, ret);
+			if (devp->msr_clk != NULL)
+				clk_disable_unprepare(devp->msr_clk);
+			devp->frontend = NULL;
+			tvin_put_frontend(fe);
+			if (para->fmt >= TVIN_SIG_FMT_MAX) {
+				kfree(devp->fmt_info_p);
+				devp->fmt_info_p = NULL;
+			}
+			mutex_unlock(&devp->fe_lock);
+			return -EIO;
+		}
 	} else {
 		pr_err("%s(%d): not supported port 0x%x\n",
 				__func__, no, para->port);
+		if (para->fmt >= TVIN_SIG_FMT_MAX) {
+			kfree(devp->fmt_info_p);
+			devp->fmt_info_p = NULL;
+		}
 		mutex_unlock(&devp->fe_lock);
 		return -1;
 	}
 	/* #ifdef CONFIG_ARCH_MESON6 */
 	/* switch_mod_gate_by_name("vdin", 1); */
 	/* #endif */
-	vdin_start_dec(devp);
+	ret = vdin_start_dec(devp);
+	if (ret) {
+		/* Nothing started: close the frontend and drop what this start
+		 * set up, so that the next start finds vdin idle.
+		 */
+		pr_err("vdin%d %s: start failed (%d)\n", devp->index, __func__,
+		       ret);
+		if (fe->dec_ops->close)
+			fe->dec_ops->close(fe);
+		devp->frontend = NULL;
+		tvin_put_frontend(fe);
+		if (devp->msr_clk != NULL)
+			clk_disable_unprepare(devp->msr_clk);
+		if (para->fmt >= TVIN_SIG_FMT_MAX) {
+			kfree(devp->fmt_info_p);
+			devp->fmt_info_p = NULL;
+		}
+		mutex_unlock(&devp->fe_lock);
+		return ret;
+	}
 	devp->flags |= VDIN_FLAG_DEC_OPENED;
 	devp->flags |= VDIN_FLAG_DEC_STARTED;
 
@@ -1168,13 +1255,26 @@ int start_tvin_service(int no, struct vdin_parm_s  *para)
 		if (!(devp->flags & VDIN_FLAG_ISR_REQ)) {
 			ret = request_irq(devp->irq, vdin_v4l2_isr, IRQF_SHARED,
 				devp->irq_name, (void *)devp);
-			devp->flags |= VDIN_FLAG_ISR_REQ;
-
 			if (ret != 0) {
 				pr_info("vdin_v4l2_isr request irq error.\n");
+				/* undo the start, as for a failed one above */
+				vdin_stop_dec(devp);
+				if (fe->dec_ops->close)
+					fe->dec_ops->close(fe);
+				devp->frontend = NULL;
+				tvin_put_frontend(fe);
+				if (devp->msr_clk != NULL)
+					clk_disable_unprepare(devp->msr_clk);
+				if (para->fmt >= TVIN_SIG_FMT_MAX) {
+					kfree(devp->fmt_info_p);
+					devp->fmt_info_p = NULL;
+				}
+				devp->flags &= ~(VDIN_FLAG_DEC_OPENED |
+						 VDIN_FLAG_DEC_STARTED);
 				mutex_unlock(&devp->fe_lock);
-				return -1;
+				return ret;
 			}
+			devp->flags |= VDIN_FLAG_ISR_REQ;
 			disable_irq(devp->irq);
 			devp->flags &= ~VDIN_FLAG_ISR_EN;
 			if (vdin_dbg_en)
@@ -1209,6 +1309,10 @@ int stop_tvin_service(int no)
 	unsigned int end_time;
 
 	devp = vdin_devp[no];
+	if (IS_ERR_OR_NULL(devp)) {
+		pr_err("[vdin]%s vdin%d has't registered\n", __func__, no);
+		return -ENODEV;
+	}
 	mutex_lock(&devp->fe_lock);
 
 	if ((devp->parm.reserved & PARAM_STATE_HISTGRAM) &&
@@ -1229,18 +1333,28 @@ int stop_tvin_service(int no)
 	devp->matrix_pattern_mode = 0;
 	vdin_stop_dec(devp);
 	/*close fe*/
-	if (devp->frontend->dec_ops->close)
-		devp->frontend->dec_ops->close(devp->frontend);
+	if (devp->frontend) {
+		if (devp->frontend->dec_ops->close)
+			devp->frontend->dec_ops->close(devp->frontend);
+		/* after its close has returned */
+		tvin_put_frontend(devp->frontend);
+		devp->frontend = NULL;
+		/* enabled with the frontend's open */
+		if (devp->msr_clk != NULL)
+			clk_disable_unprepare(devp->msr_clk);
+	}
 	/*free the memory allocated in start tvin service*/
-	if (devp->parm.info.fmt >= TVIN_SIG_FMT_MAX)
+	if (devp->parm.info.fmt >= TVIN_SIG_FMT_MAX) {
 		kfree(devp->fmt_info_p);
+		devp->fmt_info_p = NULL;
+	}
 /* #ifdef CONFIG_ARCH_MESON6 */
 /* switch_mod_gate_by_name("vdin", 0); */
 /* #endif */
 	devp->flags &= (~VDIN_FLAG_DEC_OPENED);
 	devp->flags &= (~VDIN_FLAG_DEC_STARTED);
-	if ((devp->parm.port != TVIN_PORT_VIU1) ||
-		(viu_hw_irq != 0)) {
+	/* the interrupt this start or the reader's open requested, if any */
+	if (devp->flags & VDIN_FLAG_ISR_REQ) {
 		free_irq(devp->irq, (void *)devp);
 
 		if (vdin_dbg_en)
@@ -1288,7 +1402,7 @@ int start_tvin_capture_ex(int dev_num, int port, struct vdin_parm_s  *para)
 static void get_tvin_canvas_info(int *start, int *num)
 {
 	*start = vdin_canvas_ids[0][0];
-	*num = vdin_devp[0]->canvas_max_num;
+	*num = vdin_devp[0] ? vdin_devp[0]->canvas_max_num : 0;
 }
 EXPORT_SYMBOL(get_tvin_canvas_info);
 
@@ -1306,12 +1420,13 @@ static int vdin_ioctl_fe(int no, struct fe_arg_s *parm)
 		devp->frontend->dec_ops->ioctl)
 		ret = devp->frontend->dec_ops->ioctl(devp->frontend, parm->arg);
 	else if (!devp->frontend) {
-		devp->frontend = tvin_get_frontend(parm->port, parm->index);
-		if (devp->frontend &&
-			devp->frontend->dec_ops &&
-			devp->frontend->dec_ops->ioctl)
-			ret = devp->frontend->dec_ops->ioctl(devp->frontend,
-					parm->arg);
+		/* held for this call only: nothing opened it */
+		struct tvin_frontend_s *fe =
+			tvin_hold_frontend(parm->port, parm->index);
+
+		if (fe && fe->dec_ops && fe->dec_ops->ioctl)
+			ret = fe->dec_ops->ioctl(fe, parm->arg);
+		tvin_put_frontend(fe);
 	}
 	return ret;
 }
@@ -2649,7 +2764,23 @@ static int vdin_open(struct inode *inode, struct file *file)
 	if (devp->index >= VDIN_MAX_DEVS)
 		return -ENXIO;
 
-	if (devp->flags & VDIN_FLAG_FS_OPENED) {
+	/* The loopback VDIN serves one reader at a time. A second descriptor,
+	 * or one opened over a session another path started, would stop that
+	 * session and free its interrupt at its release. reader_lock is held
+	 * through the whole open, so a release still tearing down cannot
+	 * overlap it.
+	 */
+	if (devp->index > 0) {
+		mutex_lock(&devp->reader_lock);
+		/* nor over a frontend or an interrupt a debug command left */
+		if ((devp->flags &
+		     (VDIN_FLAG_FS_OPENED | VDIN_FLAG_DEC_STARTED |
+		      VDIN_FLAG_DEC_OPENED | VDIN_FLAG_ISR_REQ)) ||
+		    devp->frontend) {
+			mutex_unlock(&devp->reader_lock);
+			return -EBUSY;
+		}
+	} else if (devp->flags & VDIN_FLAG_FS_OPENED) {
 		if (vdin_dbg_en)
 			pr_info("%s, device %s opened already\n",
 					__func__, dev_name(devp->dev));
@@ -2660,6 +2791,8 @@ static int vdin_open(struct inode *inode, struct file *file)
 		switch_vpu_mem_pd_vmod(VPU_AFBCE, VPU_MEM_POWER_ON);
 
 	devp->flags |= VDIN_FLAG_FS_OPENED;
+	devp->crash_irq_req = false;
+	devp->wr_done_irq_req = false;
 
 	/* request irq */
 	if (work_mode_simple) {
@@ -2670,6 +2803,8 @@ static int vdin_open(struct inode *inode, struct file *file)
 			pr_info("%s vdin.%d simple request_irq\n", __func__,
 				devp->index);
 	} else {
+		bool crash_irq = false;
+
 		if (devp->index == 0)
 			ret = request_irq(devp->irq, vdin_isr, IRQF_SHARED,
 					devp->irq_name, (void *)devp);
@@ -2678,22 +2813,49 @@ static int vdin_open(struct inode *inode, struct file *file)
 					devp->irq_name, (void *)devp);
 
 		pr_info("vdin%d req vs irq %d\n", devp->index, devp->irq);
-		if (cpu_after_eq(MESON_CPU_MAJOR_ID_TM2) && devp->index == 0 &&
-		    devp->vpu_crash_irq > 0) {
-			ret |= request_irq(devp->vpu_crash_irq, vpu_crash_isr,
-					   IRQF_SHARED,
-					   devp->vpu_crash_irq_name,
-					   (void *)devp);
+		if (!ret && cpu_after_eq(MESON_CPU_MAJOR_ID_TM2) &&
+		    devp->index == 0 && devp->vpu_crash_irq > 0) {
+			ret = request_irq(devp->vpu_crash_irq, vpu_crash_isr,
+					  IRQF_SHARED,
+					  devp->vpu_crash_irq_name,
+					  (void *)devp);
+			if (ret)
+				free_irq(devp->irq, (void *)devp);
+			else
+				crash_irq = true;
 			pr_info("vdin%d req crash irq %d\n",
 				devp->index, devp->vpu_crash_irq);
 		}
-		if (devp->wr_done_irq > 0) {
+		if (!ret && devp->wr_done_irq > 0) {
 			ret = request_irq(devp->wr_done_irq,
 					vdin_write_done_isr, IRQF_SHARED,
 					devp->wr_done_irq_name, (void *)devp);
+			if (ret) {
+				free_irq(devp->irq, (void *)devp);
+				if (crash_irq)
+					free_irq(devp->vpu_crash_irq,
+						 (void *)devp);
+			}
 			pr_info("vdin%d req wr_done irq %d\n", devp->index,
 				devp->wr_done_irq);
 		}
+		if (!ret) {
+			devp->crash_irq_req = crash_irq;
+			devp->wr_done_irq_req = devp->wr_done_irq > 0;
+		}
+	}
+	/* A failed open leaves no interrupt and no open device behind: no
+	 * release runs for it, so the next open must find the device free.
+	 */
+	if (ret) {
+		pr_err("vdin%d: interrupt request failed (%d)\n",
+		       devp->index, ret);
+		devp->flags &= ~VDIN_FLAG_FS_OPENED;
+		if (cpu_after_eq(MESON_CPU_MAJOR_ID_TL1))
+			switch_vpu_mem_pd_vmod(VPU_AFBCE, VPU_MEM_POWER_DOWN);
+		if (devp->index > 0)
+			mutex_unlock(&devp->reader_lock);
+		return ret;
 	}
 	devp->flags |= VDIN_FLAG_ISR_REQ;
 	devp->flags &= (~VDIN_FLAG_ISR_EN);
@@ -2716,6 +2878,8 @@ static int vdin_open(struct inode *inode, struct file *file)
 	/* WRITE_VCBUS_REG(VPP_PREBLEND_VD1_V_START_END, 0x00000fff); */
 	if (vdin_dbg_en)
 		pr_info("open device %s ok\n", dev_name(devp->dev));
+	if (devp->index > 0)
+		mutex_unlock(&devp->reader_lock);
 	return ret;
 }
 
@@ -2729,17 +2893,23 @@ static int vdin_release(struct inode *inode, struct file *file)
 {
 	struct vdin_dev_s *devp = file->private_data;
 
+	/* The device stays open until its teardown is done: a reader opening
+	 * meanwhile waits, then registers its own interrupt.
+	 */
+	if (devp->index > 0)
+		mutex_lock(&devp->reader_lock);
 	if (!(devp->flags & VDIN_FLAG_FS_OPENED)) {
 		if (vdin_dbg_en)
 			pr_info("%s, device %s not opened\n",
 					__func__, dev_name(devp->dev));
+		if (devp->index > 0)
+			mutex_unlock(&devp->reader_lock);
 		return 0;
 	}
 
 	if (cpu_after_eq(MESON_CPU_MAJOR_ID_TL1))
 		switch_vpu_mem_pd_vmod(VPU_AFBCE, VPU_MEM_POWER_DOWN);
 
-	devp->flags &= (~VDIN_FLAG_FS_OPENED);
 	if (devp->flags & VDIN_FLAG_DEC_STARTED) {
 		devp->flags |= VDIN_FLAG_DEC_STOP_ISR;
 		vdin_stop_dec(devp);
@@ -2753,21 +2923,21 @@ static int vdin_release(struct inode *inode, struct file *file)
 	}
 	devp->flags &= (~VDIN_FLAG_SNOW_FLAG);
 
-	/* free irq */
-	if (devp->flags & VDIN_FLAG_ISR_REQ) {
+	/* free irq: the main one unless a stop freed it already, and the
+	 * ones this open requested, which a stop leaves
+	 */
+	if (devp->flags & VDIN_FLAG_ISR_REQ)
 		free_irq(devp->irq, (void *)devp);
-
-		if (cpu_after_eq(MESON_CPU_MAJOR_ID_TM2) && devp->index == 0 &&
-		    devp->vpu_crash_irq > 0)
-			free_irq(devp->vpu_crash_irq, (void *)devp);
-		if (devp->wr_done_irq > 0)
-			free_irq(devp->wr_done_irq, (void *)devp);
-
-		if (vdin_dbg_en)
-			pr_info("%s vdin.%d free_irq\n", __func__,
-				devp->index);
-	}
+	if (devp->crash_irq_req)
+		free_irq(devp->vpu_crash_irq, (void *)devp);
+	if (devp->wr_done_irq_req)
+		free_irq(devp->wr_done_irq, (void *)devp);
+	devp->crash_irq_req = false;
+	devp->wr_done_irq_req = false;
+	if (vdin_dbg_en)
+		pr_info("%s vdin.%d free_irq\n", __func__, devp->index);
 	devp->flags &= (~VDIN_FLAG_ISR_REQ);
+	devp->flags &= (~VDIN_FLAG_FS_OPENED);
 
 	file->private_data = NULL;
 
@@ -2777,6 +2947,8 @@ static int vdin_release(struct inode *inode, struct file *file)
 	pr_info("vdin%d close device %s ok flags=0x%x\n", devp->index,
 		dev_name(devp->dev),
 		devp->flags);
+	if (devp->index > 0)
+		mutex_unlock(&devp->reader_lock);
 	return 0;
 }
 
@@ -2908,7 +3080,14 @@ static long vdin_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			mutex_unlock(&devp->fe_lock);
 			break;
 		}
-		vdin_start_dec(devp);
+		ret = vdin_start_dec(devp);
+		if (ret) {
+			/* nothing started: no IRQ, the decoder stays idle */
+			pr_err("TVIN_IOC_START_DEC(%d) failed (%ld)\n",
+			       devp->index, ret);
+			mutex_unlock(&devp->fe_lock);
+			break;
+		}
 		devp->flags |= VDIN_FLAG_DEC_STARTED;
 		if ((devp->parm.port != TVIN_PORT_VIU1) ||
 			(viu_hw_irq != 0)) {
@@ -3179,12 +3358,13 @@ static long vdin_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 			break;
 		}
-		fe = tvin_get_frontend(port_call, 0);
+		fe = tvin_hold_frontend(port_call, 0);
 		if (fe && fe->dec_ops && fe->dec_ops->callmaster_det) {
 			/*call the frontend det function*/
 			callmaster_status =
 				fe->dec_ops->callmaster_det(port_call, fe);
 		}
+		tvin_put_frontend(fe);
 		if (vdin_dbg_en)
 			pr_info("[vdin.%d]:%s callmaster_status=%d,port_call=[%s]\n",
 					devp->index, __func__,
@@ -3341,7 +3521,10 @@ static long vdin_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		//devp->flags |= VDIN_FLAG_V4L2_DEBUG;
 		devp->hist_bar_enable = 1;
-		start_tvin_service(devp->index, &param);
+		/* -EBUSY while another session runs, which the caller must not
+		 * then stop
+		 */
+		ret = start_tvin_service(devp->index, &param);
 		break;
 
 	case TVIN_IOC_S_VDIN_V4L2STOP:
@@ -3352,7 +3535,7 @@ static long vdin_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		devp->parm.reserved &= ~PARAM_STATE_HISTGRAM;
 		devp->parm.reserved &= ~PARAM_STATE_WR_MEM_ORDER_STD;
 
-		devp->flags &= (~VDIN_FLAG_ISR_REQ);
+		/* stop_tvin_service() frees the interrupt and clears ISR_REQ */
 		/*devp->flags &= (~VDIN_FLAG_FS_OPENED);*/
 		stop_tvin_service(devp->index);
 
@@ -3605,6 +3788,23 @@ static long vdin_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			pr_info("TVIN_IOC_P_BUF: buf is NULL\n");
 
 		break;
+	case TVIN_IOC_G_MEM_INFO: {
+		/* where vdin_mmap() maps from, so that a reader can find the
+		 * buffers TVIN_IOC_G_BUF reports by physical address
+		 */
+		struct vdin_mem_info_s mem_info = {0};
+
+		mutex_lock(&devp->fe_lock);
+		if (devp->cma_mem_alloc &&
+		    !(devp->cma_config_flag & MEM_ALLOC_DISCRETE)) {
+			mem_info.mem_start = devp->mem_start;
+			mem_info.mem_size = devp->mem_size;
+		}
+		mutex_unlock(&devp->fe_lock);
+		if (copy_to_user(argp, &mem_info, sizeof(mem_info)))
+			ret = -EFAULT;
+		break;
+	}
 	default:
 		ret = -ENOIOCTLCMD;
 	/* pr_info("%s %d is not supported command\n", __func__, cmd); */
@@ -4139,6 +4339,7 @@ static int vdin_drv_probe(struct platform_device *pdev)
 	/* malloc vdev */
 	vdevp = kzalloc(sizeof(struct vdin_dev_s), GFP_KERNEL);
 	if (!vdevp) {
+		ret = -ENOMEM;
 		goto fail_kzalloc_vdev;
 	}
 	if (pdev->dev.of_node) {
@@ -4146,8 +4347,13 @@ static int vdin_drv_probe(struct platform_device *pdev)
 				"vdin_id", &(vdevp->index));
 		if (ret) {
 			pr_err("don't find  vdin id.\n");
-			goto fail_get_resource_irq;
+			goto fail_vdin_id;
 		}
+	}
+	if (vdevp->index >= VDIN_MAX_DEVS) {
+		pr_err("vdin id %u out of range\n", vdevp->index);
+		ret = -EINVAL;
+		goto fail_vdin_id;
 	}
 	vdin_devp[vdevp->index] = vdevp;
 #ifdef CONFIG_AMLOGIC_MEDIA_RDMA
@@ -4302,8 +4508,10 @@ static int vdin_drv_probe(struct platform_device *pdev)
 				devm_kzalloc(vdevp->dev,
 					sizeof(struct vdin_afbce_s),
 					GFP_KERNEL);
-			if (!vdevp->afbce_info)
-				goto fail_kzalloc_vdev;
+			if (!vdevp->afbce_info) {
+				ret = -ENOMEM;
+				goto fail_get_resource_irq;
+			}
 		}
 	}
 
@@ -4331,6 +4539,7 @@ static int vdin_drv_probe(struct platform_device *pdev)
 	/* init vdin parameters */
 	vdevp->flags = VDIN_FLAG_NULL;
 	mutex_init(&vdevp->fe_lock);
+	mutex_init(&vdevp->reader_lock);
 	spin_lock_init(&vdevp->isr_lock);
 	spin_lock_init(&vdevp->hist_lock);
 	vdevp->frontend = NULL;
@@ -4341,6 +4550,7 @@ static int vdin_drv_probe(struct platform_device *pdev)
 				   &vdin_sm_ops,
 				   VDIN_FRONTEND_IDX + vdevp->index);
 		sprintf(vdevp->vdin_frontend.name, "%s", VDIN_DEV_NAME);
+		vdevp->vdin_frontend.owner = THIS_MODULE;
 		if (tvin_reg_frontend(&vdevp->vdin_frontend) < 0)
 			pr_info("vdin_frontend reg error!!!\n");
 	}
@@ -4376,6 +4586,7 @@ static int vdin_drv_probe(struct platform_device *pdev)
 	vdevp->vfp = vf_pool_alloc(VDIN_CANVAS_MAX_CNT);
 	if (vdevp->vfp == NULL) {
 		pr_err("%s: fail to alloc vf pool.\n", __func__);
+		ret = -ENOMEM;
 		goto fail_alloc_vf_pool;
 	}
 	/* init vframe provider */
@@ -4407,7 +4618,8 @@ static int vdin_drv_probe(struct platform_device *pdev)
 		vdevp->msr_clk = clk_get(&pdev->dev, "cts_vid_lock_clk");
 		if (IS_ERR(clk) || IS_ERR(vdevp->msr_clk)) {
 			pr_err("%s: vdin cannot get msr clk !!!\n", __func__);
-			clk = NULL;
+			if (!IS_ERR(vdevp->msr_clk))
+				clk_put(vdevp->msr_clk);
 			vdevp->msr_clk = NULL;
 		} else {
 			clk_set_parent(vdevp->msr_clk, clk);
@@ -4415,6 +4627,9 @@ static int vdin_drv_probe(struct platform_device *pdev)
 			pr_info("%s: vdin msr clock is %d MHZ\n", __func__,
 					vdevp->msr_clk_val/1000000);
 		}
+		/* the measure clock keeps its parent */
+		if (!IS_ERR(clk))
+			clk_put(clk);
 	} else {
 		struct clk *fclk_div5;
 		unsigned int clk_rate;
@@ -4431,7 +4646,6 @@ static int vdin_drv_probe(struct platform_device *pdev)
 		if (IS_ERR(vdevp->msr_clk)) {
 			pr_err("%s: vdin%d cannot get msr clk\n",
 			       __func__, vdevp->index);
-			fclk_div5 = NULL;
 			vdevp->msr_clk = NULL;
 		} else {
 			if (!IS_ERR(fclk_div5))
@@ -4445,6 +4659,9 @@ static int vdin_drv_probe(struct platform_device *pdev)
 				__func__, vdevp->index,
 				vdevp->msr_clk_val / 1000000);
 		}
+		/* the measure clock keeps its parent */
+		if (!IS_ERR(fclk_div5))
+			clk_put(fclk_div5);
 	}
 	/*disable vdin hardware*/
 	vdin_enable_module(vdevp, false);
@@ -4463,6 +4680,7 @@ static int vdin_drv_probe(struct platform_device *pdev)
 	vdevp->dv.dv_config = false;
 	INIT_DELAYED_WORK(&vdevp->dv.dv_dwork, vdin_dv_dwork);
 	INIT_DELAYED_WORK(&vdevp->vlock_dwork, vdin_vlock_dwork);
+	setup_timer(&vdevp->timer, vdin_timer_func, (ulong)vdevp);
 	/*vdin event*/
 	INIT_DELAYED_WORK(&vdevp->event_dwork, vdin_event_work);
 	vdin_extcon_register(pdev, vdevp);
@@ -4483,12 +4701,21 @@ static int vdin_drv_probe(struct platform_device *pdev)
 	return 0;
 
 fail_alloc_vf_pool:
+	if (vdevp->index == 0)
+		tvin_unreg_frontend(&vdevp->vdin_frontend);
 fail_get_resource_irq:
+	of_reserved_mem_device_release(&pdev->dev);
 fail_create_dev_file:
 	vdin_delete_device(vdevp->index);
 fail_create_device:
 	cdev_del(&vdevp->cdev);
 fail_add_cdev:
+#ifdef CONFIG_AMLOGIC_MEDIA_RDMA
+	if (vdevp->rdma_handle > 0)
+		rdma_unregister(vdevp->rdma_handle);
+#endif
+	vdin_devp[vdevp->index] = NULL;
+fail_vdin_id:
 	kfree(vdevp);
 fail_kzalloc_vdev:
 	return ret;
@@ -4502,23 +4729,90 @@ fail_kzalloc_vdev:
  */
 static int vdin_drv_remove(struct platform_device *pdev)
 {
-	int ret;
-
 	struct vdin_dev_s *vdevp;
 	vdevp = platform_get_drvdata(pdev);
+	/* First shut the ways in. Removing the sysfs attributes waits for
+	 * writes in progress and refuses new ones, so no debug command can
+	 * start a capture after the check below; the debugfs files and the
+	 * video node go too. An open descriptor of /dev/vdinN or of the video
+	 * node holds this module, and sysfs unbind is suppressed, so none is
+	 * open here. The video calls do nothing for what was not registered.
+	 */
+	vdin_rm_dev_class_files(vdevp->dev);
 	if (vdevp->report_active_area)
 		device_remove_file(vdevp->dev, &dev_attr_active_area);
-
-	ret = cancel_delayed_work(&vdevp->vlock_dwork);
-	ret = cancel_delayed_work(&vdevp->event_dwork);
-#ifdef CONFIG_AMLOGIC_MEDIA_RDMA
-	rdma_unregister(vdevp->rdma_handle);
-#endif
-	mutex_destroy(&vdevp->fe_lock);
-
 	vdin_debugfs_exit(vdevp);/*2018-07-18 add debugfs*/
+	of_reserved_mem_device_release(&vdevp->vdev.dev);
+	video_unregister_device(&vdevp->vdev);
+	v4l2_device_unregister(&vdevp->v4l2_dev);
+	/* Then stop what a debug command left running: its write-back and
+	 * this module's interrupt handler, and a frontend open without a
+	 * session, which holds the frontend's module.
+	 */
+	if (vdevp->flags & VDIN_FLAG_DEC_STARTED) {
+		if (vdevp->frontend) {
+			stop_tvin_service(vdevp->index);
+		} else {
+			/* an MPEG-in session (VDIN_CMD_MPEGIN_START), the
+			 * only one without a frontend
+			 */
+			struct vdin_arg_s arg = { .cmd = VDIN_CMD_MPEGIN_STOP };
+
+			vdin_func(vdevp->index, &arg);
+		}
+	}
+	if (vdevp->frontend)
+		vdin_close_fe(vdevp);
+	/* What a debug command or ioctl registered without a session: the
+	 * interrupt handler (request_irq), and the frame providers (vf_reg,
+	 * TVIN_IOC_VF_REG, or a start whose stop ran in another work mode).
+	 * vf_unreg_provider() finds a provider by name and does nothing when
+	 * it is not registered; the DV provider is only ever this device's on
+	 * its DV path.
+	 */
+	if (vdevp->flags & VDIN_FLAG_ISR_REQ) {
+		free_irq(vdevp->irq, (void *)vdevp);
+		vdevp->flags &= ~(VDIN_FLAG_ISR_REQ | VDIN_FLAG_ISR_EN);
+	}
+	vf_unreg_provider(&vdevp->vprov);
+	if (vdevp->index == vdevp->dv.dv_path_idx)
+		vf_unreg_provider(&vdevp->dv.vprov_dv);
+	vdevp->flags &= ~VDIN_FLAG_DEC_REGED;
+	/* The frontend list is tvin's and outlives this module: vdin0's entry
+	 * lives in the device freed below.
+	 */
+	if (vdevp->index == 0)
+		tvin_unreg_frontend(&vdevp->vdin_frontend);
+	/* No signal callback may run into this device, or this module once it
+	 * is unloaded: unregistering waits for a running one. Then nothing is
+	 * left to queue the work below.
+	 */
+	if (vdevp->index)
+		vd_signal_unregister_client(&vdin_signal_notifier);
+
+	cancel_delayed_work_sync(&vdevp->vlock_dwork);
+	cancel_delayed_work_sync(&vdevp->event_dwork);
+	cancel_delayed_work_sync(&vdevp->dv.dv_dwork);
+	if (vdevp->extcon_event) {
+		extcon_dev_unregister(vdevp->extcon_event);
+		extcon_dev_free(vdevp->extcon_event);
+		vdevp->extcon_event = NULL;
+	}
+#ifdef CONFIG_AMLOGIC_MEDIA_RDMA
+	if (vdevp->rdma_handle > 0)
+		rdma_unregister(vdevp->rdma_handle);
+#endif
+	/* probe enabled the measure clock, except on gxbb */
+	if (vdevp->msr_clk) {
+		if (!is_meson_gxbb_cpu())
+			clk_disable_unprepare(vdevp->msr_clk);
+		clk_put(vdevp->msr_clk);
+		vdevp->msr_clk = NULL;
+	}
+	mutex_destroy(&vdevp->fe_lock);
+	mutex_destroy(&vdevp->reader_lock);
+
 	vf_pool_free(vdevp->vfp);
-	vdin_rm_dev_class_files(vdevp->dev);
 	vdin_delete_device(vdevp->index);
 	cdev_del(&vdevp->cdev);
 	vdin_devp[vdevp->index] = NULL;
@@ -4527,6 +4821,8 @@ static int vdin_drv_remove(struct platform_device *pdev)
 	dev_set_drvdata(vdevp->dev, NULL);
 	platform_set_drvdata(pdev, NULL);
 	kfree(vdevp);
+	/* assigned again by the next probe */
+	of_reserved_mem_device_release(&pdev->dev);
 	pr_info("%s: driver removed ok\n", __func__);
 	return 0;
 }
@@ -4648,6 +4944,10 @@ static struct platform_driver vdin_driver = {
 	.driver	= {
 		.name	        = VDIN_DRV_NAME,
 		.of_match_table = vdin_dt_match,
+		/* removal only with the module: an unbind would not wait for
+		 * open descriptors, which hold the module
+		 */
+		.suppress_bind_attrs = true,
 	}
 };
 
@@ -4699,12 +4999,13 @@ fail_alloc_cdev_region:
 static void __exit vdin_drv_exit(void)
 {
 	vdin_unreg_v4l2();
+	/* in reverse of vdin_drv_init(): the devices go before their class */
+	platform_driver_unregister(&vdin_driver);
 #ifdef DEBUG_SUPPORT
 	vdin_remove_class_files(vdin_clsp);
 #endif
 	class_destroy(vdin_clsp);
 	unregister_chrdev_region(vdin_devno, VDIN_MAX_DEVS);
-	platform_driver_unregister(&vdin_driver);
 }
 
 

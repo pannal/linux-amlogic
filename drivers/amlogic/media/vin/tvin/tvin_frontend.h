@@ -20,6 +20,7 @@
 
 /* Standard Linux Headers */
 #include <linux/list.h>
+#include <linux/module.h>
 
 /* Amlogic Headers */
 #include <linux/amlogic/media/vfm/vframe.h>
@@ -78,6 +79,8 @@ struct tvin_frontend_s {
 	void *private_data;
 	unsigned int reserved;
 	struct list_head list;
+	/* the module the ops are in; NULL when built in */
+	struct module *owner;
 };
 
 #define VDIN_FRONTEND_IDX	0x10
@@ -87,10 +90,12 @@ int tvin_frontend_init(struct tvin_frontend_s *fe,
 		struct tvin_state_machine_ops_s *sm_ops, int index);
 int tvin_reg_frontend(struct tvin_frontend_s *fe);
 void tvin_unreg_frontend(struct tvin_frontend_s *fe);
-struct tvin_frontend_s *tvin_get_frontend(enum tvin_port_e port, int index);
-struct tvin_decoder_ops_s *tvin_get_fe_ops(enum tvin_port_e port, int index);
-struct tvin_state_machine_ops_s *tvin_get_sm_ops(enum tvin_port_e port,
-		int index);
+/* Looks the frontend up and holds its module until tvin_put_frontend(),
+ * so that it cannot be unloaded while it is in use; NULL if there is none
+ * or it is going away. The only lookup: a frontend may be in a module.
+ */
+struct tvin_frontend_s *tvin_hold_frontend(enum tvin_port_e port, int index);
+void tvin_put_frontend(struct tvin_frontend_s *fe);
 
 #endif
 

@@ -393,6 +393,18 @@ struct tvin_video_buf_s {
 	unsigned int reserved;
 };
 
+/*
+ * The frame memory of the running session, which mmap() of the vdin device
+ * maps from offset 0: a buffer that TVIN_IOC_G_BUF reports at physical
+ * address p is at offset p - mem_start. All zero while no contiguous frame
+ * memory is allocated. The same layout for 32- and 64-bit callers.
+ */
+struct vdin_mem_info_s {
+	__u64 mem_start;
+	__u32 mem_size;
+	__u32 reserved;
+};
+
 /* hs=he=vs=ve=0 is to disable Cut Window */
 struct tvin_cutwin_s {
 	unsigned short hs;
@@ -515,6 +527,7 @@ bool IS_TVAFE_AVIN_SRC(enum tvin_port_e port);
 #define TVIN_IOC_S_PC_MODE		_IOW(_TM_T, 0x50, unsigned int)
 #define TVIN_IOC_S_FRAME_WR_EN		_IOW(_TM_T, 0x51, unsigned int)
 #define TVIN_IOC_G_INPUT_TIMING		_IOW(_TM_T, 0x52, struct tvin_format_s)
+#define TVIN_IOC_G_MEM_INFO		_IOR(_TM_T, 0x53, struct vdin_mem_info_s)
 
 #define TVIN_IOC_S_CANVAS_RECOVERY  _IO(_TM_T, 0x0a)
 /* TVAFE */

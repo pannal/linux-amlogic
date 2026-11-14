@@ -85,7 +85,7 @@ static ssize_t sig_det_store(struct device *dev,
 	else
 		port = val;
 
-	frontend = tvin_get_frontend(port, 0);
+	frontend = tvin_hold_frontend(port, 0);
 	if (frontend && frontend->dec_ops &&
 		frontend->dec_ops->callmaster_det) {
 		/*call the frontend det function*/
@@ -93,6 +93,7 @@ static ssize_t sig_det_store(struct device *dev,
 						frontend);
 		/* pr_info("%d\n",callmaster_status); */
 	}
+	tvin_put_frontend(frontend);
 	pr_info("[vdin.%d]:%s callmaster_status=%d,port=[%s]\n",
 			devp->index, __func__,
 			callmaster_status, tvin_port_str(port));
@@ -1639,11 +1640,12 @@ static void vdin_dump_regs(struct vdin_dev_s *devp)
 
 void vdin_test_front_end(void)
 {
-	struct tvin_frontend_s *fe = tvin_get_frontend(TVIN_PORT_HDMI0,
+	struct tvin_frontend_s *fe = tvin_hold_frontend(TVIN_PORT_HDMI0,
 		VDIN_FRONTEND_IDX);
 
-	if (fe->sm_ops && fe->sm_ops->vdin_set_property)
+	if (fe && fe->sm_ops && fe->sm_ops->vdin_set_property)
 		fe->sm_ops->vdin_set_property(fe);
+	tvin_put_frontend(fe);
 }
 
 /*
@@ -1661,7 +1663,7 @@ void vdin_test_front_end(void)
 * 6.modify for vdin fmt & color fmt conversion
 * echo conversion w h cfmt >/sys/class/vdin/vdin0/attr
 */
-static ssize_t vdin_attr_store(struct device *dev,
+static ssize_t vdin_attr_store_cmd(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t len)
 {
@@ -1673,6 +1675,8 @@ static ssize_t vdin_attr_store(struct device *dev,
 	unsigned int temp;
 	unsigned int mode = 0, flag = 0;
 	unsigned int offset;
+	/* a command that failed returns this to the writer */
+	ssize_t err = 0;
 
 	if (!buf)
 		return len;
@@ -1706,20 +1710,50 @@ static ssize_t vdin_attr_store(struct device *dev,
 			vdin_dump_mem(parm[1], devp);
 		}
 	} else if  (!strcmp(parm[0], "request_irq")) {
-		snprintf(devp->irq_name, sizeof(devp->irq_name),
-				"vdin%d-irq", devp->index);
-		pr_info("vdin work in normal mode\n");
-		ret = request_irq(devp->irq, vdin_isr, IRQF_SHARED,
-				devp->irq_name, (void *)devp);
+		/* one handler, tracked as the others are: a stop, or the
+		 * driver's removal, frees it
+		 */
+		if (devp->flags & VDIN_FLAG_ISR_REQ) {
+			pr_err("vdin%d: interrupt requested already\n",
+			       devp->index);
+			err = -EBUSY;
+		} else {
+			snprintf(devp->irq_name, sizeof(devp->irq_name),
+					"vdin%d-irq", devp->index);
+			pr_info("vdin work in normal mode\n");
+			err = request_irq(devp->irq, vdin_isr, IRQF_SHARED,
+					devp->irq_name, (void *)devp);
+			if (!err)
+				devp->flags |= VDIN_FLAG_ISR_REQ;
+		}
 	} else if  (!strcmp(parm[0], "free_irq")) {
-		free_irq(devp->irq, (void *)devp);
-		pr_info("free irq\n");
+		if (!(devp->flags & VDIN_FLAG_ISR_REQ)) {
+			pr_err("vdin%d: no interrupt requested\n", devp->index);
+			err = -EINVAL;
+		} else if (devp->flags & VDIN_FLAG_DEC_STARTED) {
+			pr_err("vdin%d: decoder running, stop it first\n",
+			       devp->index);
+			err = -EBUSY;
+		} else {
+			free_irq(devp->irq, (void *)devp);
+			devp->flags &= ~(VDIN_FLAG_ISR_REQ | VDIN_FLAG_ISR_EN);
+			pr_info("free irq\n");
+		}
 	} else if (!strcmp(parm[0], "tvstart")) {
 		unsigned int port = 0, fmt = 0;
 
 		if (!parm[2]) {
 			kfree(buf_orig);
 			return len;
+		}
+		/* it enables the interrupt an open of the device or
+		 * request_irq requested; never a line without a handler
+		 */
+		if (!(devp->flags & VDIN_FLAG_ISR_REQ)) {
+			pr_err("vdin%d tvstart: no interrupt requested\n",
+			       devp->index);
+			kfree(buf_orig);
+			return -EINVAL;
 		}
 		if (kstrtol(parm[1], 16, &val) == 0)
 			port = val;
@@ -1786,6 +1820,8 @@ static ssize_t vdin_attr_store(struct device *dev,
 		if (ret) {
 			pr_err("TVIN_IOC_OPEN(%d) failed to open port 0x%x\n",
 					devp->index, devp->parm.port);
+			kfree(buf_orig);
+			return -EIO;
 		}
 		devp->flags |= VDIN_FLAG_DEC_OPENED;
 		pr_info("TVIN_IOC_OPEN() port %s opened ok\n\n",
@@ -1818,7 +1854,15 @@ start_chk:
 			pr_info("TVIN_IOC_START_DEC(%d) error, fmt is null\n",
 					devp->index);
 		}
-		vdin_start_dec(devp);
+		err = vdin_start_dec(devp);
+		if (err) {
+			/* nothing started: close what this command opened */
+			pr_err("vdin%d tvstart: start failed (%zd)\n",
+			       devp->index, err);
+			vdin_close_fe(devp);
+			kfree(buf_orig);
+			return err;
+		}
 		/*enable irq */
 		enable_irq(devp->irq);
 
@@ -1832,19 +1876,32 @@ start_chk:
 		pr_info("TVIN_IOC_START_DEC port %s, decode started ok\n\n",
 			tvin_port_str(devp->parm.port));
 	} else if (!strcmp(parm[0], "startdec")) {
+		/* as tvstart: only with the interrupt requested */
+		if (!(devp->flags & VDIN_FLAG_ISR_REQ)) {
+			pr_err("vdin%d startdec: no interrupt requested\n",
+			       devp->index);
+			kfree(buf_orig);
+			return -EINVAL;
+		}
 		temp = devp->parm.info.fmt;
 		pr_info("cur timing info:0x%x %s\n", temp,
 			tvin_sig_fmt_str(devp->parm.info.fmt));
 		devp->fmt_info_p =
 			(struct tvin_format_s *)tvin_get_fmt_info(temp);
 
-		vdin_start_dec(devp);
-		/*enable irq */
-		enable_irq(devp->irq);
+		err = vdin_start_dec(devp);
+		if (err) {
+			/* nothing started: no IRQ, the decoder stays idle */
+			pr_err("vdin%d startdec: start failed (%zd)\n",
+			       devp->index, err);
+		} else {
+			/*enable irq */
+			enable_irq(devp->irq);
 
-		pr_info("%s START_DEC vdin.%d enable_irq\n",
-			__func__, devp->index);
-		devp->flags |= VDIN_FLAG_DEC_STARTED;
+			pr_info("%s START_DEC vdin.%d enable_irq\n",
+				__func__, devp->index);
+			devp->flags |= VDIN_FLAG_DEC_STARTED;
+		}
 	} else if (!strcmp(parm[0], "tvstop")) {
 		vdin_stop_dec(devp);
 		vdin_close_fe(devp);
@@ -1972,7 +2029,14 @@ start_chk:
 		param.reserved |= PARAM_STATE_HISTGRAM;
 		/* param.scan_mode = TVIN_SCAN_MODE_PROGRESSIVE; */
 		/*start the vdin hardware*/
-		start_tvin_service(devp->index, &param);
+		err = start_tvin_service(devp->index, &param);
+		if (err) {
+			pr_err("vdin%d v4l2start: start failed (%zd)\n",
+			       devp->index, err);
+			devp->flags &= ~VDIN_FLAG_V4L2_DEBUG;
+			if (err == -1)
+				err = -EIO;
+		}
 	} else if (!strcmp(parm[0], "disablesm"))
 		del_timer_sync(&devp->timer);
 	else if (!strcmp(parm[0], "freeze")) {
@@ -2124,9 +2188,14 @@ start_chk:
 			devp->parm.info.fmt = fmt;
 			devp->fmt_info_p  =
 				(struct tvin_format_s *)tvin_get_fmt_info(fmt);
-			vdin_start_dec(devp);
-			devp->flags |= VDIN_FLAG_DEC_STARTED;
-			pr_info("TVIN_IOC_START_DEC port TVIN_PORT_CVBS3, decode started ok\n\n");
+			err = vdin_start_dec(devp);
+			if (err) {
+				pr_err("vdin%d snowon: start failed (%zd)\n",
+				       devp->index, err);
+			} else {
+				devp->flags |= VDIN_FLAG_DEC_STARTED;
+				pr_info("TVIN_IOC_START_DEC port TVIN_PORT_CVBS3, decode started ok\n\n");
+			}
 		}
 		devp->flags &= (~VDIN_FLAG_SM_DISABLE);
 		/*tvafe_snow_config(1);*/
@@ -2158,9 +2227,14 @@ start_chk:
 				devp->fmt_info_p  =
 				(struct tvin_format_s *)tvin_get_fmt_info(
 				devp->parm.info.fmt);
-				vdin_start_dec(devp);
-				devp->flags |= VDIN_FLAG_DEC_STARTED;
-				pr_info("VDIN_FLAG_DEC_STARTED port TVIN_PORT_CVBS3, decode started ok\n");
+				err = vdin_start_dec(devp);
+				if (err) {
+					pr_err("vdin%d snowoff: start failed (%zd)\n",
+					       devp->index, err);
+				} else {
+					devp->flags |= VDIN_FLAG_DEC_STARTED;
+					pr_info("VDIN_FLAG_DEC_STARTED port TVIN_PORT_CVBS3, decode started ok\n");
+				}
 			}
 		}
 		devp->flags &= (~VDIN_FLAG_SM_DISABLE);
@@ -2268,6 +2342,7 @@ start_chk:
 			if (ret) {
 				pr_err("TVIN_IOC_OPEN(%d) failed to open port 0x%x\n",
 					devp->parm.index, devp->parm.port);
+				err = -EIO;
 			} else {
 				devp->flags |= VDIN_FLAG_DEC_OPENED;
 				pr_info("TVIN_IOC_OPEN(%d) port %s opened ok\n\n",
@@ -2282,6 +2357,15 @@ start_chk:
 			pr_err("TVIN_IOC_CLOSE(%d) you have not opened port\n",
 					devp->index);
 		else {
+			/* as TVIN_IOC_CLOSE: the decoder stops first, which
+			 * needs the frontend
+			 */
+			if (devp->flags & VDIN_FLAG_DEC_STARTED) {
+				devp->flags |= VDIN_FLAG_DEC_STOP_ISR;
+				vdin_stop_dec(devp);
+				devp->flags &= ~VDIN_FLAG_DEC_STOP_ISR;
+				devp->flags &= ~VDIN_FLAG_DEC_STARTED;
+			}
 			vdin_close_fe(devp);
 			devp->flags &= (~VDIN_FLAG_DEC_OPENED);
 			pr_info("TVIN_IOC_CLOSE(%d) port %s closed ok\n\n",
@@ -2537,8 +2621,60 @@ start_chk:
 	}
 
 	kfree(buf_orig);
-	return len;
+	return err ? err : len;
 }
+/* The commands that start, stop or pause capture, take or free its
+ * interrupt or frame provider, open or close the frontend, or read or
+ * write its frame memory. While a reader has the loopback VDIN open, its
+ * session, frame memory and interrupt are the reader's: a session started
+ * under it would be stopped by its release, and the reader's own stop can
+ * free the memory under a dump.
+ */
+static bool vdin_attr_cmd_is_capture(const char *buf)
+{
+	static const char * const cmds[] = {
+		"tvstart", "tvstop", "startdec", "v4l2start", "v4l2stop",
+		"snowon", "snowoff", "open_port", "close_port",
+		"request_irq", "free_irq", "vf_reg", "vf_unreg",
+		"pause_dec", "resume_dec",
+		"capture", "read_pic", "read_pic_afbce", "read_bin",
+		"dump_afbce",
+	};
+	size_t n;
+	int i;
+
+	buf = skip_spaces(buf);
+	n = strcspn(buf, " \t\n");
+	for (i = 0; i < ARRAY_SIZE(cmds); i++)
+		if (strlen(cmds[i]) == n && !strncmp(buf, cmds[i], n))
+			return true;
+	return false;
+}
+
+static ssize_t vdin_attr_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t len)
+{
+	struct vdin_dev_s *devp = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	if (!buf || devp->index == 0)
+		return vdin_attr_store_cmd(dev, attr, buf, len);
+	/* One command at a time on the loopback VDIN, and none while its
+	 * reader is opening or releasing it.
+	 */
+	mutex_lock(&devp->reader_lock);
+	if ((devp->flags & VDIN_FLAG_FS_OPENED) &&
+	    vdin_attr_cmd_is_capture(buf)) {
+		pr_err("vdin%d is open by a reader\n", devp->index);
+		ret = -EBUSY;
+	} else {
+		ret = vdin_attr_store_cmd(dev, attr, buf, len);
+	}
+	mutex_unlock(&devp->reader_lock);
+	return ret;
+}
+
 static DEVICE_ATTR(attr, 0664, vdin_attr_show, vdin_attr_store);
 #ifdef VF_LOG_EN
 static ssize_t vdin_vf_log_show(struct device *dev,
@@ -3131,7 +3267,8 @@ void vdin_debugfs_exit(struct vdin_dev_s *vdevp)
 	if (nub > 0)
 		return;
 
-	debugfs_remove(vdevp->dbg_root);
+	/* with its files, which call into this module */
+	debugfs_remove_recursive(vdevp->dbg_root);
 }
 /*------------------------------------------*/
 

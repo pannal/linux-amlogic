@@ -2062,6 +2062,7 @@ bool vlock_get_phlock_flag(void)
 	else
 		return false;
 }
+EXPORT_SYMBOL_GPL(vlock_get_phlock_flag);
 
 bool vlock_get_vlock_flag(void)
 {
@@ -2084,6 +2085,7 @@ bool vlock_get_vlock_flag(void)
 	else
 		return false;
 }
+EXPORT_SYMBOL_GPL(vlock_get_vlock_flag);
 
 void vlock_enc_timing_monitor(void)
 {

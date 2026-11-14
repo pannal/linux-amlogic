@@ -468,6 +468,16 @@ struct vdin_dev_s {
 	struct vdin_active_area active_area;
 	bool report_active_area;
 	struct mutex fe_lock;
+	/* The loopback reader's ownership: held through open and release, and
+	 * around every attr debug command on the loopback VDIN. Taken before
+	 * fe_lock.
+	 */
+	struct mutex reader_lock;
+	/* the extra interrupts an open of the device requested, which its
+	 * release frees whatever a stop did with the main one
+	 */
+	bool crash_irq_req;
+	bool wr_done_irq_req;
 	struct clk *msr_clk;
 	unsigned int msr_clk_val;
 
@@ -750,7 +760,7 @@ void vdin_remove_debug_files(struct device *dev);
 int vdin_open_fe(enum tvin_port_e port, int index,
 		struct vdin_dev_s *devp);
 void vdin_close_fe(struct vdin_dev_s *devp);
-void vdin_start_dec(struct vdin_dev_s *devp);
+int vdin_start_dec(struct vdin_dev_s *devp);
 void vdin_stop_dec(struct vdin_dev_s *devp);
 irqreturn_t vdin_isr_simple(int irq, void *dev_id);
 irqreturn_t vdin_isr(int irq, void *dev_id);
