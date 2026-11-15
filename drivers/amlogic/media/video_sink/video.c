@@ -7159,12 +7159,60 @@ static void release_di_buffer(int inst)
 	recycle_cnt[inst] = 0;
 }
 
+static struct vframe_s *video_afbc_scanout_buffer(void)
+{
+#ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
+	u32 head;
+	int i;
+
+	if (!is_vsync_rdma_enable() || !cur_dispbuf ||
+	    cur_dispbuf == &vf_local ||
+	    !(cur_dispbuf->type & VIDTYPE_COMPRESS) ||
+	    vd_layer[0].dispbuf_mapping != &cur_dispbuf ||
+	    !(READ_VCBUS_REG(vd_layer[0].vd_afbc_reg.afbc_enable) & 0x100))
+		return NULL;
+
+	head = READ_VCBUS_REG(vd_layer[0].vd_afbc_reg.afbc_head_baddr) << 4;
+	if (!head || head == cur_dispbuf->compHeadAddr)
+		return NULL;
+
+	for (i = 0; i < DISPBUF_TO_PUT_MAX; i++) {
+		struct vframe_s *vf = dispbuf_to_put[i];
+
+		if (vf && (vf->type & VIDTYPE_COMPRESS) &&
+		    !(vf->type & VIDTYPE_DI_PW) &&
+		    vf->compHeadAddr == head)
+			return vf;
+	}
+	pr_warn_ratelimited("AFBC scanout buffer not tracked: head=%x queued=%x\n",
+		head, cur_dispbuf->compHeadAddr);
+#endif
+	return NULL;
+}
+
+static void video_keep_afbc_scanout(struct vframe_s *vf)
+{
+	unsigned int ret;
+
+	if (!vf)
+		return;
+
+	/* The provider owns queued descriptors until unregistration returns.
+	 * Pin scanout first; the keeper delays release through RDMA application.
+	 */
+	ret = vf_keep_current(vf, NULL);
+	if (!ret)
+		pr_warn("Failed to retain AFBC scanout buffer: head=%x\n",
+			vf->compHeadAddr);
+}
+
 static void video_vf_unreg_provider(void)
 {
 	ulong flags;
 	bool layer1_used = false;
 	bool layer2_used = false;
 	struct vframe_s *el_vf = NULL;
+	struct vframe_s *scanout_vf;
 	int keeped = 0, ret = 0;
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 	int i;
@@ -7190,6 +7238,7 @@ static void video_vf_unreg_provider(void)
 	presentation_route_invalidate();
 
 	spin_lock_irqsave(&lock, flags);
+	scanout_vf = video_afbc_scanout_buffer();
 	ret = update_amvideo_recycle_buffer();
 	if (ret == -EAGAIN) {
 	/* The currently displayed vf is not added to the queue
@@ -7282,6 +7331,8 @@ static void video_vf_unreg_provider(void)
 	if (!layer1_used && !layer2_used)
 		cur_dispbuf = NULL;
 
+	if (cur_dispbuf && !(blackout | force_blackout))
+		video_keep_afbc_scanout(scanout_vf);
 	if (blackout | force_blackout) {
 		if (layer1_used)
 			safe_switch_videolayer(
@@ -7365,6 +7416,7 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 {
 	ulong flags;
 	int ret = 0;
+	struct vframe_s *scanout_vf;
 #ifdef CONFIG_AMLOGIC_MEDIA_VSYNC_RDMA
 	int i;
 #endif
@@ -7380,6 +7432,7 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 	presentation_route_invalidate();
 
 	spin_lock_irqsave(&lock, flags);
+	scanout_vf = need_keep_frame ? video_afbc_scanout_buffer() : NULL;
 	ret = update_amvideo_recycle_buffer();
 	if (ret == -EAGAIN) {
 	/* The currently displayed vf is not added to the queue
@@ -7416,6 +7469,7 @@ static void video_vf_light_unreg_provider(int need_keep_frame)
 	spin_unlock_irqrestore(&lock, flags);
 
 	if (need_keep_frame) {
+		video_keep_afbc_scanout(scanout_vf);
 		/* keep the last toggled frame*/
 		if (cur_dispbuf) {
 			unsigned int result;
