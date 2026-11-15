@@ -1,0 +1,42 @@
+AFBC seek/reset regression
+=========================
+
+Run on a Linux host with Python 3 and a C compiler:
+
+    python3 tools/testing/amlogic/test_afbc_scanout.py
+
+To also prove regression sensitivity with deliberately broken source variants:
+
+    python3 tools/testing/amlogic/test_afbc_scanout.py --negative-controls
+
+CC may select another compiler or add flags, for example:
+
+    CC='cc -fsanitize=undefined -fno-sanitize-recover=all' \
+        python3 tools/testing/amlogic/test_afbc_scanout.py --negative-controls
+
+No kernel build, device connection, video file, capture or image analysis is
+needed. Generated sources and executables use an automatically removed
+temporary directory. The working tree and production files are not changed.
+
+The test compiles complete functions from the current video.c/video_keeper.c,
+including both unregister callbacks, the recycle helper, AFBC lookup and the
+keeper chain. Only their kernel, register and codec-memory boundaries are
+simulated; it does not reimplement the fix. With hardware still reading the
+previous AFBC header, releasing provider ownership must not allow the body,
+header or double-write allocation to be reused before a modeled RDMA handoff.
+The replacement remains retained, and retired allocations eventually release.
+
+Cases cover full/light unregister, contiguous/scatter allocation types,
+initialized per-layer registers, sparse/mixed deferred queues, RDMA compiled
+in/out and disabled at runtime, lookup eligibility, blackout/no-keep policy,
+already-current scanout, and failed-pin diagnostics. With --negative-controls,
+twelve deliberately broken in-memory variants must compile but fail the
+specific expected runtime assertions, including missing pins, late lookup,
+reversed keeper order and immediate release. Only this optional sensitivity
+check uses exact source-replacement anchors; update them after code refactors.
+
+This is a deterministic ownership/order regression, not hardware acceptance:
+the modeled 40 ms handoff does not prove that the existing 120 ms delay covers
+every real interleaving. Provider descriptors/handles are assumed valid until
+the unregister callback returns. Real SMP/IRQ/RDMA behavior and native Dolby
+Vision enhancement-layer lifetime still require separate validation.
