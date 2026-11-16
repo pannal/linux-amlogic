@@ -27,7 +27,11 @@
  *           register update carries it; with OSD_AFBC_SCANOUT_WAIT the call
  *           returns once that vsync has passed, when the previous buffer is
  *           no longer read, or fails with ETIMEDOUT if that took over a
- *           second (the flip stays queued). While the display is not scanning
+ *           second (the flip stays queued). A flip queued as soon as such a
+ *           call returned is shown with the next vsync, so a client can keep
+ *           one flip queued while it draws into a third buffer
+ *           (/sys/module/fb/parameters/afbc_scanout_queued_flips reads Y on
+ *           kernels that guarantee it). While the display is not scanning
  *           out (no vsync for OSD_AFBC_SCANOUT_STALL_MS: off, or changing
  *           mode) it fails with EAGAIN and queues nothing. The decoder holds
  *           one row of superblocks: a frame wider than 1920 pixels needs 32x8

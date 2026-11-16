@@ -1118,11 +1118,11 @@ static void osd_reset_rdma_irq(void *arg)
  * though its done interrupt still counts its vsync: one still running (its
  * first item sets the reject flag, its last clears it), which an append that
  * gave up waiting for it does not extend, or one that ran and whose
- * interrupt has not counted it yet (the interrupt clears the done status
- * after its callback, which counts the vsync). Either way the writes reach
- * the hardware with the next table. A table that ends between two reads
- * clears the flag before it sets the done status, so the status is read on
- * both sides of the flag.
+ * interrupt has not counted it yet (the interrupt acknowledges the done
+ * status right after counting the vsync, see osd_rdma_ack_vsync). Either way
+ * the writes reach the hardware with the next table. A table that ends
+ * between two reads clears the flag before it sets the done status, so the
+ * status is read on both sides of the flag.
  */
 bool osd_rdma_table_pending(void)
 {
@@ -1134,6 +1134,22 @@ bool osd_rdma_table_pending(void)
 	return (osd_reg_read(RDMA_STATUS) & done) ||
 		OSD_RDMA_STATUS_IS_REJECT ||
 		(osd_reg_read(RDMA_STATUS) & done);
+}
+
+/* The done interrupt has counted its table's vsync: clear the table's done
+ * status before anyone waiting for that vsync is woken. The RDMA manager
+ * clears it only after this driver's callback returns, and until then a
+ * write the woken task queues, which reaches the hardware with the next
+ * table, is taken for one that the counted table missed and counts from a
+ * vsync later (osd_rdma_table_pending): a flip queued right after the
+ * previous one took effect would wait for a vsync more. Writes appended
+ * before the table is rebuilt in the same interrupt are kept by it.
+ */
+void osd_rdma_ack_vsync(void)
+{
+	if (!rdma_enable || osd_rdma_handle < 0)
+		return;
+	osd_reg_write(RDMA_CTRL, 1 << (24 + OSD_RDMA_CHANNEL_INDEX));
 }
 
 /* Changes each time the table is dropped with the writes queued in it: by

@@ -1842,6 +1842,11 @@ void osd_update_vsync_hit(void)
 	/* Counted here, not in the wakeups at suspend and shutdown. */
 	WRITE_ONCE(osd_rdma_done_jiffies[VIU1], jiffies);
 	WRITE_ONCE(osd_rdma_done_seq[VIU1], osd_rdma_done_seq[VIU1] + 1);
+	/* Before the wakeup: a flip queued by a woken waiter is shown with the
+	 * next vsync and must count from this one.
+	 */
+	if (osd_hw.hw_rdma_en)
+		osd_rdma_ack_vsync();
 #ifdef FIQ_VSYNC
 	fiq_bridge_pulse_trigger(&osd_hw.fiq_handle_item);
 #else
@@ -2710,6 +2715,15 @@ u32 osd_get_afbc(u32 index)
 		afbc_type = 0;
 	return afbc_type;
 }
+
+/* Tells AFBC scanout clients that a flip queued as soon as the previous one
+ * took effect is shown with the next vsync (see osd_update_vsync_hit), so
+ * one flip can stay queued while a third buffer is drawn.
+ */
+static bool afbc_scanout_queued_flips = true;
+module_param(afbc_scanout_queued_flips, bool, 0444);
+MODULE_PARM_DESC(afbc_scanout_queued_flips,
+		 "AFBC scanout: a flip queued when the previous one took effect is shown with the next vsync");
 
 /* AFBC scanout session: one complete Mali AFBC frame per flip, decoded by the
  * VPU's Mali AFBC decoder instead of read as a linear canvas. The linear
