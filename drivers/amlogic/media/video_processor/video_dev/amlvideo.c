@@ -607,6 +607,29 @@ static int vidioc_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	return 0;
 }
 
+/* Optional DQBUF extension v1: exact held-picture live L5, before Dolby's
+ * temporary OSD/subtitle suppression. Keep type/flags for frame dimensions.
+ * Old providers leave valid clear; valid zero means confirmed full frame.
+ */
+static void amlvideo_frame_l5(struct vivi_dev *dev, struct v4l2_buffer *p)
+{
+	struct provider_active_area_req_s area = { .vf = dev->vf };
+
+	vf_notify_provider(dev->vf_receiver_name,
+		VFRAME_EVENT_RECEIVER_GET_ACTIVE_AREA, &area);
+	if (!area.valid)
+		return;
+	p->timecode.frames = area.top >> 8;
+	p->timecode.seconds = area.top & 0xff;
+	p->timecode.minutes = area.bottom >> 8;
+	p->timecode.hours = area.bottom & 0xff;
+	p->timecode.userbits[0] = area.left >> 8;
+	p->timecode.userbits[1] = area.left & 0xff;
+	p->timecode.userbits[2] = area.right >> 8;
+	p->timecode.userbits[3] = area.right & 0xff;
+	p->reserved2 = 0x50334c01;
+}
+
 static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 {
 	struct vivi_dev *dev = video_drvdata(file);
@@ -616,6 +639,9 @@ static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	struct vframe_s *next_vf;
 	unsigned long flags;
 	int pending;
+
+	p->reserved2 = 0;
+	memset(&p->timecode, 0, sizeof(p->timecode));
 
 	mutex_lock(&dev->vf_mutex);
 	spin_lock_irqsave(&dev->queue_lock, flags);
@@ -695,6 +721,7 @@ static int vidioc_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 	p->timestamp.tv_sec = pts_us64 >> 32;
 	p->timestamp.tv_usec = pts_us64 & 0xFFFFFFFF;
 	dev->last_pts_us64 = pts_us64;
+	amlvideo_frame_l5(dev, p);
 	dev->vf->pts_us64 = omx_freerun_index;
 	dev->vf->flag &= ~VFRAME_FLAG_AMLVIDEO_DISCARD;
 	spin_lock_irqsave(&dev->queue_lock, flags);
