@@ -1142,8 +1142,9 @@ bool osd_rdma_table_pending(void)
  * write the woken task queues, which reaches the hardware with the next
  * table, is taken for one that the counted table missed and counts from a
  * vsync later (osd_rdma_table_pending): a flip queued right after the
- * previous one took effect would wait for a vsync more. Writes appended
- * before the table is rebuilt in the same interrupt are kept by it.
+ * previous one took effect would wait for a vsync more. The table rebuild
+ * retains recoverable writes; backed AFBC registers are replayed by
+ * osd_hw_reset(), including when the hardware reset is disabled.
  */
 void osd_rdma_ack_vsync(void)
 {
@@ -1396,7 +1397,10 @@ int osd_rdma_reset_and_flush(u32 reset_bit)
 	reset_reg_mask &= ~HW_RESET_OSD1_REGS;
 	if (disable_osd_rdma_reset != 0) {
 		reset_reg_mask = 0;
-		reset_bit = 0;
+		/* The rebuild omits backed AFBC registers. A flip appended since the
+		 * completed table ran still needs those writes in the next table.
+		 */
+		reset_bit &= HW_RESET_MALI_AFBCD_REGS;
 	}
 
 	if (reset_reg_mask) {
