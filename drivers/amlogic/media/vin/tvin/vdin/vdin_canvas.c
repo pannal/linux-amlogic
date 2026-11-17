@@ -803,7 +803,10 @@ unsigned int vdin_cma_alloc(struct vdin_dev_s *devp)
 	}
 
 	devp->mem_size = mem_size;
+	/* vdin_mmap() and its faults map the frames from here */
+	mutex_lock(&devp->mem_lock);
 	devp->cma_mem_alloc = 1;
+	mutex_unlock(&devp->mem_lock);
 
 	if (devp->afbce_info && devp->afbce_valid) {
 		devp->afbce_info->frame_body_size = devp->vfmem_size;
@@ -845,6 +848,7 @@ void vdin_cma_release(struct vdin_dev_s *devp)
 {
 	char vdin_name[6];
 	unsigned int i;
+	struct vdin_map_file *mf;
 
 	if ((devp->cma_config_en == 0) ||
 		(devp->cma_mem_alloc == 0)) {
@@ -857,6 +861,17 @@ void vdin_cma_release(struct vdin_dev_s *devp)
 		strcpy(vdin_name, "vdin0");
 	else if (devp->index == 1)
 		strcpy(vdin_name, "vdin1");
+
+	/* The frames are reusable CMA, which the kernel hands out again once
+	 * they are freed: take down every mapping of them first, of every file
+	 * that mapped them. A fault after this maps nothing until the next
+	 * allocation.
+	 */
+	mutex_lock(&devp->mem_lock);
+	devp->cma_mem_alloc = 0;
+	list_for_each_entry(mf, &devp->map_files, list)
+		unmap_mapping_range(mf->file->f_mapping, 0, 0, 1);
+	mutex_unlock(&devp->mem_lock);
 
 	if (devp->cma_config_flag & MEM_ALLOC_DISCRETE) {
 		if (devp->cma_config_flag & MEM_ALLOC_FROM_CODEC) {

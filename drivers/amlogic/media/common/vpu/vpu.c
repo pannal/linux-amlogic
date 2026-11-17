@@ -578,6 +578,7 @@ void switch_vpu_mem_pd_vmod(unsigned int vmod, int flag)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(switch_vpu_mem_pd_vmod);
 
 /*
  *  Function: get_vpu_mem_pd_vmod
@@ -779,6 +780,7 @@ void switch_vpu_clk_gate_vmod(unsigned int vmod, int flag)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(switch_vpu_clk_gate_vmod);
 
 /* *********************************************** */
 

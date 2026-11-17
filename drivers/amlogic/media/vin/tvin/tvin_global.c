@@ -234,11 +234,13 @@ inline bool IS_TVAFE_SRC(enum tvin_port_e port)
 {
 	return ((port >= TVIN_PORT_CVBS0) && (port <= TVIN_PORT_CVBS3));
 }
+EXPORT_SYMBOL_GPL(IS_TVAFE_SRC);
 
 inline bool IS_TVAFE_ATV_SRC(enum tvin_port_e port)
 {
 	return (port == TVIN_PORT_CVBS3);
 }
+EXPORT_SYMBOL_GPL(IS_TVAFE_ATV_SRC);
 
 inline bool IS_TVAFE_AVIN_SRC(enum tvin_port_e port)
 {

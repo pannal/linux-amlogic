@@ -27,3 +27,22 @@
 		aux-det-gpio = <&gpio GPIOH_4 GPIO_ACTIVE_HIGH>;
 	};
 };
+
+/*
+ * VDIN1 write-back of the display output (video and GUI after blending)
+ * for screen capture. vdin1 only starts while vdin0 is registered.
+ */
+&vdin1_cma_reserved {
+	status = "okay";
+	/* 3840x2160 yuv422 8bit, 5 buffers */
+	size = <0x0 0x05400000>;
+};
+
+&vdin1 {
+	status = "okay";
+};
+
+&vdin0 {
+	status = "okay";
+	flag_cma = <1>; /* share the codec pool; no own reservation */
+};
