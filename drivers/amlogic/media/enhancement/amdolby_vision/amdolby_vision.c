@@ -3591,15 +3591,26 @@ void dolby_vision_dump_setting(int debug_flag)
 }
 EXPORT_SYMBOL(dolby_vision_dump_setting);
 
+static const struct dv_info *sink_dv_info(const struct vinfo_s *vinfo)
+{
+	const struct vout_device_s *vout = vinfo ? READ_ONCE(vinfo->vout_device) : NULL;
+
+	return vout ? READ_ONCE(vout->dv_info) : NULL;
+}
+
 static int sink_support_dolby_vision(const struct vinfo_s *vinfo, struct vframe_s *vf)
 {
+	const struct dv_info *dv_info;
+
 	if (dolby_vision_flags & FLAG_DISABLE_DOVI_OUT)
 		return 0;
 
 	if (!((sink_hdr_support(vinfo) & DV_SUPPORT) >> DV_SUPPORT_SHF))
 		return 0;
 
-	if (vinfo && vf && !vinfo->vout_device->dv_info->sup_2160p60hz)
+	/* Forced DV support can be reported without an HDMI descriptor. */
+	dv_info = sink_dv_info(vinfo);
+	if (dv_info && vf && !dv_info->sup_2160p60hz)
 	{
 		if (vf->width    >= 3840 &&
 		    vf->height   == 2160 &&
@@ -5878,17 +5889,26 @@ static inline void set_dolby_vsvdb_when_changed(const unsigned char *vsvdb_tbl, 
     set_dolby_vsvdb(vsvdb_tbl, vsvdb_len);
 }
 
-static inline void load_dolby_vsvdb(const struct dv_info *dv_info, enum signal_format_enum src_format)
+static inline bool load_dolby_vsvdb(const struct dv_info *dv_info, enum signal_format_enum src_format)
 {
-  bool dovi_cap = ((dv_info->ieeeoui == 0x00d046) && (dv_info->block_flag == CORRECT));
+  bool vp = READ_ONCE(xbmc_dv_vp) != 0;
+  bool player_led = READ_ONCE(xbmc_dv_type) != 0;
+  bool inject = READ_ONCE(xbmc_dv_vsvdb_inject);
+  bool use_payload = vp || (player_led && inject);
+  bool use_sink = !vp && dv_info && dv_info->ieeeoui == 0x00d046 &&
+                  dv_info->block_flag == CORRECT;
 
-  // For Display Led (VP=0): load VSVDB from HDMI sink
-  if (dovi_cap && (xbmc_dv_vp == 0)) {
+  /* A modeset can temporarily hide the sink. Keep its table and retry. */
+  if (!dv_info && !use_payload)
+    return false;
+
+  /* Outside VP, load a capable sink before applying any Kodi override. */
+  if (use_sink) {
     set_dolby_vsvdb(NULL, 0);
     set_dolby_vsvdb(&dv_info->rawdata[0], dv_info->length + 1);
 
     // V2-to-V1 conversion for Player Led (non-inject) mode
-    if ((xbmc_dv_type != 0) && !xbmc_dv_vsvdb_inject) {
+    if (player_led && !inject) {
       unsigned char *x = &new_dovi_setting.vsvdb_tbl[5];
       const unsigned char v = (x[0] >> 5) & 0x07;
       u16 vsvdb_max = 0;
@@ -5922,11 +5942,11 @@ static inline void load_dolby_vsvdb(const struct dv_info *dv_info, enum signal_f
   }
 
   // For VP mode, or when DV cap missing, or when injecting: use payload from Kodi
-  if (!dovi_cap || (xbmc_dv_vp != 0) || ((xbmc_dv_type != 0) && xbmc_dv_vsvdb_inject)) {
+  if (!use_sink || use_payload) {
     size_t payload_str_len = strlen(xbmc_dv_vsvdb_payload);
     if (payload_str_len != 14) {
       pr_info("DOLBY: inject_dolby_vsvdb failed - Cannot parse: Length wrong, must be a Dolby VSVDB V1 or V2 - 14 Hex Char Payload. [%s]\n", xbmc_dv_vsvdb_payload);
-      return;
+      return use_sink; /* The native block is already available to clamp. */
     }
     char dolby_vsvdb[25];
     unsigned char buf[12];
@@ -5941,6 +5961,7 @@ static inline void load_dolby_vsvdb(const struct dv_info *dv_info, enum signal_f
     set_dolby_vsvdb(buf, 12);
   }
   xbmc_dv_vsvdb_inject_num += 1;
+  return true;
 }
 
 
@@ -6378,6 +6399,8 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 				bool drop_flag)
 {
 	const struct vinfo_s *vinfo = get_current_vinfo();
+	const struct dv_info *dv_info;
+	bool vsvdb_ready = true;
 	struct vframe_s *el_vf;
 	struct provider_aux_req_s req;
 	struct provider_aux_req_s el_req;
@@ -6853,29 +6876,25 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 			graphic_max = dv_HDR10_graphics_max;
 	}
 
+	dv_info = sink_dv_info(vinfo);
 	if (dolby_vision_flags & FLAG_USE_SINK_MIN_MAX) {
-		if (vinfo->vout_device->dv_info->ieeeoui == 0x00d046) {
-			if (vinfo->vout_device->dv_info->ver == 0) {
+		if (dv_info && dv_info->ieeeoui == 0x00d046) {
+			if (dv_info->ver == 0) {
 				/* need lookup PQ table ... */
-			} else if (vinfo->vout_device->dv_info->ver == 1) {
-				if (vinfo->vout_device->dv_info->tmaxLUM) {
+			} else if (dv_info->ver == 1) {
+				if (dv_info->tmaxLUM) {
 					/* Target max luminance = 100+50*CV */
 					graphic_max =
 					target_lumin_max =
-						(vinfo->vout_device
-						->dv_info->tmaxLUM
-						* 50 + 100);
+						(dv_info->tmaxLUM * 50 + 100);
 					/* Target min luminance = (CV/127)^2 */
 					graphic_min =
 					dolby_vision_target_min =
-						(vinfo->vout_device->
-						dv_info->tminLUM *
-						vinfo->vout_device->
-						dv_info->tminLUM)
+						(dv_info->tminLUM * dv_info->tminLUM)
 						* 10000 / (127 * 127);
 				}
 			}
-		} else if (sink_hdr_support(vinfo) & HDR_SUPPORT) {
+		} else if (vinfo && (sink_hdr_support(vinfo) & HDR_SUPPORT)) {
 			if (vinfo->hdr_info.lumi_max) {
 				/* Luminance value = 50 * (2 ^ (CV/32)) */
 				graphic_max =
@@ -6900,7 +6919,7 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 			dolby_vision_target_max[2][0] =
 			dolby_vision_target_max[2][1] =
 				target_lumin_max;
-		} else {
+		} else if (dv_info) {
 			memcpy(dolby_vision_target_max,
 			       dolby_vision_default_max,
 			       sizeof(unsigned int[3][3]));
@@ -6945,13 +6964,13 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 
 	// Load the VSVDB from xbmc if injected or obtain from vout (hdmi sink) if present.
 	if (xbmc_dv_vsvdb_inject_num < 24)
-		load_dolby_vsvdb(vinfo->vout_device->dv_info, src_format);
+		vsvdb_ready = load_dolby_vsvdb(dv_info, src_format);
 
 	/* DV-LL (non-VP): clamp VSVDB luminance to source content's max PQ.
 	 * This tells the DV library the effective display range matches the
 	 * source, which can trigger per-frame L2 generation for backlight
 	 * control in the LL VSIF. Also injects HDR10 metadata for DV-LL. */
-	if (!use_new && (xbmc_dv_vp == 0) && is_dv_ll() &&
+	if (vsvdb_ready && !use_new && (xbmc_dv_vp == 0) && is_dv_ll() &&
 	    (xbmc_dv_vsvdb_source_lum_limit_num < 24)) {
 		unsigned char *x = &new_dovi_setting.vsvdb_tbl[5];
 		const unsigned char version = (x[0] >> 5) & 0x07;
