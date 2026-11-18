@@ -27,6 +27,9 @@
 #include <linux/list.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
+#include <linux/bitmap.h>
+#include <linux/seqlock.h>
+#include <linux/mutex.h>
 /* Amlogic headers */
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/amlogic/media/vfm/vframe_provider.h>
@@ -42,12 +45,29 @@
 #include "vftrace.h"
 #include "vfm.h"
 static DEFINE_SPINLOCK(lock);
+/*
+ * vfm_map_add() and vfm_map_remove() hold vfm_map_edit_mutex throughout,
+ * so maps are added and removed one at a time, and an add or a remove
+ * waits until the providers of a map being removed have been called
+ * back: a route that replaces it, and the providers that start on that,
+ * come after the old route's teardown. The callbacks must not add or
+ * remove maps. The writers, those two and the active-state refresh
+ * vf_update_active_map(), which the callbacks may cause, hold
+ * vfm_map_mutex while they change a map's state, and write it holding
+ * vfm_map_lock, with interrupts off, bumping vfm_map_seq around the
+ * writes. The lookups read the maps without a lock, and take vfm_map_lock
+ * only to look again when vfm_map_seq says a writer ran meanwhile.
+ * Nothing is taken under vfm_map_lock.
+ */
+static DEFINE_MUTEX(vfm_map_edit_mutex);
+static DEFINE_MUTEX(vfm_map_mutex);
+static DEFINE_SPINLOCK(vfm_map_lock);
+static seqcount_t vfm_map_seq = SEQCNT_ZERO(vfm_map_seq);
 
 #define DRV_NAME    "vfm"
 #define DEV_NAME    "vfm"
 #define BUS_NAME    "vfm"
 #define CLS_NAME    "vfm"
-#define VFM_NAME_LEN    100
 #define VFM_MAP_SIZE    10
 #define VFM_MAP_COUNT   40
 static struct device *vfm_dev;
@@ -66,24 +86,42 @@ int vfm_trace_num = 40;		/*  */
 
 void vf_update_active_map(void)
 {
+	int active[VFM_MAP_COUNT];
+	unsigned long flags;
+	bool changed = false;
 	int i, j;
 	struct vframe_provider_s *vfp;
 
+	mutex_lock(&vfm_map_mutex);
 	for (i = 0; i < vfm_map_num; i++) {
 		if (vfm_map[i] && vfm_map[i]->valid) {
+			active[i] = vfm_map[i]->active;
 			for (j = 0; j < (vfm_map[i]->vfm_map_size - 1); j++) {
 				vfp = vf_get_provider_by_name(vfm_map[i]->name
 					[j]);
 				if (vfp == NULL)
-					vfm_map[i]->active &= (~(1 << j));
+					active[i] &= (~(1 << j));
 				else {
-					if ((j > 0 && vfm_map[i]->active & 0x1)
+					if ((j > 0 && active[i] & 0x1)
 						|| j == 0)
-						vfm_map[i]->active |= (1 << j);
+						active[i] |= (1 << j);
 				}
 			}
+			changed |= active[i] != vfm_map[i]->active;
 		}
 	}
+	if (changed) {
+		/* the lookups see the new active states all at once */
+		spin_lock_irqsave(&vfm_map_lock, flags);
+		write_seqcount_begin(&vfm_map_seq);
+		for (i = 0; i < vfm_map_num; i++) {
+			if (vfm_map[i] && vfm_map[i]->valid)
+				vfm_map[i]->active = active[i];
+		}
+		write_seqcount_end(&vfm_map_seq);
+		spin_unlock_irqrestore(&vfm_map_lock, flags);
+	}
+	mutex_unlock(&vfm_map_mutex);
 }
 
 static int get_vfm_map_index(const char *id)
@@ -103,13 +141,27 @@ static int get_vfm_map_index(const char *id)
 	return index;
 }
 
+/*
+ * Called with vfm_map_edit_mutex held, so no add or remove runs meanwhile
+ * and the map's chain stays in its slot. The map leaves the lookups and
+ * the active-state refresh at once, before its providers are called back,
+ * as they may unregister and so refresh the active states.
+ */
 static int vfm_map_remove_by_index(int index)
 {
+	unsigned long flags;
 	int i;
 	int ret = 0;
 	struct vframe_provider_s *vfp;
 
+	mutex_lock(&vfm_map_mutex);
+	spin_lock_irqsave(&vfm_map_lock, flags);
+	write_seqcount_begin(&vfm_map_seq);
 	vfm_map[index]->active = 0;
+	vfm_map[index]->valid = 0;
+	write_seqcount_end(&vfm_map_seq);
+	spin_unlock_irqrestore(&vfm_map_lock, flags);
+	mutex_unlock(&vfm_map_mutex);
 	for (i = 0; i < (vfm_map[index]->vfm_map_size - 1); i++) {
 		vfp = vf_get_provider_by_name(vfm_map[index]->name[i]);
 		if (vfp && vfp->ops && vfp->ops->event_cb) {
@@ -129,7 +181,6 @@ static int vfm_map_remove_by_index(int index)
 			vfm_map[index]->id, vfm_map[index]->name[i]);
 		ret = -1;
 	}
-	vfm_map[index]->valid = 0;
 	return ret;
 }
 
@@ -141,6 +192,7 @@ int vfm_map_remove(char *id)
 
 	if (IS_ERR_OR_NULL(id))
 		return -1;
+	mutex_lock(&vfm_map_edit_mutex);
 	if (!strcmp(id, "all")) {
 		for (i = 0; i < vfm_map_num; i++) {
 			if (vfm_map[i])
@@ -151,6 +203,7 @@ int vfm_map_remove(char *id)
 		if (index >= 0)
 			ret = vfm_map_remove_by_index(index);
 	}
+	mutex_unlock(&vfm_map_edit_mutex);
 	return ret;
 }
 EXPORT_SYMBOL(vfm_map_remove);
@@ -161,7 +214,6 @@ int vfm_map_add(char *id, char *name_chain)
 	int ret = -1;
 	char *ptr = NULL, *token = NULL;
 	struct vfm_map_s *p;
-	int old_num = vfm_map_num;
 	unsigned long flags;
 	int add_ok = 0;
 	int cnt = 10;
@@ -207,69 +259,64 @@ int vfm_map_add(char *id, char *name_chain)
 		p->vfm_map_size++;
 	} while (token && cnt--);
 
-	cnt = 10; /*limit the cnt of retry to avoid the infinite loop*/
 	kfree((void *)addr);
-retry:
-	for (i = 0; i < vfm_map_num; i++) {
+	mutex_lock(&vfm_map_edit_mutex);
+	mutex_lock(&vfm_map_mutex);
+	/* the same chain, in any map of the id, is already there */
+	for (i = 0; i < vfm_map_num && !add_ok; i++) {
 		struct vfm_map_s *pi = vfm_map[i];
 
-		if (!pi || (strcmp(pi->id, p->id))) {
-			/*not same id to next one*/
+		if (!pi || !pi->valid || strcmp(pi->id, p->id) ||
+		    pi->vfm_map_size != p->vfm_map_size)
 			continue;
-		} else if (pi->valid) {
-			for (j = 0; j < p->vfm_map_size; j++) {
-				if (strcmp(pi->name[j],
-					p->name[j])){
-					break;
-				}
-			}
-			if (j == p->vfm_map_size) {
-				pi->valid = 1;
-				kfree(p);
-				add_ok = 1;
+		for (j = 0; j < p->vfm_map_size; j++) {
+			if (strcmp(pi->name[j], p->name[j]))
 				break;
-			}
-		} else if (!pi->valid) {
-			/*
-			 *over write old setting.
-			 *  don't free old one,
-			 * because it may on used.
-			 */
-			for (j = 0; j < p->vfm_map_size; j++) {
-				/*over write node.*/
-				strcpy(pi->name[j], p->name[j]);
-			}
-			pi->vfm_map_size = p->vfm_map_size;
-			pi->valid = 1;
-			kfree(p);
-			add_ok = 1;
-			break;
 		}
+		add_ok = j == p->vfm_map_size;
 	}
-	if (!add_ok) {
-		spin_lock_irqsave(&lock, flags);
-		if (i == old_num && old_num != vfm_map_num && cnt--) {
-			spin_unlock_irqrestore(&lock, flags);
-			pr_err("%s: vfm_map changed on add, need retry!\n",
-				__func__);
-			goto retry;
+	/*
+	 * Else over write a removed map of the id.
+	 * don't free old one, because it may on used.
+	 */
+	for (i = 0; i < vfm_map_num && !add_ok; i++) {
+		struct vfm_map_s *pi = vfm_map[i];
+
+		if (!pi || pi->valid || strcmp(pi->id, p->id))
+			continue;
+		spin_lock_irqsave(&vfm_map_lock, flags);
+		write_seqcount_begin(&vfm_map_seq);
+		for (j = 0; j < p->vfm_map_size; j++) {
+			/*over write node.*/
+			strcpy(pi->name[j], p->name[j]);
 		}
-		if (i == vfm_map_num) {
-			if (i < VFM_MAP_COUNT) {
-				vfm_map[i] = p;
-				vfm_map_num++;
-				add_ok = 1;
-			} else{
-				pr_err("%s: Error, map full\n", __func__);
-				ret = -1;
-				kfree(p);
-			}
-		} else
-			kfree(p);
-		spin_unlock_irqrestore(&lock, flags);
+		pi->vfm_map_size = p->vfm_map_size;
+		/* inactive until the active states are refreshed */
+		pi->active = 0;
+		pi->valid = 1;
+		write_seqcount_end(&vfm_map_seq);
+		spin_unlock_irqrestore(&vfm_map_lock, flags);
+		add_ok = 1;
 	}
+	/* else a new slot */
+	if (!add_ok && vfm_map_num < VFM_MAP_COUNT) {
+		spin_lock_irqsave(&vfm_map_lock, flags);
+		write_seqcount_begin(&vfm_map_seq);
+		/* the map before its slot: unlocked reads */
+		smp_store_release(&vfm_map[vfm_map_num], p);
+		vfm_map_num++;
+		write_seqcount_end(&vfm_map_seq);
+		spin_unlock_irqrestore(&vfm_map_lock, flags);
+		p = NULL;
+		add_ok = 1;
+	}
+	mutex_unlock(&vfm_map_mutex);
+	mutex_unlock(&vfm_map_edit_mutex);
+	kfree(p);
 	if (add_ok)
 		ret = 0;
+	else
+		pr_err("%s: Error, map full\n", __func__);
 	return ret;
 }
 EXPORT_SYMBOL(vfm_map_add);
@@ -291,6 +338,11 @@ static char *vf_get_provider_name_inmap(int i, const char *receiver_name)
 	return provider_name;
 }
 
+/*
+ * The map's own string: amvideo, the deinterlacers and v4lvideo use it
+ * at once to find a chain's first provider. vf_get_provider() takes a
+ * copy instead (vf_get_provider_name_copy()).
+ */
 char *vf_get_provider_name(const char *receiver_name)
 {
 	int i;
@@ -307,7 +359,8 @@ char *vf_get_provider_name(const char *receiver_name)
 	return provider_name;
 }
 
-static char *vf_get_receiver_name_inmap(int i, const char *provider_name)
+static char *vf_get_receiver_name_inmap(int i, const char *provider_name,
+					bool trace)
 {
 	int j;
 	int provide_namelen = strlen(provider_name);
@@ -317,7 +370,7 @@ static char *vf_get_receiver_name_inmap(int i, const char *provider_name)
 
 	for (j = 0; j < vfm_map[i]->vfm_map_size; j++) {
 		namelen = strlen(vfm_map[i]->name[j]);
-		if (vfm_debug_flag & 2) {
+		if (trace && (vfm_debug_flag & 2)) {
 			pr_err("%s:vfm_map:%s\n", __func__,
 				vfm_map[i]->name[j]);
 		}
@@ -329,7 +382,8 @@ static char *vf_get_receiver_name_inmap(int i, const char *provider_name)
 				receiver_name = vfm_map[i]->name[j + 1];
 				found = true;
 				break;
-			} else if (provider_name[namelen] == '.') {
+			} else if (namelen < provide_namelen &&
+				   provider_name[namelen] == '.') {
 				/*
 				 *continue looking, an exact matching
 				 * has higher priority
@@ -342,20 +396,139 @@ static char *vf_get_receiver_name_inmap(int i, const char *provider_name)
 	return receiver_name;
 }
 
-char *vf_get_receiver_name(const char *provider_name)
+/*
+ * Whether the active maps give a receiver a provider, whose name is
+ * copied to name (size bytes the caller owns): read as the receiver
+ * lookup reads the maps (vf_get_receiver_name_routed()), so the name is
+ * that of the maps between two writes and does not change under the
+ * caller.
+ */
+bool vf_get_provider_name_copy(const char *receiver_name, char *name,
+			       size_t size)
+{
+	unsigned long flags;
+	unsigned int seq;
+	char *provider_name;
+
+	seq = read_seqcount_begin(&vfm_map_seq);
+	provider_name = vf_get_provider_name(receiver_name);
+	if (provider_name)
+		strscpy(name, provider_name, size);
+	if (read_seqcount_retry(&vfm_map_seq, seq)) {
+		spin_lock_irqsave(&vfm_map_lock, flags);
+		provider_name = vf_get_provider_name(receiver_name);
+		if (provider_name)
+			strscpy(name, provider_name, size);
+		spin_unlock_irqrestore(&vfm_map_lock, flags);
+	}
+	return provider_name;
+}
+
+/*
+ * The receiver the active maps route a provider to, the walk as it always
+ * was. Unless inactive is NULL, it also notes there the valid maps it
+ * passes as inactive, reading each map's active state once.
+ */
+static char *vf_get_receiver_name_walk(const char *provider_name,
+				       unsigned long *inactive, bool trace)
 {
 	int i;
 	char *receiver_name = NULL;
 
 	for (i = 0; i < vfm_map_num; i++) {
-		if (vfm_map[i] && vfm_map[i]->valid && vfm_map[i]->active) {
-			receiver_name = vf_get_receiver_name_inmap(i,
-				provider_name);
+		if (vfm_map[i] && vfm_map[i]->valid) {
+			if (READ_ONCE(vfm_map[i]->active))
+				receiver_name = vf_get_receiver_name_inmap(i,
+					provider_name, trace);
+			else if (inactive)
+				__set_bit(i, inactive);
 		}
 		if (receiver_name)
 			break;
 	}
 	return receiver_name;
+}
+
+/* Whether one of the maps in the bitmap routes the provider */
+static bool vf_routed_by(const unsigned long *maps, const char *provider_name)
+{
+	int i;
+
+	for_each_set_bit(i, maps, VFM_MAP_COUNT) {
+		if (vfm_map[i]->valid &&
+		    vf_get_receiver_name_inmap(i, provider_name, false))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The walk, and unless routed is NULL, in *routed, whether any valid map
+ * routes the provider, active or not: a map added while its provider is
+ * registered stays inactive until a provider registers or goes
+ * (vf_update_active_map()), and a notification that fails meanwhile is
+ * worth an error all the same. The maps the walk passes as inactive are
+ * looked at, untraced as they always were, only when no active one gives
+ * a receiver, so a look that finds one looks at the maps the walk does;
+ * the walk notes them in a bitmap. The receiver's name is copied to name.
+ */
+static bool vf_get_receiver_name_look(const char *provider_name,
+				      char *name, size_t size, bool *routed,
+				      bool trace)
+{
+	DECLARE_BITMAP(inactive, VFM_MAP_COUNT);
+	char *receiver_name;
+
+	if (routed)
+		bitmap_zero(inactive, VFM_MAP_COUNT);
+	receiver_name = vf_get_receiver_name_walk(provider_name,
+						  routed ? inactive : NULL,
+						  trace);
+	if (receiver_name)
+		strscpy(name, receiver_name, size);
+	if (routed)
+		*routed = receiver_name ||
+			  vf_routed_by(inactive, provider_name);
+	return receiver_name;
+}
+
+/*
+ * Whether the active maps route a provider to a receiver, whose name is
+ * copied to name (size bytes the caller owns), and unless routed is NULL,
+ * whether any valid map routes it: the look. The look reads the maps
+ * without a lock while the writers may change them: an add may add a map
+ * or rewrite a removed one in place, a remove take one out and the
+ * active-state refresh activate one. The look could then find a
+ * receiver, or a route, in a mix of maps before and after that neither
+ * had, or miss one that both had, or that moved from one map to another.
+ * When vfm_map_seq says a writer ran meanwhile, it looks once more,
+ * untraced, holding vfm_map_lock, so the answer and the name are those of
+ * the maps between two writes, and the name does not change under the
+ * caller.
+ */
+bool vf_get_receiver_name_routed(const char *provider_name, char *name,
+				 size_t size, bool *routed)
+{
+	unsigned long flags;
+	unsigned int seq;
+	bool found;
+
+	seq = read_seqcount_begin(&vfm_map_seq);
+	found = vf_get_receiver_name_look(provider_name, name, size, routed,
+					  true);
+	if (read_seqcount_retry(&vfm_map_seq, seq)) {
+		spin_lock_irqsave(&vfm_map_lock, flags);
+		found = vf_get_receiver_name_look(provider_name, name, size,
+						  routed, false);
+		spin_unlock_irqrestore(&vfm_map_lock, flags);
+	}
+	return found;
+}
+
+bool vf_get_receiver_name_copy(const char *provider_name, char *name,
+			       size_t size)
+{
+	return vf_get_receiver_name_routed(provider_name, name, size, NULL);
 }
 
 static void vfm_init(void)
@@ -444,26 +617,31 @@ static ssize_t vfm_map_show(struct class *class,
 	int i, j;
 	int len = 0;
 
+	mutex_lock(&vfm_map_mutex);
 	for (i = 0; i < vfm_map_num; i++) {
 		if (vfm_map[i] && vfm_map[i]->valid) {
-			len += sprintf(buf + len, "[%02d]  %s { ",
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				"[%02d]  %s { ",
 				i,/*in slot num.*/
 				vfm_map[i]->id);
 			for (j = 0; j < vfm_map[i]->vfm_map_size; j++) {
 				if (j < (vfm_map[i]->vfm_map_size - 1)) {
-					len += sprintf(buf + len, "%s(%d) ",
+					len += scnprintf(buf + len,
+					   PAGE_SIZE - len, "%s(%d) ",
 					   vfm_map[i]->name[j],
 					   (vfm_map[i]->active >> j) & 0x1);
 				} else{
-					len += sprintf(buf + len, "%s",
+					len += scnprintf(buf + len,
+						PAGE_SIZE - len, "%s",
 						vfm_map[i]->name[j]);
 				}
 			}
-			len += sprintf(buf + len, "}\n");
+			len += scnprintf(buf + len, PAGE_SIZE - len, "}\n");
 		}
 	}
-	len += provider_list(buf + len);
-	len += receiver_list(buf + len);
+	mutex_unlock(&vfm_map_mutex);
+	len += provider_list(buf + len, PAGE_SIZE - len);
+	len += receiver_list(buf + len, PAGE_SIZE - len);
 	return len;
 }
 
@@ -732,8 +910,10 @@ int vfm_map_show_fun(const char *trigger, int id, char *sbuf, int size)
 		ret = -1;
 	}
 	if (ret > 0 && getbuf != NULL) {
-		ret = min_t(int, ret, size);
-		strncpy(sbuf, buf, ret);
+		/* cut to sbuf's size, and ended with a NUL */
+		ret = strscpy(sbuf, buf, size);
+		if (ret < 0)
+			ret = size - 1;
 	}
 	if (getbuf != NULL)
 		free_page((unsigned long)getbuf);
@@ -905,8 +1085,32 @@ fs_initcall(vfm_class_init);
 module_exit(vfm_class_exit);
 MODULE_PARM_DESC(vfm_debug_flag, "\n vfm_debug_flag\n");
 module_param(vfm_debug_flag, int, 0664);
+/*
+ * vfm_map_num, the count of map slots in use, is vfm_map_add()'s to keep:
+ * a count past VFM_MAP_COUNT would make every walk of the slots read past
+ * them. It can be read but not set: sysfs cannot write it, and a value
+ * from the kernel command line (vfm.vfm_map_num=) is ignored. That value
+ * is still parsed as before, as an error there would also keep init from
+ * getting the arguments after "--".
+ */
+static int vfm_map_num_set(const char *val, const struct kernel_param *kp)
+{
+	int num;
+	int ret = kstrtoint(val, 0, &num);
+
+	if (ret)
+		return ret;
+	pr_warn("%s: vfm_map_num is read-only, %d ignored\n", __func__, num);
+	return 0;
+}
+
+static const struct kernel_param_ops vfm_map_num_ops = {
+	.set = vfm_map_num_set,
+	.get = param_get_int,
+};
+
 MODULE_PARM_DESC(vfm_map_num, "\n vfm_map_num\n");
-module_param(vfm_map_num, int, 0664);
+module_param_cb(vfm_map_num, &vfm_map_num_ops, &vfm_map_num, 0444);
 
 module_param(vfm_trace_enable, int, 0664);
 MODULE_PARM_DESC(vfm_trace_enable, "\n vfm_trace_enable\n");
