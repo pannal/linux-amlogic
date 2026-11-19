@@ -937,6 +937,29 @@ static int is_dvi_device(struct rx_cap *prxcap)
 		return 0;
 }
 
+static void hdmitx_set_display_pkts(struct hdmitx_dev *hdev,
+	enum hdmi_vic VideoCode)
+{
+	if ((VideoCode == HDMI_4k2k_30) ||
+		(VideoCode == HDMI_4k2k_25) ||
+		(VideoCode == HDMI_4k2k_24) ||
+		(VideoCode == HDMI_4k2k_smpte_24))
+		hdmi_set_vend_spec_infofram(hdev, VideoCode);
+	else if ((!hdev->flag_3dfp) && (!hdev->flag_3dtb) &&
+		(!hdev->flag_3dss))
+		hdmi_set_vend_spec_infofram(hdev, 0);
+	else
+		;
+
+	if (hdev->allm_mode) {
+		hdmitx_construct_vsif(hdev, VT_ALLM, 1, NULL);
+		hdev->hwop.cntlconfig(hdev, CONF_CT_MODE,
+			SET_CT_OFF);
+	}
+	hdev->hwop.cntlconfig(hdev, CONF_CT_MODE,
+		hdev->ct_mode);
+}
+
 int hdmitx_set_display(struct hdmitx_dev *hdev, enum hdmi_vic VideoCode)
 {
 	struct hdmitx_vidpara *param = NULL;
@@ -1018,32 +1041,20 @@ int hdmitx_set_display(struct hdmitx_dev *hdev, enum hdmi_vic VideoCode)
 					CONF_HDMI_DVI_MODE, HDMI_MODE);
 			}
 			hdmi_tx_construct_avi_packet(param, (char *)AVI_DB);
-
-			if ((VideoCode == HDMI_4k2k_30) ||
-				(VideoCode == HDMI_4k2k_25) ||
-				(VideoCode == HDMI_4k2k_24) ||
-				(VideoCode == HDMI_4k2k_smpte_24))
-				hdmi_set_vend_spec_infofram(hdev, VideoCode);
-			else if ((!hdev->flag_3dfp) && (!hdev->flag_3dtb) &&
-				(!hdev->flag_3dss))
-				hdmi_set_vend_spec_infofram(hdev, 0);
-			else
-				;
-
-			if (hdev->allm_mode) {
-				hdmitx_construct_vsif(hdev, VT_ALLM, 1, NULL);
-				hdev->hwop.cntlconfig(hdev, CONF_CT_MODE,
-					SET_CT_OFF);
-			}
-			hdev->hwop.cntlconfig(hdev, CONF_CT_MODE,
-				hdev->ct_mode);
-
+			hdmitx_set_display_pkts(hdev, VideoCode);
 			ret = 0;
 		}
 	}
 	hdmitx_set_spd_info(hdev);
 
 	return ret;
+}
+
+/* Packet tail of a modeset, for a same-transport refresh (setclk_mutex). */
+void hdmitx_refresh_display_pkts(struct hdmitx_dev *hdev, enum hdmi_vic vic)
+{
+	hdmitx_set_display_pkts(hdev, vic);
+	hdmitx_set_spd_info(hdev);
 }
 
 static void hdmi_set_vend_spec_infofram(struct hdmitx_dev *hdev,

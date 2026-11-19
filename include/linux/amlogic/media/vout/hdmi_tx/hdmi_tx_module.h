@@ -307,6 +307,19 @@ struct st_debug_param {
 };
 
 #define EDID_MAX_BLOCK              8
+struct hdmitx_hdr_bypass {
+	unsigned int outstanding;
+	u64 requests, assertions, zero_request;
+	bool initialized, closing, failed, owed, legacy_demand, zero_next;
+	bool enabled, zero_active, applied_valid, capabilities_valid;
+	bool untrusted;
+	unsigned char endpoint;
+	atomic_t transport_gen, link_gen;
+	int applied_gen, applied_link, endpoint_gen, zero_gen;
+	unsigned int vic, frac, phy, cs, cd, cr, num, den, clock;
+	char attr[16];
+};
+
 struct hdmitx_dev {
 	struct cdev cdev; /* The cdev structure */
 	dev_t hdmitx_id;
@@ -510,6 +523,7 @@ struct hdmitx_dev {
 	spinlock_t edid_spinlock; /* edid hdr/dv cap lock */
 	struct st_debug_param debug_param;
 	unsigned int cec_func_config;
+	struct hdmitx_hdr_bypass hdr_bypass;
 };
 
 #define CMD_DDC_OFFSET          (0x10 << 24)
@@ -854,6 +868,52 @@ extern unsigned int get_hdcp22_base(void);
  *       2: for EDID auto mode
  */
 extern void hdmitx_audio_mute_op(unsigned int flag);
+enum hdmitx_hdr_origin {
+	HDMITX_HDR_ORIGIN_UNKNOWN = 0,
+	HDMITX_HDR_ORIGIN_PLAIN_HDR10 = 1,
+};
+
+#if defined(CONFIG_AMLOGIC_HDMITX) && \
+	defined(CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_VECM) && \
+	!defined(CONFIG_DRM_MESON_HDMI) && \
+	!defined(CONFIG_DRM_MESON_HDMI_MODULE)
+#define HDMITX_NATIVE_HDR_PROVENANCE
+bool hdmitx_hdr_packet_from(struct vout_device_s *provider,
+	struct master_display_info_s *data, enum hdmitx_hdr_origin origin);
+#else
+static inline bool hdmitx_hdr_packet_from(struct vout_device_s *provider,
+	struct master_display_info_s *data, enum hdmitx_hdr_origin origin)
+{
+	return false;
+}
+#endif
+
+/* Packet classes an untracked writer can leave dirty for native HDR bypass. */
+#define HDMITX_HDR_PKT_VSIF	0x1
+#define HDMITX_HDR_PKT_AVI	0x2
+#define HDMITX_HDR_PKT_ALL	(HDMITX_HDR_PKT_VSIF | HDMITX_HDR_PKT_AVI)
+
+#if defined(CONFIG_DRM_MESON_HDMI)
+static inline void hdmitx_hdr_transport_changed(struct hdmitx_dev *hdev) {}
+static inline void hdmitx_hdr_link_changed(struct hdmitx_dev *hdev) {}
+static inline void hdmitx_hdr_transport_untrusted(struct hdmitx_dev *hdev) {}
+static inline void hdmitx_hdr_debug_untrusted(struct hdmitx_dev *hdev) {}
+static inline void hdmitx_hdr_packet_untrusted(struct hdmitx_dev *hdev,
+	unsigned int pkt) {}
+static inline void hdmitx_hdr_packet_clean(struct hdmitx_dev *hdev,
+	unsigned int pkt) {}
+static inline void hdmitx_same_mode_hw_changed(void) {}
+#else
+void hdmitx_hdr_transport_changed(struct hdmitx_dev *hdev);
+void hdmitx_hdr_link_changed(struct hdmitx_dev *hdev);
+void hdmitx_hdr_transport_untrusted(struct hdmitx_dev *hdev);
+void hdmitx_hdr_debug_untrusted(struct hdmitx_dev *hdev);
+void hdmitx_hdr_packet_untrusted(struct hdmitx_dev *hdev, unsigned int pkt);
+void hdmitx_hdr_packet_clean(struct hdmitx_dev *hdev, unsigned int pkt);
+void hdmitx_same_mode_hw_changed(void);
+#endif
+void hdmitx_hw_same_mode_refresh(struct hdmitx_dev *hdev);
+void hdmitx_refresh_display_pkts(struct hdmitx_dev *hdev, enum hdmi_vic vic);
 extern void hdmitx_video_mute_op(unsigned int flag);
 
 /*

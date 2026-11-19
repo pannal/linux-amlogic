@@ -51,6 +51,29 @@ MODULE_PARM_DESC(osd_pq_passthrough, "\n osd plane carries bt2020 pq, skip sdr->
  */
 u32 osd_pq_applied;
 
+/* 1: on an HDR-capable BT.2020 sink, send SDR video and graphics as
+ * BT.2020 colour with the SDR transfer (709 primaries converted to 2020)
+ * instead of BT.709, so SDR<->HDR10 switches change only the DRM packet
+ * and the AVI colorimetry stays constant.
+ */
+u32 sdr_bt2020_out;
+module_param(sdr_bt2020_out, uint, 0664);
+MODULE_PARM_DESC(sdr_bt2020_out, "\n send sdr as bt2020 colour, sdr transfer\n");
+
+/* sdr_bt2020_out as sampled by the last policy pass, and the value OSD1
+ * was last programmed under; amcsc re-runs the csc process until the
+ * module parameter reaches OSD1.
+ */
+u32 sdr_bt2020_policy;
+u32 sdr_bt2020_applied;
+
+/* BT.709 -> BT.2020 linear RGB, 1024 = 1.0 (SDR_GMT_CONVERT scale) */
+static int sdr_709_2020_1024[9] = {
+	643, 337, 44,
+	71, 942, 11,
+	17, 90, 917
+};
+
 // sdr to hdr table  12bit
 int cgain_lut0[65] = {
 	0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400,
@@ -2479,8 +2502,10 @@ enum hdr_process_sel hdr_func(
 	if (disable_flush_flag)
 		return hdr_process_select;
 
-	if (module_sel == OSD1_HDR)
+	if (module_sel == OSD1_HDR) {
 		osd_pq_applied = osd_pq;
+		sdr_bt2020_applied = READ_ONCE(sdr_bt2020_policy);
+	}
 
 	if (osd_pq && module_sel == OSD1_HDR &&
 	    (hdr_process_select & SDR_HDR)) {
@@ -3476,6 +3501,8 @@ enum hdr_process_sel hdr_func(
 		hdr_mtx_param.mtx_on = MTX_ON;
 		hdr_mtx_param.p_sel = hdr_process_select;
 	} else if (hdr_process_select & SDR_GMT_CONVERT) {
+		int *luma = rgb2ycbcr_709;
+
 		if (hdr_process_select & RGB_VDIN &&
 		    hdr_process_select & FULL_VDIN) {
 			coeff_in = bypass_coeff;
@@ -3510,13 +3537,28 @@ enum hdr_process_sel hdr_func(
 				hdr_mtx_param.mtx_gamut[i] =
 				bypass_coeff[i];
 		}
+		if (hdr_process_select & SDR_BT2020_OUT) {
+			/* OSD1 is full-range RGB here, video limited YCbCr */
+			if (module_sel == OSD1_HDR &&
+			    (hdr_process_select & RGB_OSD)) {
+				coeff_in = bypass_coeff;
+				oft_pre_in = bypass_pre;
+				oft_post_in = bypass_pos;
+			}
+			coeff_out = rgb2ycbcr_ncl2020;
+			oft_pre_out = rgb2yuvpre;
+			oft_post_out = rgb2yuvpos;
+			luma = rgb2ycbcr_ncl2020;
+			for (i = 0; i < 9; i++)
+				hdr_mtx_param.mtx_gamut[i] =
+					sdr_709_2020_1024[i];
+		}
 		hdr_mtx_param.mtx_only = HDR_ONLY;
 		hdr_mtx_param.mtx_gamut_mode = 1;
 		for (i = 0; i < MTX_NUM_PARAM; i++) {
 			hdr_mtx_param.mtx_in[i] = coeff_in[i];
-			hdr_mtx_param.mtx_cgain[i] =
-				rgb2ycbcr_709[i];
-			hdr_mtx_param.mtx_ogain[i] = rgb2ycbcr_709[i];
+			hdr_mtx_param.mtx_cgain[i] = luma[i];
+			hdr_mtx_param.mtx_ogain[i] = luma[i];
 			hdr_mtx_param.mtx_out[i] = coeff_out[i];
 
 			if (i < 3) {

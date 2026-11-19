@@ -1,0 +1,54 @@
+What:		/sys/class/amhdmitx/amhdmitx0/native_hdr_mute_bypass
+Description:
+		Experimental native HDR10 mute-bypass policy. Read/write decimal
+		values 0 or 1; other values return EINVAL. Default 0 (disabled).
+		Setting 0 disables future bypass admissions; setting 1 permits
+		only qualified native HDR10 events. A previously admitted zero-
+		mute notification completes without compensating mute operations.
+		The value reports policy, not whether a particular event qualifies.
+
+		This control is independent of hdr_mute_frame, whose accepted
+		values, legacy assertion/release behavior and global reads remain
+		unchanged. Writing hdr_mute_frame does not change this policy.
+		The bypass path calls neither the video nor audio mute function,
+		for either assertion or release. The existing SDR zero-DRM packet
+		and 1.5-second cleanup remain unchanged.
+
+		Eligibility requires an idle HDR work lifetime with no queued,
+		pre-entry or executing legacy dispatch, coalesced legacy demand or
+		owed HDR assertion; a previous SDR/BT709 wire state; and a known
+		unchanged successfully applied HDMI transport. This includes VIC,
+		timing, fractional policy, PHY selection, color format/depth/range,
+		bounded attributes, link generation and cached HDR capability.
+		Unknown/invalid transport, hotplug and modesets fail qualification.
+
+		Only the built-in native HDMI provider can receive the synchronous
+		per-call plain-HDR10 tag. The G12B single-VD1, follow-source, auto-
+		HDR path must have actually invoked the unforced VPP path, with
+		matching native source, applied bypass and PQ output state. Dolby
+		Vision, HLG, HDR10+, CUVA, conversion/forced output, skipped VPP,
+		other providers and untagged/ambiguous producers use legacy policy.
+		DRM and unsupported build configurations retain legacy callbacks.
+		Metadata payload and public vout callback layout are unchanged.
+		This is source-state qualification, not proof of displayed pixels.
+
+		Unsupported raw/debug controls, active receiver-sense probing and
+		dynamic/unknown transport controls conservatively make bypass
+		ineligible until fresh driver initialization. Tracking invariant
+		failures are logged and also disable eligibility. Toggling this
+		control does not erase those conditions or release existing mutes.
+
+		The legacy rapid-reentry limitation is deliberately unchanged:
+		after a zero notification completes, SDR cleanup can queue; PQ
+		reentry before cleanup runs can skip a fresh assertion because
+		current and last mode still match, then legacy work can unmute.
+		This experiment is not a general audio-ownership fix or a promise
+		that every busy fallback asserts hdr_mute_frame frames.
+
+		Off-device regression:
+		  python3 tools/test-native-hdr-mute-bypass.py --negative-controls
+		The test compiles actual callback/worker/producer functions under
+		ASan/UBSan. Its scheduling-cutpoint model checks the kernel's
+		PENDING-clear-before-callback order, not real SMP execution.
+		Hardware qualification, correct HDR pixels and sink lock continuity
+		require separate approved device/display validation.
