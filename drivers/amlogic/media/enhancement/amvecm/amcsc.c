@@ -409,18 +409,23 @@ MODULE_PARM_DESC(hdr_policy, "\n current hdr_policy\n");
  * re-run the csc process every frame.
  */
 #define OSD_PQ_TRIES 4
-static u32 osd_pq_target;
+static u32 osd_pq_target, sdr_bt2020_target;
 static int osd_pq_tries[VD_PATH_MAX];
 
+/* also covers sdr_bt2020_out, which likewise must reach OSD1 */
 static bool osd_pq_pending(enum vd_path_e vd_path)
 {
 	u32 want = READ_ONCE(osd_pq_passthrough);
+	u32 bt2020 = !!READ_ONCE(sdr_bt2020_out);
 
-	if (want != osd_pq_target) {
+	if (want != osd_pq_target || bt2020 != sdr_bt2020_target) {
 		osd_pq_target = want;
+		sdr_bt2020_target = bt2020;
 		memset(osd_pq_tries, 0, sizeof(osd_pq_tries));
 	}
-	return want != osd_pq_applied && osd_pq_tries[vd_path] < OSD_PQ_TRIES;
+	return (want != osd_pq_applied ||
+		bt2020 != !!READ_ONCE(sdr_bt2020_applied)) &&
+		osd_pq_tries[vd_path] < OSD_PQ_TRIES;
 }
 
 /* 0: source: use src meta */
@@ -8435,6 +8440,8 @@ static int vpp_matrix_update(
 	int hdmi_scs_type_changed = 0;
 	bool hdr10p_meta_updated = false;
 	bool cuva_meta_updated = false;
+	bool unforced_csc = false;
+	bool unforced_path = false;
 	enum hdr_type_e source_format[VD_PATH_MAX];
 	static int signal_change_latch;
 
@@ -8471,6 +8478,7 @@ static int vpp_matrix_update(
 	if (force_csc_type != 0xff)
 		csc_type = force_csc_type;
 	else {
+		unforced_csc = !debug_csc && !disable_flush_flag;
 		if (signal_change_flag & SIG_CS_CHG){
 			csc_type = get_csc_type(1);
 			pr_info("signal type changed\n");
@@ -8582,11 +8590,13 @@ static int vpp_matrix_update(
 		SIG_SRC_CHG | SIG_HDR_OOTF_CHG | SIG_FORCE_CHG | SIG_RANGE_CHG |
 		SIG_CUVA_HDR_MODE))) {
 		if (cpu_after_eq(MESON_CPU_MAJOR_ID_G12A) &&
-		(get_cpu_type() != MESON_CPU_MAJOR_ID_TL1))
+		(get_cpu_type() != MESON_CPU_MAJOR_ID_TL1)) {
 			video_post_process(
 				vf, csc_type, vinfo,
 				vd_path, p, source_format);
-		else
+			unforced_path = unforced_csc &&
+				!debug_csc && !disable_flush_flag;
+		} else
 			video_process(
 				vf, csc_type, signal_change_flag,
 				vinfo, p, vd_path, source_format);
@@ -8609,7 +8619,7 @@ static int vpp_matrix_update(
 				&hdmitx_vsif_params[vd_path] : NULL,
 				cuva_meta_updated ?
 				&hdmitx_edms_params[vd_path] : NULL,
-				vd_path, source_format);
+				vd_path, source_format, unforced_path);
 	} else {
 		if ((vd_path == VD1_PATH)
 		|| ((vd_path == VD2_PATH) && !is_video_layer_on(VD1_PATH)))
@@ -9078,7 +9088,8 @@ int amvecm_matrix_process(
 				       get_hdr_policy(),
 				       cur_hdr_policy);
 				send_fake_frame = true;
-				if (get_hdr_policy() == 1) {
+				if (get_hdr_policy() == 1 &&
+				    !sdr_bt2020_video_off(vinfo)) {
 				/* adaptive hdr */
 				/* faked vframe to switch matrix */
 				/* turn off hdr module */

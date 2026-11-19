@@ -102,6 +102,10 @@ static void edidinfo_detach_to_vinfo(struct hdmitx_dev *hdev);
 static bool is_cur_tmds_div40(struct hdmitx_dev *hdev);
 static void hdmitx_resend_div40(struct hdmitx_dev *hdev);
 static unsigned int hdmitx_get_frame_duration(void);
+static void hdmitx_close_hdr_work(struct hdmitx_dev *hdev);
+static void hdmitx_hdr_prearm_close(struct hdmitx_dev *hdev);
+static void hdmitx_hdr_commit(struct hdmitx_dev *hdev, int ret,
+			      int link);
 
 static DEFINE_MUTEX(setclk_mutex);
 static DEFINE_MUTEX(getedid_mutex);
@@ -128,6 +132,254 @@ static bool dovi_tv_led_no_colorimetry = false;
  */
 static int hdr_mute_frame = 20;
 static bool hdr10plus_vsif_hold;
+/* Native HDR10 -> BT.2020 SDR exit owes a delayed DRM disable (edid_spinlock). */
+static bool hdr_bt2020_exit;
+
+static void hdmitx_hdr_fail(struct hdmitx_dev *hdev, const char *reason)
+{
+	if (!hdev->hdr_bypass.failed)
+		pr_err("hdmitx: native HDR tracking disabled: %s\n", reason);
+	hdev->hdr_bypass.failed = true;
+}
+
+/* These dispatch fields are protected by edid_spinlock, including admission. */
+static bool hdmitx_hdr_advance(struct hdmitx_dev *hdev, u64 *generation)
+{
+	if (*generation == U64_MAX) {
+		hdmitx_hdr_fail(hdev, "generation overflow");
+		return false;
+	}
+	++*generation;
+	return true;
+}
+
+static void hdmitx_hdr_forget(struct hdmitx_dev *hdev)
+{
+	hdev->hdr_bypass.endpoint = 0;
+	hdev->hdr_bypass.zero_active = false;
+	hdmitx_hdr_advance(hdev, &hdev->hdr_bypass.requests);
+}
+
+static bool hdmitx_queue_hdr(struct hdmitx_dev *hdev, bool zero)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	bool queued;
+
+	if (b->closing)
+		return false;
+	if (!b->initialized) {
+		hdmitx_hdr_fail(hdev, "admission before initialization");
+		return false;
+	}
+	if (!zero) {
+		b->legacy_demand = true;
+		b->zero_active = false;
+		hdmitx_hdr_advance(hdev, &b->requests);
+	}
+	if (b->outstanding == UINT_MAX) {
+		hdmitx_hdr_fail(hdev, "dispatch overflow");
+		return false;
+	}
+	if (b->outstanding > 2) {
+		hdmitx_hdr_fail(hdev, "invalid dispatch count");
+		return false;
+	}
+	if (zero && (b->failed || b->outstanding || b->legacy_demand || b->owed)) {
+		hdmitx_hdr_fail(hdev, "zero admission while busy");
+		return false;
+	}
+	++b->outstanding;
+	if (zero) {
+		b->zero_next = true;
+		b->zero_active = true;
+		b->zero_request = b->requests;
+		b->zero_gen = atomic_read(&b->transport_gen);
+	}
+	queued = schedule_work(&hdev->work_hdr);
+	if (queued && b->outstanding > 2)
+		hdmitx_hdr_fail(hdev, "more than running plus pending");
+	if (!queued) {
+		--b->outstanding;
+		if (zero) {
+			b->zero_next = false;
+			b->zero_active = false;
+			hdmitx_hdr_fail(hdev, "idle zero queue rejected");
+		} else if (!b->outstanding) {
+			hdmitx_hdr_fail(hdev, "coalesced without a reservation");
+		}
+	}
+	return queued;
+}
+
+static void hdmitx_close_hdr_work(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+	bool initialized;
+
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	hdev->hdr_bypass.closing = true;
+	initialized = hdev->hdr_bypass.initialized;
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	if (initialized && cancel_work_sync(&hdev->work_hdr)) {
+		spin_lock_irqsave(&hdev->edid_spinlock, flags);
+		if (!hdev->hdr_bypass.outstanding)
+			hdmitx_hdr_fail(hdev, "cancel without reservation");
+		else
+			--hdev->hdr_bypass.outstanding;
+		hdev->hdr_bypass.zero_next = false;
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	}
+	hdmitx_hdr_prearm_close(hdev);
+}
+
+/*
+ * hdr_bypass.untrusted = sticky || dirty packets.  Transport-class untracked
+ * control stays sticky until a successful full modeset rebuilds the transport;
+ * debug register access and generation overflow stay sticky until reboot.  A
+ * packet class is dirty only until a write that fully defines its registers
+ * again.  Leaf lock: untracked writers run in hardirq.
+ */
+static DEFINE_SPINLOCK(hdmitx_hdr_trust_lock);
+static bool hdmitx_hdr_sticky_untrusted;
+static bool hdmitx_hdr_sticky_permanent;
+static unsigned int hdmitx_hdr_dirty_pkts;
+
+static void hdmitx_hdr_set_sticky(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hdmitx_hdr_trust_lock, flags);
+	hdmitx_hdr_sticky_untrusted = true;
+	hdmitx_hdr_sticky_permanent = true;
+	WRITE_ONCE(hdev->hdr_bypass.untrusted, true);
+	spin_unlock_irqrestore(&hdmitx_hdr_trust_lock, flags);
+}
+
+void hdmitx_hdr_transport_changed(struct hdmitx_dev *hdev)
+{
+	if (atomic_inc_return(&hdev->hdr_bypass.transport_gen) <= 0) {
+		hdmitx_hdr_set_sticky(hdev);
+		pr_err("hdmitx: HDR transport generation overflow\n");
+	}
+}
+
+void hdmitx_hdr_link_changed(struct hdmitx_dev *hdev)
+{
+	if (atomic_inc_return(&hdev->hdr_bypass.link_gen) <= 0) {
+		hdmitx_hdr_set_sticky(hdev);
+		pr_err("hdmitx: HDR link generation overflow\n");
+	}
+	hdmitx_hdr_transport_changed(hdev);
+}
+
+/*
+ * Hardware generation for the same-mode refresh: bumped by every transport
+ * or untracked control change except packet-only AVI/VSIF field writes,
+ * which the refresh itself rewrites.
+ */
+static atomic_t hdmitx_same_mode_hw_gen = ATOMIC_INIT(0);
+
+void hdmitx_same_mode_hw_changed(void)
+{
+	atomic_inc(&hdmitx_same_mode_hw_gen);
+}
+
+static void hdmitx_hdr_mark_untrusted(struct hdmitx_dev *hdev, void *caller,
+	unsigned int pkts)
+{
+	unsigned long flags;
+	bool was;
+
+	spin_lock_irqsave(&hdmitx_hdr_trust_lock, flags);
+	was = READ_ONCE(hdev->hdr_bypass.untrusted);
+	if (pkts)
+		hdmitx_hdr_dirty_pkts |= pkts;
+	else
+		hdmitx_hdr_sticky_untrusted = true;
+	WRITE_ONCE(hdev->hdr_bypass.untrusted, true);
+	spin_unlock_irqrestore(&hdmitx_hdr_trust_lock, flags);
+	if (!was) {
+		if (READ_ONCE(hdev->hdr_bypass.enabled))
+			pr_warn("hdmitx: native HDR bypass ineligible after untracked control from %pS\n",
+				caller);
+		else
+			pr_info("hdmitx: native HDR bypass ineligible after untracked control from %pS\n",
+				caller);
+	}
+	hdmitx_hdr_transport_changed(hdev);
+}
+
+void hdmitx_hdr_transport_untrusted(struct hdmitx_dev *hdev)
+{
+	hdmitx_same_mode_hw_changed();
+	hdmitx_hdr_mark_untrusted(hdev, __builtin_return_address(0), 0);
+}
+
+/* Raw register access: nothing short of a reboot redefines what it wrote. */
+void hdmitx_hdr_debug_untrusted(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hdmitx_hdr_trust_lock, flags);
+	hdmitx_hdr_sticky_permanent = true;
+	spin_unlock_irqrestore(&hdmitx_hdr_trust_lock, flags);
+	hdmitx_same_mode_hw_changed();
+	hdmitx_hdr_mark_untrusted(hdev, __builtin_return_address(0), 0);
+}
+
+void hdmitx_hdr_packet_untrusted(struct hdmitx_dev *hdev, unsigned int pkt)
+{
+	hdmitx_hdr_mark_untrusted(hdev, __builtin_return_address(0),
+		pkt & HDMITX_HDR_PKT_ALL);
+}
+
+/*
+ * The caller has just rewritten every field of @pkt that an untracked writer
+ * can change.  Restores trust only if nothing sticky or still dirty remains;
+ * eligibility itself is re-established by the next hdmitx_hdr_commit().
+ */
+void hdmitx_hdr_packet_clean(struct hdmitx_dev *hdev, unsigned int pkt)
+{
+	unsigned long flags;
+	bool restored = false;
+
+	spin_lock_irqsave(&hdmitx_hdr_trust_lock, flags);
+	if (hdmitx_hdr_dirty_pkts & pkt) {
+		hdmitx_hdr_dirty_pkts &= ~pkt;
+		if (!hdmitx_hdr_dirty_pkts && !hdmitx_hdr_sticky_untrusted &&
+		    READ_ONCE(hdev->hdr_bypass.untrusted)) {
+			WRITE_ONCE(hdev->hdr_bypass.untrusted, false);
+			restored = true;
+		}
+	}
+	spin_unlock_irqrestore(&hdmitx_hdr_trust_lock, flags);
+	if (restored)
+		pr_info("hdmitx: native HDR bypass packet state rewritten; trust restored\n");
+}
+
+/*
+ * A successful full modeset has just reprogrammed PHY, timing, AVI and packet
+ * enables, so transport-class sticky untrust is redefined.  Packet classes
+ * still dirty and permanent untrust remain.
+ */
+static void hdmitx_hdr_transport_rebuilt(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+	bool restored = false;
+
+	spin_lock_irqsave(&hdmitx_hdr_trust_lock, flags);
+	if (hdmitx_hdr_sticky_untrusted && !hdmitx_hdr_sticky_permanent) {
+		hdmitx_hdr_sticky_untrusted = false;
+		if (!hdmitx_hdr_dirty_pkts &&
+		    READ_ONCE(hdev->hdr_bypass.untrusted)) {
+			WRITE_ONCE(hdev->hdr_bypass.untrusted, false);
+			restored = true;
+		}
+	}
+	spin_unlock_irqrestore(&hdmitx_hdr_trust_lock, flags);
+	if (restored)
+		pr_info("hdmitx: native HDR bypass transport rebuilt; trust restored\n");
+}
 
 struct vout_device_s hdmitx_vdev = {
 	.dv_info = &hdmitx_device.rxcap.dv_info,
@@ -412,6 +664,7 @@ static void hdmitx_late_resume(struct early_suspend *h)
 
 static void hdmitx_syscore_resume(void)
 {
+	hdmitx_hdr_link_changed(&hdmitx_device);
 	WRITE_ONCE(hdmitx_wake_gen, hdmitx_wake_gen + 1);
 }
 
@@ -435,7 +688,7 @@ static int hdmitx_reboot_notifier(struct notifier_block *nb,
 	hdev->hpd_lock = 1;
 	cancel_delayed_work_sync(&hdev->work_hpd_plugin);
 	cancel_delayed_work_sync(&hdev->work_hpd_plugout);
-	cancel_work_sync(&hdev->work_hdr);
+	hdmitx_close_hdr_work(hdev);
 	hdmitx_cancel_dv_reconnect(hdev);
 	hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP, SET_AVMUTE);
 	if (hdev->debug_param.avmute_frame > 0)
@@ -482,6 +735,7 @@ static  int  set_disp_mode(const char *mode)
 	struct hdmi_format_para *para = NULL;
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	hdmitx_hdr_transport_untrusted(hdev);
 	para = hdmi_get_fmt_name(mode, hdev->fmt_attr);
 	hdev->para = para;
 
@@ -544,6 +798,22 @@ static void hdmitx_pre_display_init(void)
 		CONF_CLR_AVI_PACKET, 0);
 	hdmitx_device.hwop.cntlconfig(&hdmitx_device,
 		CONF_CLR_VSDB_PACKET, 0);
+}
+
+/*
+ * The modeset's own TMDS PHY disable is one link edge belonging to the
+ * transaction it commits. Adopt exactly that edge; any earlier or concurrent
+ * HPD/EDID edge still leaves the commit's link snapshot stale.
+ */
+static int hdmitx_hdr_pre_display_init(struct hdmitx_dev *hdev, int link)
+{
+	int before = atomic_read(&hdev->hdr_bypass.link_gen);
+
+	hdmitx_pre_display_init();
+	if (before == link && before != INT_MAX &&
+	    atomic_read(&hdev->hdr_bypass.link_gen) == before + 1)
+		return before + 1;
+	return link;
 }
 
 /* fr_tab[]
@@ -664,19 +934,102 @@ static void edidinfo_detach_to_vinfo(struct hdmitx_dev *hdev)
 	hdmitx_vdev.dv_info = &dv_dummy;
 }
 
-static int set_disp_mode_auto_locked(void)
+struct hdmitx_same_mode {
+	bool valid;
+	int hw_gen, link_gen;
+	unsigned int wake_gen;
+	struct hdmi_format_para *para;
+	enum hdmi_vic vic;
+	unsigned int frac, phy, req_cs, req_cd, cs, cd, cr;
+	unsigned int num, den, clock;
+};
+
+/*
+ * Default-off: let an attr "now" refresh skip the modeset when the last
+ * modeset's transport is provably unchanged. All protected by setclk_mutex.
+ */
+static bool seamless_mode_refresh;
+static struct hdmitx_same_mode hdmitx_same_mode;
+static unsigned int same_mode_last, same_mode_refreshes, same_mode_modesets;
+/* Plugin work publishes hpd_state after its modeset, under setclk_mutex. */
+static bool hdmitx_same_mode_plugin;
+
+static unsigned int hdmitx_same_mode_mismatch(struct hdmitx_dev *hdev,
+	const struct hdmitx_same_mode *s, bool same_mode_ok, bool was_ready,
+	struct hdmi_format_para *para, enum hdmi_vic vic,
+	struct vinfo_s *info, unsigned int gen)
+{
+	return !READ_ONCE(seamless_mode_refresh) << 0 | !same_mode_ok << 1 |
+		!s->valid << 2 | !was_ready << 3 | !hdev->hpd_state << 4 |
+		(s->hw_gen != atomic_read(&hdmitx_same_mode_hw_gen)) << 5 |
+		(s->link_gen != atomic_read(&hdev->hdr_bypass.link_gen)) << 6 |
+		(s->wake_gen != gen || hdmitx_setup_gen != gen) << 7 |
+		(vic == HDMI_Unknown || s->vic != vic ||
+		 hdev->cur_VIC != vic) << 8 |
+		(!hdev->cur_video_param ||
+		 hdev->cur_video_param->VIC != vic) << 9 |
+		(!para || s->para != para) << 10 |
+		(s->frac != hdev->frac_rate_policy ||
+		 s->phy != hdev->phy_idx) << 11 |
+		(para && (s->req_cs != para->cs || s->req_cd != para->cd ||
+			  s->cr != para->cr)) << 12 |
+		(s->num != info->sync_duration_num ||
+		 s->den != info->sync_duration_den ||
+		 s->clock != info->video_clk) << 13 |
+		(hdev->flag_3dfp || hdev->flag_3dtb || hdev->flag_3dss) << 14;
+}
+
+/* hw_gen is sampled after the modeset, so its own bumps are absorbed. */
+static void hdmitx_same_mode_record(struct hdmitx_dev *hdev,
+	struct vinfo_s *info, unsigned int gen, int link,
+	unsigned int req_cs, unsigned int req_cd)
+{
+	struct hdmitx_same_mode *s = &hdmitx_same_mode;
+	struct hdmi_format_para *p = hdev->para;
+
+	if (!p || !hdev->cur_video_param || hdev->cur_VIC == HDMI_Unknown ||
+	    hdev->cur_video_param->VIC != hdev->cur_VIC ||
+	    (!hdev->hpd_state && !hdmitx_same_mode_plugin) ||
+	    link != atomic_read(&hdev->hdr_bypass.link_gen) ||
+	    hdev->flag_3dfp || hdev->flag_3dtb || hdev->flag_3dss)
+		return;
+	s->hw_gen = atomic_read(&hdmitx_same_mode_hw_gen);
+	s->link_gen = link;
+	s->wake_gen = gen;
+	s->para = p;
+	s->vic = hdev->cur_VIC;
+	s->frac = hdev->frac_rate_policy;
+	s->phy = hdev->phy_idx;
+	s->req_cs = req_cs;
+	s->req_cd = req_cd;
+	s->cs = p->cs;
+	s->cd = p->cd;
+	s->cr = p->cr;
+	s->num = info->sync_duration_num;
+	s->den = info->sync_duration_den;
+	s->clock = info->video_clk;
+	s->valid = true;
+}
+
+static int __set_disp_mode_auto_locked(bool same_mode_ok)
 {
 	int ret =  -1;
 	const unsigned int gen = READ_ONCE(hdmitx_wake_gen);
 
 	struct vinfo_s *info = NULL;
 	struct hdmitx_dev *hdev = &hdmitx_device;
+	int link = atomic_read(&hdev->hdr_bypass.link_gen);
 	struct hdmi_format_para *para = NULL;
 	unsigned char mode[32];
 	enum hdmi_vic vic = HDMI_Unknown;
 	int colour_depths[] = { 8, 10, 12, 16 };
 	char* colour_sampling[] = {"RGB","YUV422","YUV444","YUV420"};
+	const struct hdmitx_same_mode snap = hdmitx_same_mode;
+	const bool was_ready = hdev->ready;
+	unsigned int req_cs, req_cd;
 
+	hdmitx_same_mode.valid = false;
+	hdmitx_hdr_transport_changed(hdev);
 	memset(mode, 0, sizeof(mode));
 	hdev->ready = 0;
 
@@ -750,7 +1103,15 @@ static int set_disp_mode_auto_locked(void)
 	// still reflect the previous IPT mode (stale).  Treat it as non-DV so
 	// the switch statements below apply normal colour params instead of
 	// DV tunnel mode overrides.
-	int effective_eotf = (xbmc_dv_non_ipt) ?
+	// Likewise once DV has been disabled: a DV->HDR10 VS10 switch never
+	// sends a NULL DV VSIF, so the recorded EOTF can stay DV after Kodi
+	// turns DV off and would otherwise force the RGB/444 8-bit tunnel.
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	bool dv_enabled = is_dolby_vision_enable();
+#else
+	bool dv_enabled = true;
+#endif
+	int effective_eotf = (xbmc_dv_non_ipt || !dv_enabled) ?
 		EOTF_T_NULL : hdev->hdmi_current_eotf_type;
 
 	// force colour subsampling when DV mode
@@ -895,7 +1256,44 @@ static int set_disp_mode_auto_locked(void)
 	/* nothing */
 	}
 
-	hdmitx_pre_display_init();
+	req_cs = para->cs;
+	req_cd = para->cd;
+	same_mode_last = hdmitx_same_mode_mismatch(hdev, &snap, same_mode_ok,
+		was_ready, para, vic, info, gen);
+	if (!same_mode_last) {
+		const bool dv = effective_eotf == EOTF_T_DOLBYVISION ||
+			effective_eotf == EOTF_T_LL_MODE ||
+			effective_eotf == EOTF_T_DV_AHEAD;
+
+		/* Re-apply what set_display resolved, e.g. an RGB-only sink. */
+		para->cs = snap.cs;
+		para->cd = snap.cd;
+		/* The Dolby Vision driver owns VSIF and AVI while DV is active. */
+		if (!dv) {
+			unsigned long flags;
+
+			/* Serialise AVI/packet RMWs with the vsync DRM writer. */
+			spin_lock_irqsave(&hdev->edid_spinlock, flags);
+			hdmitx_hw_same_mode_refresh(hdev);
+			hdmitx_refresh_display_pkts(hdev, vic);
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		}
+		hdev->cur_VIC = vic;
+		hdev->output_blank_flag = 1;
+		hdev->ready = 1;
+		edidinfo_attach_to_vinfo(hdev);
+		memcpy(hdev->backup_fmt_attr, hdev->fmt_attr, 16);
+		hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
+		hdev->backup_phy_idx = hdev->phy_idx;
+		hdmitx_hdr_commit(hdev, 0, link);
+		hdmitx_same_mode_record(hdev, info, gen, link, req_cs, req_cd);
+		same_mode_refreshes++;
+		pr_info("hdmitx: same-transport refresh (dv=%d)\n", dv);
+		return 0;
+	}
+	same_mode_modesets++;
+
+	link = hdmitx_hdr_pre_display_init(hdev, link);
 
 	hdev->cur_VIC = HDMI_Unknown;
 /* if vic is HDMI_Unknown, hdmitx_set_display will disable HDMI */
@@ -934,7 +1332,17 @@ static int set_disp_mode_auto_locked(void)
 	memcpy(hdev->backup_fmt_attr, hdev->fmt_attr, 16);
 	hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
 	hdev->backup_phy_idx = hdev->phy_idx;
+	if (ret >= 0 && hdev->cur_VIC != HDMI_Unknown)
+		hdmitx_hdr_transport_rebuilt(hdev);
+	hdmitx_hdr_commit(hdev, ret, link);
+	if (ret >= 0)
+		hdmitx_same_mode_record(hdev, info, gen, link, req_cs, req_cd);
 	return ret;
+}
+
+static int set_disp_mode_auto_locked(void)
+{
+	return __set_disp_mode_auto_locked(false);
 }
 
 /* HPD work already holds setclk_mutex; vout/sysfs callers enter here. */
@@ -942,8 +1350,14 @@ static int set_disp_mode_auto(void)
 {
 	int ret;
 
+	/*
+	 * vout re-sets the same mode whenever the attr text differs (e.g.
+	 * "422,12bit,now" vs ",422,12bit"). Allow the guarded same-transport
+	 * fast path here; every transport/hw/link mismatch still modesets and
+	 * vout MODE_CHANGE notifiers still run.
+	 */
 	mutex_lock(&setclk_mutex);
-	ret = set_disp_mode_auto_locked();
+	ret = __set_disp_mode_auto_locked(true);
 	mutex_unlock(&setclk_mutex);
 	return ret;
 }
@@ -989,7 +1403,7 @@ ssize_t store_attr(struct device *dev,
 	mutex_lock(&setclk_mutex);
 	/* A refresh must not discard the explicit colour/depth selection. */
 	if (sysfs_streq(buf, "now")) {
-		set_disp_mode_auto_locked();
+		__set_disp_mode_auto_locked(true);
 		goto out;
 	}
 
@@ -1010,7 +1424,7 @@ ssize_t store_attr(struct device *dev,
 	if (now) {
 		/* Keep the refresh command out of the saved mode attributes. */
 		memset(now, ' ', 3);
-		set_disp_mode_auto_locked();
+		__set_disp_mode_auto_locked(true);
 	}
 out:
 	mutex_unlock(&setclk_mutex);
@@ -1023,6 +1437,7 @@ void setup_attr(const char *buf)
 {
 	char attr[16] = {0};
 
+	hdmitx_hdr_transport_untrusted(&hdmitx_device);
 	memcpy(attr, buf, sizeof(attr));
 	memcpy(hdmitx_device.fmt_attr, attr, sizeof(hdmitx_device.fmt_attr));
 }
@@ -1253,6 +1668,7 @@ static ssize_t store_edid(struct device *dev,
 	char *p = NULL, *para = NULL, *argv[8] = {NULL};
 	unsigned int path_length = 0;
 
+	hdmitx_hdr_transport_untrusted(&hdmitx_device);
 	p = kstrdup(buf, GFP_KERNEL);
 	if (p == NULL)
 		return count;
@@ -1643,11 +2059,235 @@ static unsigned int hdmitx_get_frame_duration(void)
 	return frame_duration;
 }
 
+/*
+ * Boot uses "422,12bit" while userspace writes ",422,12bit"; store_attr()
+ * blanks an embedded "now" to spaces and echo may keep a newline. Selections
+ * can thus differ only in leading/trailing separators or bytes after the
+ * terminator. hdmi_parse_attr() and the modeset's strstr() checks match
+ * alphanumeric tokens, so those bytes never change the selected format.
+ */
+static bool hdmitx_hdr_attr_sep(char c)
+{
+	return c == ' ' || c == ',' || c == '\n';
+}
+
+static bool hdmitx_hdr_attr_same(const char *a, const char *b)
+{
+	size_t la = strnlen(a, 16), lb = strnlen(b, 16);
+
+	while (la && hdmitx_hdr_attr_sep(*a))
+		a++, la--;
+	while (lb && hdmitx_hdr_attr_sep(*b))
+		b++, lb--;
+	while (la && hdmitx_hdr_attr_sep(a[la - 1]))
+		la--;
+	while (lb && hdmitx_hdr_attr_sep(b[lb - 1]))
+		lb--;
+	return la == lb && !memcmp(a, b, la);
+}
+
+static bool hdmitx_hdr_transport_ok(struct hdmitx_dev *hdev)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	struct hdmi_format_para *p = hdev->para;
+	struct vinfo_s *v = hdev->vinfo;
+	int gen = atomic_read(&b->transport_gen);
+
+	return b->applied_valid && b->capabilities_valid && !READ_ONCE(b->untrusted) &&
+		hdev->ready && hdev->hpd_state && p && v &&
+		hdev->cur_video_param &&
+		v->sync_duration_num && v->sync_duration_den && v->video_clk &&
+		b->applied_gen == gen &&
+		b->applied_link == atomic_read(&b->link_gen) &&
+		b->vic == hdev->cur_VIC && b->vic == hdev->cur_video_param->VIC &&
+		b->frac == hdev->frac_rate_policy && b->phy == hdev->phy_idx &&
+		b->cs == p->cs && b->cd == p->cd && b->cr == p->cr &&
+		b->num == v->sync_duration_num && b->den == v->sync_duration_den &&
+		b->clock == v->video_clk &&
+		hdmitx_hdr_attr_same(b->attr, hdev->fmt_attr) &&
+		!hdev->flag_3dfp && !hdev->flag_3dtb && !hdev->flag_3dss &&
+		gen == atomic_read(&b->transport_gen);
+}
+
+static void hdmitx_hdr_commit(struct hdmitx_dev *hdev, int ret, int link)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	struct hdmi_format_para *p = hdev->para;
+	struct vinfo_s *v = hdev->vinfo;
+	unsigned long flags;
+	int gen;
+
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	b->applied_valid = false;
+	hdmitx_hdr_forget(hdev);
+	gen = atomic_read(&b->transport_gen);
+	if (ret >= 0 && link == atomic_read(&b->link_gen) &&
+	    b->initialized && !b->closing && !b->failed && !READ_ONCE(b->untrusted) &&
+	    hdev->ready && hdev->hpd_state && hdev->cur_VIC != HDMI_Unknown &&
+	    p && v && hdev->cur_video_param &&
+	    hdev->cur_video_param->VIC == hdev->cur_VIC) {
+		b->applied_gen = gen;
+		b->applied_link = link;
+		b->vic = hdev->cur_VIC;
+		b->frac = hdev->frac_rate_policy;
+		b->phy = hdev->phy_idx;
+		b->cs = p->cs;
+		b->cd = p->cd;
+		b->cr = p->cr;
+		b->num = v->sync_duration_num;
+		b->den = v->sync_duration_den;
+		b->clock = v->video_clk;
+		memcpy(b->attr, hdev->fmt_attr, 16);
+		b->capabilities_valid = !!(hdev->rxcap.hdr_info2.hdr_support & 4);
+		b->applied_valid = gen == atomic_read(&b->transport_gen) &&
+			link == atomic_read(&b->link_gen) &&
+			!READ_ONCE(b->untrusted);
+	}
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+}
+
+/* Diagnostic only: why the last SDR->HDR10 entry was (not) native. */
+static unsigned int hdr_native_last_entry;
+
+static unsigned int hdmitx_hdr_transport_mismatch(struct hdmitx_dev *hdev)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	struct hdmi_format_para *p = hdev->para;
+	struct vinfo_s *v = hdev->vinfo;
+
+	return !b->applied_valid << 0 | !b->capabilities_valid << 1 |
+		READ_ONCE(b->untrusted) << 2 | !hdev->ready << 3 |
+		!hdev->hpd_state << 4 | !p << 5 | !v << 6 |
+		!hdev->cur_video_param << 7 |
+		(b->applied_gen != atomic_read(&b->transport_gen)) << 8 |
+		(b->applied_link != atomic_read(&b->link_gen)) << 9 |
+		(b->vic != hdev->cur_VIC) << 10 |
+		(hdev->cur_video_param && b->vic != hdev->cur_video_param->VIC) << 11 |
+		(b->frac != hdev->frac_rate_policy) << 12 |
+		(b->phy != hdev->phy_idx) << 13 |
+		(p && (b->cs != p->cs || b->cd != p->cd || b->cr != p->cr)) << 14 |
+		(v && (b->num != v->sync_duration_num ||
+		       b->den != v->sync_duration_den)) << 15 |
+		(v && b->clock != v->video_clk) << 16 |
+		!hdmitx_hdr_attr_same(b->attr, hdev->fmt_attr) << 17 |
+		(hdev->flag_3dfp || hdev->flag_3dtb || hdev->flag_3dss) << 18;
+}
+
+/*
+ * SDR endpoints are BT.709 (no DRM, mode 0) and amvecm's opt-in BT.2020
+ * SDR output (tf BT2020-10, mode 4). Only the BT.2020 endpoint keeps the AVI
+ * colorimetry identical to HDR10, so only it gets a native exit (*exit).
+ */
+static bool hdmitx_hdr_native(struct hdmitx_dev *hdev,
+	struct master_display_info_s *data, enum hdmitx_hdr_origin origin,
+	bool *exit)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	int gen = atomic_read(&b->transport_gen);
+	unsigned char endpoint = 0;
+	bool fresh, repeat, idle, ok, sdr2020 = false, was709, was2020;
+
+	if (data && !(data->features & BIT(30))) {
+		unsigned int tf = (data->features >> 8) & 0xff;
+		unsigned int cf = (data->features >> 16) & 0xff;
+
+		if (tf == T_BT709 && cf == C_BT709)
+			endpoint = 1;
+		else if (tf == T_BT2020_10 && cf == C_BT2020)
+			endpoint = 1, sdr2020 = true;
+		else if (tf == T_SMPTE_ST_2084 && cf == C_BT2020 &&
+			 origin == HDMITX_HDR_ORIGIN_PLAIN_HDR10)
+			endpoint = 2;
+	}
+	idle = !b->outstanding && !b->legacy_demand && !b->owed;
+	was709 = hdev->hdmi_last_hdr_mode == 0 &&
+		hdev->hdmi_current_hdr_mode == 0 &&
+		hdev->hdr_transfer_feature == T_BT709 &&
+		hdev->hdr_color_feature == C_BT709;
+	was2020 = hdev->hdmi_last_hdr_mode == 4 &&
+		hdev->hdmi_current_hdr_mode == 4 &&
+		hdev->hdr_transfer_feature == T_BT2020_10 &&
+		hdev->hdr_color_feature == C_BT2020;
+	fresh = endpoint == 2 && b->endpoint == 1 && b->endpoint_gen == gen &&
+		(was709 || was2020) && idle;
+	repeat = endpoint == 2 && b->endpoint == 2 && b->zero_active &&
+		b->zero_request == b->requests && b->zero_gen == gen &&
+		!b->legacy_demand && !b->owed;
+	ok = b->enabled && b->initialized && !b->closing && !b->failed &&
+		hdmitx_hdr_transport_ok(hdev) && !hdmitx_dv_en() &&
+		!hdev->hdr10plus_feature;
+	*exit = ok && sdr2020 && b->endpoint == 2 && b->endpoint_gen == gen &&
+		b->zero_active && b->zero_gen == gen &&
+		b->zero_request == b->requests && idle &&
+		hdev->hdmi_last_hdr_mode == 1 && hdev->hdmi_current_hdr_mode == 1;
+	if (endpoint == 2 && b->endpoint != 2)
+		hdr_native_last_entry =
+			(b->endpoint != 1) << 0 | (b->endpoint_gen != gen) << 1 |
+			(hdev->hdmi_last_hdr_mode != 0 && !was2020) << 2 |
+			(hdev->hdmi_current_hdr_mode != 0 && !was2020) << 3 |
+			(!was709 && !was2020) << 4 |
+			(b->outstanding != 0) << 5 | b->legacy_demand << 6 |
+			b->owed << 7 | !b->enabled << 8 | !b->initialized << 9 |
+			b->closing << 10 | b->failed << 11 |
+			!hdmitx_hdr_transport_ok(hdev) << 12 |
+			hdmitx_dv_en() << 13 | !!hdev->hdr10plus_feature << 14 |
+			was2020 << 15 | 1U << 31;
+	if (!endpoint || endpoint != b->endpoint)
+		hdmitx_hdr_forget(hdev);
+	b->endpoint = endpoint;
+	b->endpoint_gen = gen;
+	return ok && (fresh || repeat);
+}
+
 static void hdr_work_func(struct work_struct *work)
 {
 	struct hdmitx_dev *hdev =
 		container_of(work, struct hdmitx_dev, work_hdr);
 	unsigned int mute_us;
+	unsigned long flags;
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+	u64 assertion;
+	bool zero, notify = false, released = false, exit = false;
+
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (!b->outstanding || b->outstanding > 2)
+		hdmitx_hdr_fail(hdev, "entry without reservation");
+	assertion = b->assertions;
+	zero = b->zero_next;
+	b->zero_next = false;
+	if (zero) {
+		notify = !b->failed && !b->closing && !b->untrusted && b->zero_active &&
+			b->requests == b->zero_request &&
+			atomic_read(&b->transport_gen) == b->zero_gen &&
+			b->endpoint == 2 && hdev->hdmi_current_hdr_mode == 1;
+		if (notify)
+			hdev->hdmi_last_hdr_mode = 1;
+	} else {
+		b->legacy_demand = false;
+		exit = hdr_bt2020_exit;
+	}
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	if (zero) {
+		if (notify) {
+			extcon_set_state_sync(hdmitx_extcon_hdr, EXTCON_DISP_HDMI, 1);
+			hdmitx_set_uevent(HDMITX_HDR_EVENT, 1);
+		}
+		goto complete;
+	}
+	if (exit) {
+		/* Like the BT.709 exit: zero DRM for 1.5s, then none; no mute. */
+		msleep(1500);
+		spin_lock_irqsave(&hdev->edid_spinlock, flags);
+		if (hdr_bt2020_exit && hdev->hdmi_current_hdr_mode == 4 &&
+		    hdev->hdr_transfer_feature == T_BT2020_10 &&
+		    hdev->hdr_color_feature == C_BT2020) {
+			pr_info("hdr_work_func: disable DRM after bt2020 sdr exit\n");
+			hdev->hwop.setpacket(HDMI_PACKET_DRM, NULL, NULL);
+		}
+		hdr_bt2020_exit = false;
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		goto complete;
+	}
 
 	if (hdev->hdr_transfer_feature == T_BT709 &&
 		hdev->hdr_color_feature == C_BT709) {
@@ -1686,9 +2326,22 @@ static void hdr_work_func(struct work_struct *work)
 			usleep_range(mute_us, mute_us + 10);
 			hdmitx_video_mute_op(1);
 			hdmitx_audio_mute_op(1);
+			released = true;
 		}
 		hdmitx_sdr_hdr_uevent(hdev);
 	}
+complete:
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (released && !b->failed && assertion == b->assertions)
+		b->owed = false;
+	if (zero && b->legacy_demand && b->outstanding == 1 && !b->closing)
+		if (!hdmitx_queue_hdr(hdev, false))
+			hdmitx_hdr_fail(hdev, "coalesced replay rejected");
+	if (!b->outstanding)
+		hdmitx_hdr_fail(hdev, "dispatch underflow");
+	else
+		--b->outstanding;
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 }
 
 #define hdmi_debug() \
@@ -1710,10 +2363,180 @@ static void init_drm_db0(struct hdmitx_dev *hdev, unsigned char *dat)
 
 #define GET_LOW8BIT(a)	((a) & 0xff)
 #define GET_HIGH8BIT(a)	(((a) >> 8) & 0xff)
+
+/*
+ * HDR10 pre-arm: userspace announces a plain HDR10 stream while it loads.
+ * From the BT.2020 SDR endpoint only the DRM EOTF differs, so enter native
+ * HDR10 behind VENC black (not AVMUTE) and let the sink switch before the
+ * first frame; that frame's PQ packet then only updates metadata. Video is
+ * shown once it arrives and the legacy HDR entry hold (hdr_mute_frame frames,
+ * with HDMI audio muted) has passed since the PQ packet. A native entry that
+ * was not pre-armed gets the same hold from its first PQ packet. Without
+ * video the pre-arm times out or is cancelled back to BT.2020 SDR.
+ * State is protected by edid_spinlock.
+ */
+enum {
+	HDR_PREARM_IDLE,
+	HDR_PREARM_ARMING,
+	HDR_PREARM_WAITING,
+	HDR_PREARM_SETTLING,
+};
+enum {
+	HDR_PREARM_RESULT_NONE,
+	HDR_PREARM_RESULT_VIDEO,
+	HDR_PREARM_RESULT_OTHER_PKT,
+	HDR_PREARM_RESULT_TIMEOUT,
+	HDR_PREARM_RESULT_CANCEL,
+	HDR_PREARM_RESULT_REJECTED,
+	HDR_PREARM_RESULT_SDR_VIDEO,
+	HDR_PREARM_RESULT_ENTRY_HOLD,
+};
+#define HDR_PREARM_TIMEOUT_MS		5000
+#define HDR_PREARM_MAX_SETTLE_MS	3000
+/* a new video's first pass may repeat the held BT.2020 SDR output */
+#define HDR_PREARM_SDR_REPEATS		2
+static unsigned int hdr_prearm_state;
+static unsigned int hdr_prearm_result;
+static unsigned int hdr_prearm_settle_ms;
+static unsigned int hdr_prearm_sdr_repeats;
+static unsigned long hdr_prearm_start;
+static bool hdr_prearm_entry_hold;
+static bool hdr_prearm_audio;
+static void hdr_prearm_work_func(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hdr_prearm_work, hdr_prearm_work_func);
+
+enum hdmitx_drm_req {
+	HDMITX_DRM_REQ_NORMAL,
+	HDMITX_DRM_REQ_PREARM,
+	HDMITX_DRM_REQ_PREARM_CANCEL,
+	HDMITX_DRM_REQ_PREARM_TIMEOUT,
+};
+
+static bool hdmitx_drm_is(struct master_display_info_s *data,
+	unsigned int tf, unsigned int cf)
+{
+	return data && !(data->features & BIT(30)) &&
+		((data->features >> 8) & 0xff) == tf &&
+		((data->features >> 16) & 0xff) == cf;
+}
+
+/* A fresh native HDR10 entry from the BT.2020 SDR endpoint, AVI unchanged. */
+static bool hdmitx_hdr_prearm_ok(struct hdmitx_dev *hdev)
+{
+	struct hdmitx_hdr_bypass *b = &hdev->hdr_bypass;
+
+	return b->enabled && b->initialized && !b->closing && !b->failed &&
+		hdmitx_hdr_transport_ok(hdev) && !hdmitx_dv_en() &&
+		!hdev->hdr10plus_feature && hdr_status_pos != 4 &&
+		(hdev->rxcap.hdr_info2.hdr_support & 0x4) &&
+		b->endpoint == 1 &&
+		b->endpoint_gen == atomic_read(&b->transport_gen) &&
+		!b->outstanding && !b->legacy_demand && !b->owed &&
+		!hdr_bt2020_exit &&
+		hdev->hdmi_last_hdr_mode == 4 && hdev->hdmi_current_hdr_mode == 4 &&
+		hdev->hdr_transfer_feature == T_BT2020_10 &&
+		hdev->hdr_color_feature == C_BT2020;
+}
+
+/* The legacy HDR entry black: hdr_mute_frame frames of the current mode. */
+static unsigned int hdmitx_hdr_hold_ms(void)
+{
+	u64 us;
+
+	if (hdr_mute_frame <= 0)
+		return 0;
+	us = (u64)hdr_mute_frame * hdmitx_get_frame_duration();
+	return min_t(u64, DIV_ROUND_UP_ULL(us, 1000), HDR_PREARM_MAX_SETTLE_MS);
+}
+
+/* Like the legacy entry, a nonzero hold also mutes HDMI audio. */
+static void hdmitx_hdr_prearm_hold(struct hdmitx_dev *hdev)
+{
+	hdr_prearm_start = jiffies;
+	hdr_prearm_settle_ms = hdmitx_hdr_hold_ms();
+	hdmitx_update_video_mute(hdev, HDMITX_MUTE_PREARM, true, false);
+	hdr_prearm_audio = hdr_prearm_settle_ms && hdev->tx_aud_cfg == 1;
+	if (hdr_prearm_audio)
+		hdmitx_audio_mute_op(0);
+}
+
+static void hdmitx_hdr_prearm_release(struct hdmitx_dev *hdev,
+	unsigned int result)
+{
+	hdr_prearm_state = HDR_PREARM_IDLE;
+	hdr_prearm_result = result;
+	hdr_prearm_entry_hold = false;
+	hdmitx_update_video_mute(hdev, HDMITX_MUTE_PREARM, false, true);
+	/* only undo our own mute; another writer may have changed it since */
+	if (hdr_prearm_audio && hdev->tx_aud_cfg == 0)
+		hdmitx_audio_mute_op(1);
+	hdr_prearm_audio = false;
+	pr_info("hdmitx: hdr prearm released (%u) after %u ms\n", result,
+		jiffies_to_msecs(jiffies - hdr_prearm_start));
+}
+
+/* A native HDR10 entry that was not pre-armed: hold from its PQ packet. */
+static void hdmitx_hdr_entry_hold(struct hdmitx_dev *hdev)
+{
+	if (hdr_prearm_state != HDR_PREARM_IDLE || hdr_mute_frame <= 0)
+		return;
+	hdr_prearm_state = HDR_PREARM_SETTLING;
+	hdr_prearm_result = HDR_PREARM_RESULT_NONE;
+	hdr_prearm_entry_hold = true;
+	hdmitx_hdr_prearm_hold(hdev);
+	mod_delayed_work(system_wq, &hdr_prearm_work,
+			 msecs_to_jiffies(hdr_prearm_settle_ms));
+	pr_info("hdmitx: hdr entry hold %u ms\n", hdr_prearm_settle_ms);
+}
+
+/*
+ * A packet from amvecm while pre-armed. Returns true when it must be
+ * swallowed: the output is already PQ and the packet only repeats the
+ * BT.2020 SDR output held for the new video's first pass.
+ */
+static bool hdmitx_hdr_prearm_packet(struct hdmitx_dev *hdev,
+	struct master_display_info_s *data)
+{
+	unsigned long elapsed, settle;
+
+	if (hdr_prearm_state != HDR_PREARM_WAITING)
+		return false;
+	if (hdmitx_drm_is(data, T_SMPTE_ST_2084, C_BT2020)) {
+		hdr_prearm_state = HDR_PREARM_SETTLING;
+		elapsed = jiffies - hdr_prearm_start;
+		settle = msecs_to_jiffies(hdr_prearm_settle_ms);
+		mod_delayed_work(system_wq, &hdr_prearm_work,
+				 elapsed < settle ? settle - elapsed : 0);
+		return false;
+	}
+	if (hdmitx_drm_is(data, T_BT2020_10, C_BT2020) &&
+	    hdr_prearm_sdr_repeats < HDR_PREARM_SDR_REPEATS) {
+		hdr_prearm_sdr_repeats++;
+		return true;
+	}
+	hdmitx_hdr_prearm_release(hdev,
+		hdmitx_drm_is(data, T_BT2020_10, C_BT2020) ?
+		HDR_PREARM_RESULT_SDR_VIDEO : HDR_PREARM_RESULT_OTHER_PKT);
+	return false;
+}
+
+static struct master_display_info_s hdr_prearm_pq = {
+	.features = (1 << 29) | (5 << 26) | (1 << 24) |
+		(C_BT2020 << 16) | (T_SMPTE_ST_2084 << 8) | (10 << 0),
+};
+static struct master_display_info_s hdr_prearm_sdr = {
+	.features = (1 << 29) | (5 << 26) | (1 << 24) |
+		(C_BT2020 << 16) | (T_BT2020_10 << 8) | (10 << 0),
+};
+
+static void hdmitx_set_drm_pkt_req(struct master_display_info_s *data,
+	enum hdmitx_hdr_origin origin, enum hdmitx_drm_req req);
+
 struct master_display_info_s hsty_drm_config_data[8];
 unsigned int hsty_drm_config_loc, hsty_drm_config_num;
 struct master_display_info_s drm_config_data;
-static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
+static void hdmitx_set_drm_pkt_req(struct master_display_info_s *data,
+	enum hdmitx_hdr_origin origin, enum hdmitx_drm_req req)
 {
 	struct hdmitx_dev *hdev = &hdmitx_device;
 	struct hdr_info *hdr_info = &hdev->rxcap.hdr_info;
@@ -1721,9 +2544,68 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 	static unsigned char DRM_DB[26] = {0x0};
 	unsigned long flags = 0;
 	static unsigned char clear_hdr10plus_flag = 0;
+	bool zero, exit;
 
 	hdmi_debug();
 	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (hdev->hdr_bypass.closing) {
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		return;
+	}
+	switch (req) {
+	case HDMITX_DRM_REQ_PREARM:
+		if (hdr_prearm_state != HDR_PREARM_IDLE ||
+		    !hdmitx_hdr_prearm_ok(hdev)) {
+			hdr_prearm_result = HDR_PREARM_RESULT_REJECTED;
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+			return;
+		}
+		hdr_prearm_state = HDR_PREARM_WAITING;
+		hdr_prearm_result = HDR_PREARM_RESULT_NONE;
+		hdr_prearm_sdr_repeats = 0;
+		hdr_prearm_entry_hold = false;
+		hdmitx_hdr_prearm_hold(hdev);
+		mod_delayed_work(system_wq, &hdr_prearm_work,
+				 msecs_to_jiffies(HDR_PREARM_TIMEOUT_MS));
+		pr_info("hdmitx: hdr prearm, settle %u ms\n",
+			hdr_prearm_settle_ms);
+		data = &hdr_prearm_pq;
+		origin = HDMITX_HDR_ORIGIN_PLAIN_HDR10;
+		break;
+	case HDMITX_DRM_REQ_PREARM_CANCEL:
+	case HDMITX_DRM_REQ_PREARM_TIMEOUT:
+		if (hdr_prearm_state == HDR_PREARM_IDLE) {
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+			return;
+		}
+		if (hdr_prearm_state != HDR_PREARM_WAITING) {
+			/* video is playing: only show it */
+			hdmitx_hdr_prearm_release(hdev,
+						  HDR_PREARM_RESULT_CANCEL);
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+			return;
+		}
+		hdmitx_hdr_prearm_release(hdev,
+			req == HDMITX_DRM_REQ_PREARM_TIMEOUT ?
+			HDR_PREARM_RESULT_TIMEOUT : HDR_PREARM_RESULT_CANCEL);
+		/* no HDR video arrived: back to the BT.2020 SDR endpoint */
+		data = &hdr_prearm_sdr;
+		origin = HDMITX_HDR_ORIGIN_UNKNOWN;
+		break;
+	default:
+		if (hdmitx_hdr_prearm_packet(hdev, data)) {
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+			return;
+		}
+		break;
+	}
+	zero = hdmitx_hdr_native(hdev, data, origin, &exit);
+	if (exit)
+		hdr_bt2020_exit = true;
+	else if (!data || (data->features & BIT(30)) ||
+		 ((data->features >> 8) & 0xff) != T_BT2020_10 ||
+		 ((data->features >> 16) & 0xff) != C_BT2020)
+		hdr_bt2020_exit = false;
 	if (data)
 		memcpy(&drm_config_data, data,
 		       sizeof(struct master_display_info_s));
@@ -1812,12 +2694,13 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 	if (hdev->hdr_transfer_feature == T_BT709 &&
 		hdev->hdr_color_feature == C_BT709) {
 		/* send zero drm only for HDR->SDR transition */
-		if ((DRM_DB[0] == 0x02) || (DRM_DB[0] == 0x03) || clear_hdr10plus_flag) {
+		if ((DRM_DB[0] == 0x02) || (DRM_DB[0] == 0x03) || clear_hdr10plus_flag ||
+		    hdev->hdmi_current_hdr_mode == 4) {
 			pr_info("hdmitx_set_drm_pkt: HDR->SDR, DRM_DB[0]=%d\n",
 				DRM_DB[0]);
 			hdev->colormetry = 0;
 			hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, 0);
-			schedule_work(&hdev->work_hdr);
+			hdmitx_queue_hdr(hdev, false);
 			DRM_DB[0] = 0;
 			clear_hdr10plus_flag = 0;
 		}
@@ -1928,7 +2811,28 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 		break;
 	case 4:
 		/*BT2020-10*/
-		hdmitx_device.hwop.setpacket(HDMI_PACKET_DRM, NULL, NULL);
+		if (exit) {
+			memset(DRM_DB, 0, sizeof(DRM_DB));
+			hdmitx_device.hwop.setpacket(HDMI_PACKET_DRM,
+				DRM_DB, DRM_HB);
+			hdmitx_device.hwop.cntlconfig(&hdmitx_device,
+				CONF_AVI_BT2020, SET_AVI_BT2020);
+			/* 1 -> 4 sends no uevent; skip the mute entirely. */
+			hdev->hdmi_last_hdr_mode = 4;
+			if (!hdmitx_queue_hdr(hdev, false))
+				hdr_bt2020_exit = false;
+			spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+			return;
+		}
+		if (hdr_bt2020_exit) {
+			/* repeat before the delayed disable: keep zero DRM */
+			memset(DRM_DB, 0, sizeof(DRM_DB));
+			hdmitx_device.hwop.setpacket(HDMI_PACKET_DRM,
+				DRM_DB, DRM_HB);
+		} else {
+			hdmitx_device.hwop.setpacket(HDMI_PACKET_DRM,
+				NULL, NULL);
+		}
 		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
 			CONF_AVI_BT2020, SET_AVI_BT2020);
 		break;
@@ -1943,14 +2847,82 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 
 	/* if sdr/hdr mode change ,notify uevent to userspace*/
 	if (hdev->hdmi_current_hdr_mode != hdev->hdmi_last_hdr_mode) {
+		if (zero && hdev->hdmi_current_hdr_mode == 1) {
+			if (hdev->hdr_bypass.zero_active ||
+			    hdmitx_queue_hdr(hdev, true)) {
+				hdmitx_hdr_entry_hold(hdev);
+				spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+				return;
+			}
+		}
 		if (hdr_mute_frame) {
+			hdev->hdr_bypass.owed = true;
+			hdmitx_hdr_advance(hdev, &hdev->hdr_bypass.assertions);
 			hdmitx_video_mute_op(0);
 			hdmitx_audio_mute_op(0);
 		}
-		schedule_work(&hdev->work_hdr);
+		/* No running or pending work will release the mute: undo it. */
+		if (!hdmitx_queue_hdr(hdev, false) &&
+		    !hdev->hdr_bypass.outstanding && hdr_mute_frame) {
+			hdev->hdr_bypass.owed = false;
+			hdmitx_video_mute_op(1);
+			hdmitx_audio_mute_op(1);
+		}
 	}
 	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 }
+
+static void hdmitx_set_drm_pkt_from(struct master_display_info_s *data,
+	enum hdmitx_hdr_origin origin)
+{
+	hdmitx_set_drm_pkt_req(data, origin, HDMITX_DRM_REQ_NORMAL);
+}
+
+static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
+{
+	hdmitx_set_drm_pkt_from(data, HDMITX_HDR_ORIGIN_UNKNOWN);
+}
+
+static void hdr_prearm_work_func(struct work_struct *work)
+{
+	struct hdmitx_dev *hdev = &hdmitx_device;
+	unsigned long flags;
+	unsigned int state;
+
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	state = hdr_prearm_state;
+	if (state == HDR_PREARM_SETTLING)
+		hdmitx_hdr_prearm_release(hdev, hdr_prearm_entry_hold ?
+					  HDR_PREARM_RESULT_ENTRY_HOLD :
+					  HDR_PREARM_RESULT_VIDEO);
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	if (state == HDR_PREARM_WAITING)
+		hdmitx_set_drm_pkt_req(NULL, HDMITX_HDR_ORIGIN_UNKNOWN,
+				       HDMITX_DRM_REQ_PREARM_TIMEOUT);
+}
+
+static void hdmitx_hdr_prearm_close(struct hdmitx_dev *hdev)
+{
+	unsigned long flags;
+
+	cancel_delayed_work_sync(&hdr_prearm_work);
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (hdr_prearm_state != HDR_PREARM_IDLE)
+		hdmitx_hdr_prearm_release(hdev, HDR_PREARM_RESULT_CANCEL);
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+}
+
+#ifdef HDMITX_NATIVE_HDR_PROVENANCE
+bool hdmitx_hdr_packet_from(struct vout_device_s *provider,
+	struct master_display_info_s *data, enum hdmitx_hdr_origin origin)
+{
+	if (provider != &hdmitx_vdev ||
+	    origin != HDMITX_HDR_ORIGIN_PLAIN_HDR10)
+		return false;
+	hdmitx_set_drm_pkt_from(data, origin);
+	return true;
+}
+#endif
 
 void update_current_para(struct hdmitx_dev *hdev)
 {
@@ -2093,6 +3065,7 @@ void hdmitx_set_vsif_pkt(enum eotf_type type,
 	vsif_debug_info.type = type;
 	vsif_debug_info.tunnel_mode = tunnel_mode;
 	vsif_debug_info.signal_sdr = signal_sdr;
+	hdmitx_hdr_forget(hdev);
 
 	if (hsty_vsif_config_loc > 7)
 		hsty_vsif_config_loc = 0;
@@ -2137,7 +3110,7 @@ void hdmitx_set_vsif_pkt(enum eotf_type type,
 		hdev->hdr_color_feature = C_BT709;
 		hdev->colormetry = 0;
 		hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, hdev->colormetry);
-		schedule_work(&hdev->work_hdr);
+		hdmitx_queue_hdr(hdev, false);
 	}
 
 	/*ver0 and ver1_15 and ver1_12bit with ll= 0 use hdmi 1.4b VSIF*/
@@ -3048,6 +4021,7 @@ static ssize_t store_config(struct device *dev,
 	struct master_display_info_s data = {0};
 	struct hdr10plus_para hdr_data = {0x1, 0x2, 0x3};
 
+	hdmitx_hdr_transport_untrusted(&hdmitx_device);
 	pr_info("hdmitx: config: %s\n", buf);
 
 	if (strncmp(buf, "unplug_powerdown", 16) == 0) {
@@ -4398,9 +5372,13 @@ static ssize_t store_phy_idx(struct device *dev,
 		val = buf[0] - '0';
 		pr_info("hdmitx: set phy_idx as %d\n", val);
 		if ((val == 0) || (val == 1) || (val == 2)) {
+			mutex_lock(&setclk_mutex);
+			if (hdev->phy_idx != val)
+				hdmitx_hdr_transport_changed(hdev);
 			hdev->phy_idx = val;
 			if (!hdev->cedst_buf)
 				cedst_malloc_buf(hdev);
+			mutex_unlock(&setclk_mutex);
 		} else {
 			pr_info("hdmitx: only accept as 0(default), 1, or 2\n");
 		}
@@ -4478,9 +5456,13 @@ static ssize_t store_frac_rate(struct device *dev,
 	if (isdigit(buf[0])) {
 		val = buf[0] - '0';
 		pr_info(SYS "set frac_rate_policy as %d\n", val);
-		if ((val == 0) || (val == 1))
+		if ((val == 0) || (val == 1)) {
+			mutex_lock(&setclk_mutex);
+			if (hdmitx_device.frac_rate_policy != val)
+				hdmitx_hdr_transport_changed(&hdmitx_device);
 			hdmitx_device.frac_rate_policy = val;
-		else
+			mutex_unlock(&setclk_mutex);
+		} else
 			pr_info(SYS "only accept as 0 or 1\n");
 	}
 
@@ -4999,6 +5981,7 @@ static ssize_t store_fake_plug(struct device *dev,
 {
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	hdmitx_hdr_transport_untrusted(hdev);
 	pr_info("hdmitx: fake plug %s\n", buf);
 
 	if (strncmp(buf, "1", 1) == 0)
@@ -5859,6 +6842,135 @@ static DEVICE_ATTR(sysctrl_enable, 0664,
 static DEVICE_ATTR(hdr_mute_frame, 0664,
 		   hdr_mute_frame_show, hdr_mute_frame_store);
 
+static ssize_t native_hdr_mute_bypass_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 READ_ONCE(hdmitx_device.hdr_bypass.enabled));
+}
+
+static ssize_t native_hdr_mute_bypass_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned long flags;
+	unsigned int value;
+
+	if (kstrtouint(buf, 10, &value) || value > 1)
+		return -EINVAL;
+	spin_lock_irqsave(&hdmitx_device.edid_spinlock, flags);
+	hdmitx_device.hdr_bypass.enabled = value;
+	spin_unlock_irqrestore(&hdmitx_device.edid_spinlock, flags);
+	return count;
+}
+
+static DEVICE_ATTR(native_hdr_mute_bypass, 0644,
+		   native_hdr_mute_bypass_show, native_hdr_mute_bypass_store);
+
+static ssize_t hdr_prearm_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	unsigned int state, result, settle;
+
+	spin_lock_irqsave(&hdmitx_device.edid_spinlock, flags);
+	state = hdr_prearm_state;
+	result = hdr_prearm_result;
+	settle = hdr_prearm_settle_ms;
+	spin_unlock_irqrestore(&hdmitx_device.edid_spinlock, flags);
+	return scnprintf(buf, PAGE_SIZE, "state=%u result=%u settle_ms=%u\n",
+			 state, result, settle);
+}
+
+/* write 1: pre-arm HDR10 (hold = hdr_mute_frame frames); 0: cancel */
+static ssize_t hdr_prearm_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned long flags;
+	unsigned int value, state;
+
+	if (kstrtouint(buf, 10, &value) || value > 1)
+		return -EINVAL;
+	if (!value) {
+		hdmitx_set_drm_pkt_req(NULL, HDMITX_HDR_ORIGIN_UNKNOWN,
+				       HDMITX_DRM_REQ_PREARM_CANCEL);
+		return count;
+	}
+	hdmitx_set_drm_pkt_req(NULL, HDMITX_HDR_ORIGIN_UNKNOWN,
+			       HDMITX_DRM_REQ_PREARM);
+	spin_lock_irqsave(&hdmitx_device.edid_spinlock, flags);
+	state = hdr_prearm_state;
+	spin_unlock_irqrestore(&hdmitx_device.edid_spinlock, flags);
+	return state == HDR_PREARM_IDLE ? -EAGAIN : count;
+}
+
+static DEVICE_ATTR(hdr_prearm, 0644, hdr_prearm_show, hdr_prearm_store);
+
+static ssize_t seamless_mode_refresh_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(seamless_mode_refresh));
+}
+
+/* 1: an attr "now" with an unchanged transport refreshes packets only */
+static ssize_t seamless_mode_refresh_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	bool value;
+
+	if (kstrtobool(buf, &value))
+		return -EINVAL;
+	mutex_lock(&setclk_mutex);
+	WRITE_ONCE(seamless_mode_refresh, value);
+	mutex_unlock(&setclk_mutex);
+	return count;
+}
+
+static DEVICE_ATTR(seamless_mode_refresh, 0644,
+		   seamless_mode_refresh_show, seamless_mode_refresh_store);
+
+static ssize_t seamless_mode_refresh_state_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	ssize_t n;
+
+	mutex_lock(&setclk_mutex);
+	n = scnprintf(buf, PAGE_SIZE,
+		      "last_mismatch=0x%x refreshes=%u modesets=%u valid=%d\n",
+		      same_mode_last, same_mode_refreshes, same_mode_modesets,
+		      hdmitx_same_mode.valid);
+	mutex_unlock(&setclk_mutex);
+	return n;
+}
+
+static DEVICE_ATTR(seamless_mode_refresh_state, 0444,
+		   seamless_mode_refresh_state_show, NULL);
+
+static ssize_t native_hdr_mute_bypass_state_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct hdmitx_hdr_bypass *b = &hdmitx_device.hdr_bypass;
+	unsigned long flags;
+	ssize_t n;
+
+	spin_lock_irqsave(&hdmitx_device.edid_spinlock, flags);
+	n = scnprintf(buf, PAGE_SIZE,
+		      "last_entry=0x%x transport=0x%x endpoint=%u outstanding=%u legacy=%d owed=%d hdr_mode=%u/%u dirty_pkts=0x%x sticky=%d permanent=%d\n",
+		      hdr_native_last_entry,
+		      hdmitx_hdr_transport_mismatch(&hdmitx_device),
+		      b->endpoint, b->outstanding, b->legacy_demand, b->owed,
+		      hdmitx_device.hdmi_last_hdr_mode,
+		      hdmitx_device.hdmi_current_hdr_mode,
+		      READ_ONCE(hdmitx_hdr_dirty_pkts),
+		      READ_ONCE(hdmitx_hdr_sticky_untrusted),
+		      READ_ONCE(hdmitx_hdr_sticky_permanent));
+	spin_unlock_irqrestore(&hdmitx_device.edid_spinlock, flags);
+	return n;
+}
+
+static DEVICE_ATTR(native_hdr_mute_bypass_state, 0444,
+		   native_hdr_mute_bypass_state_show, NULL);
+
 static struct vinfo_s *hdmitx_get_current_vinfo(void)
 {
 	return hdmitx_device.vinfo;
@@ -5868,6 +6980,7 @@ static int hdmitx_set_current_vmode(enum vmode_e mode)
 {
 	struct vinfo_s *vinfo;
 
+	hdmitx_hdr_transport_changed(&hdmitx_device);
 	pr_info("%s[%d]\n", __func__, __LINE__);
 	/* get current vinfo and refesh */
 	vinfo = hdmitx_get_current_vinfo();
@@ -6402,7 +7515,9 @@ static void hdmitx_hpd_plugin_handler(struct work_struct *work)
 		hdev->dv_reconnect_pending = false;
 	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 
+	hdmitx_same_mode_plugin = true;
 	set_disp_mode_auto_locked();
+	hdmitx_same_mode_plugin = false;
 	info = hdmitx_get_current_vinfo();
 	if (info && (info->mode == VMODE_HDMI))
 		hdmitx_set_audio(hdev, &(hdev->cur_audio_param));
@@ -6422,7 +7537,8 @@ static void hdmitx_hpd_plugin_handler(struct work_struct *work)
 			hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP,
 					    CLR_AVMUTE);
 		} else {
-			/* keep avmute & clear pkt */
+			/* keep avmute & clear pkt; only a full modeset clears it */
+			hdmitx_same_mode.valid = false;
 			hdmitx_set_drm_pkt(NULL);
 			hdmitx_set_vsif_pkt(0, 0, NULL, true);
 			hdmitx_set_hdr10plus_pkt(0, NULL);
@@ -6638,6 +7754,7 @@ static int hdmi_task_handle(void *data)
 {
 	struct vinfo_s *info = NULL;
 	struct hdmitx_dev *hdmitx_device = (struct hdmitx_dev *)data;
+	unsigned long flags;
 
 	if (hdmitx_device->hpd_state) {
 		/* need to get edid before vout probe */
@@ -6652,7 +7769,12 @@ static int hdmi_task_handle(void *data)
 			      HDMI_WAKEUP);
 	hdmitx_set_uevent(HDMITX_HDCPPWR_EVENT, HDMI_WAKEUP);
 
-	INIT_WORK(&hdmitx_device->work_hdr, hdr_work_func);
+	spin_lock_irqsave(&hdmitx_device->edid_spinlock, flags);
+	if (!hdmitx_device->hdr_bypass.closing) {
+		INIT_WORK(&hdmitx_device->work_hdr, hdr_work_func);
+		hdmitx_device->hdr_bypass.initialized = true;
+	}
+	spin_unlock_irqrestore(&hdmitx_device->edid_spinlock, flags);
 	INIT_WORK(&hdmitx_device->work_dv_reconnect, hdmitx_dv_reconnect_work);
 	hdmitx_device->dv_reconnect_pending = false;
 	hdmitx_device->hdmi_wq = alloc_workqueue(DEVICE_NAME,
@@ -7101,6 +8223,7 @@ static int amhdmitx_device_init(struct hdmitx_dev *hdmi_dev)
 	hdmitx_device.vid_mute_op = VIDEO_NONE_OP;
 	/* init debug param */
 	hdmitx_device.debug_param.avmute_frame = 0;
+	memset(&hdmitx_device.hdr_bypass, 0, sizeof(hdmitx_device.hdr_bypass));
 	spin_lock_init(&hdmitx_device.edid_spinlock);
 	return 0;
 }
@@ -7376,6 +8499,11 @@ static int amhdmitx_probe(struct platform_device *pdev)
 	ret = device_create_file(dev, &dev_attr_drm_mode_setting);
 	ret = device_create_file(dev, &dev_attr_sysctrl_enable);
 	ret = device_create_file(dev, &dev_attr_hdr_mute_frame);
+	ret = device_create_file(dev, &dev_attr_native_hdr_mute_bypass);
+	ret = device_create_file(dev, &dev_attr_native_hdr_mute_bypass_state);
+	ret = device_create_file(dev, &dev_attr_hdr_prearm);
+	ret = device_create_file(dev, &dev_attr_seamless_mode_refresh);
+	ret = device_create_file(dev, &dev_attr_seamless_mode_refresh_state);
 
 #ifdef CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND
 	register_early_suspend(&hdmitx_early_suspend_handler);
@@ -7428,11 +8556,16 @@ static int amhdmitx_remove(struct platform_device *pdev)
 {
 	struct device *dev = hdmitx_device.hdtx_dev;
 
+	device_remove_file(dev, &dev_attr_native_hdr_mute_bypass);
+	device_remove_file(dev, &dev_attr_native_hdr_mute_bypass_state);
+	device_remove_file(dev, &dev_attr_hdr_prearm);
+	device_remove_file(dev, &dev_attr_seamless_mode_refresh);
+	device_remove_file(dev, &dev_attr_seamless_mode_refresh_state);
 #ifdef CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND
 	unregister_syscore_ops(&hdmitx_syscore_ops);
 #endif
 	hdmitx_cancel_dv_reconnect(&hdmitx_device);
-	cancel_work_sync(&hdmitx_device.work_hdr);
+	hdmitx_close_hdr_work(&hdmitx_device);
 
 	if (hdmitx_device.hwop.uninit)
 		hdmitx_device.hwop.uninit(&hdmitx_device);

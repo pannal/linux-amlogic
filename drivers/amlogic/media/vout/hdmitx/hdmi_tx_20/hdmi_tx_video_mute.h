@@ -12,10 +12,12 @@ enum hdmitx_video_mute_owner {
 	HDMITX_MUTE_USERSPACE,
 	HDMITX_MUTE_HDR,
 	HDMITX_MUTE_KODI,
+	HDMITX_MUTE_PREARM,
 };
 static DEFINE_SPINLOCK(video_mute_request_lock);
 static bool video_mute_internal;
 static bool video_mute_kodi;
+static bool video_mute_prearm;
 
 static void hdmitx_update_video_mute(struct hdmitx_dev *hdev,
 				    enum hdmitx_video_mute_owner owner,
@@ -34,11 +36,13 @@ static void hdmitx_update_video_mute(struct hdmitx_dev *hdev,
 		video_mute_internal = mute;
 	} else if (owner == HDMITX_MUTE_KODI) {
 		WRITE_ONCE(video_mute_kodi, mute);
+	} else if (owner == HDMITX_MUTE_PREARM) {
+		video_mute_prearm = mute;
 	} else {
 		spin_unlock_irqrestore(&video_mute_request_lock, flags);
 		return;
 	}
-	op = video_mute_internal || video_mute_kodi ||
+	op = video_mute_internal || video_mute_kodi || video_mute_prearm ||
 		atomic_read(&hdev->kref_video_mute) > 0 ?
 		VIDEO_MUTE : VIDEO_UNMUTE;
 	if (deferred) {
