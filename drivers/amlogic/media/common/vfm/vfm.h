@@ -24,13 +24,25 @@ extern int vfm_map_remove(char *id);
 
 char *vf_get_provider_name(const char *receiver_name);
 
-char *vf_get_receiver_name(const char *provider_name);
+bool vf_get_provider_name_copy(const char *receiver_name, char *name,
+			       size_t size);
+
+#define VFM_NAME_LEN    100
+
+bool vf_get_receiver_name_copy(const char *provider_name, char *name,
+			       size_t size);
+
+bool vf_get_receiver_name_routed(const char *provider_name, char *name,
+				 size_t size, bool *routed);
+
+struct vframe_receiver_s *vf_get_receiver_routed(const char *provider_name,
+						 bool *routed);
 
 void vf_update_active_map(void);
 
-int provider_list(char *buf);
+int provider_list(char *buf, int size);
 
-int receiver_list(char *buf);
+int receiver_list(char *buf, int size);
 
 struct vframe_provider_s *vf_get_provider_by_name(const char *provider_name);
 
@@ -39,6 +51,18 @@ extern int vfm_mode;
 extern int vfm_debug_flag;
 extern int vfm_trace_enable;	/* 1; */
 extern int vfm_trace_num;	/*  */
+
+/*
+ * Whether a provider whose receiver cannot be found is worth an error: a
+ * map routes it (routed, from vf_get_receiver_routed()), but to no
+ * registered receiver. A provider no map routes, such as a vdin1 session
+ * whose frames userspace takes through /dev/vdin1, has nobody to tell;
+ * vfm_debug_flag bit 0 logs it as well.
+ */
+static inline bool vf_receiver_expected(bool routed)
+{
+	return routed || (vfm_debug_flag & 1);
+}
 
 struct vfmctl {
 	char name[10];

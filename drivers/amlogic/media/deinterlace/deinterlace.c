@@ -8136,7 +8136,6 @@ static void dbg_check_list(void)
 /*
  * provider/receiver interface
  */
-char *vf_get_receiver_name(const char *provider_name);
 static int di_receiver_event_fun(int type, void *data, void *arg)
 {
 	int i;
@@ -8385,7 +8384,7 @@ static int di_receiver_event_fun(int type, void *data, void *arg)
 		}
 #endif
 	} else if (type == VFRAME_EVENT_PROVIDER_REG) {
-		char *receiver_name = NULL;
+		char receiver_name[VFM_NAME_LEN];
 
 		mutex_lock(&di_event_mutex);
 		if (de_devp->flags & DI_SUSPEND_FLAG) {
@@ -8424,8 +8423,8 @@ static int di_receiver_event_fun(int type, void *data, void *arg)
 		} else {
 			di_pre_stru.vdin_source = false;
 		}
-		receiver_name = vf_get_receiver_name(VFM_NAME);
-		if (receiver_name) {
+		if (vf_get_receiver_name_copy(VFM_NAME, receiver_name,
+					      sizeof(receiver_name))) {
 			if (!strcmp(receiver_name, "amvideo")) {
 				di_post_stru.run_early_proc_fun_flag = 0;
 				if (post_wr_en && post_wr_support)

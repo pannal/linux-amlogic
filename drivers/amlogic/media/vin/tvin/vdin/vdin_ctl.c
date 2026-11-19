@@ -1747,7 +1747,6 @@ void vdin_set_hdr(struct vdin_dev_s *devp)
 	 * through, rather than through whatever the previous session set up.
 	 */
 	case SIGNAL_DOVI:
-		pr_info("vdin_set_hdr: dv loopback passed through\n");
 		/* HDR_BYPASS(bit0) | HLG_BYPASS(bit3) */
 		hdr_set(5, 0x9);
 		break;

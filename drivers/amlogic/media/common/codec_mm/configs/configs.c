@@ -613,7 +613,7 @@ static int configs_list_node_configs_locked(
 		cprefix = "";
 	for (i = 0; i < node->configs_num && (size - pn_size) > 8; i++) {
 		config = &node->configs[i];
-		ret = snprintf(buf + pn_size,
+		ret = scnprintf(buf + pn_size,
 				size - pn_size,
 				" %s%s.%s%s",
 			     cprefix,
@@ -629,13 +629,13 @@ static int configs_list_node_configs_locked(
 			ret = configs_config2str(config,
 				buf + pn_size, size - pn_size);
 			if (ret > 0) {
-				if ((pn_size + ret) < size) {
+				if ((pn_size + ret + 1) < size) {
 					strcat(buf, "\n");
 					ret++;
 				}
 				pn_size += ret;
 			} else {
-				if (ret == 0 && (pn_size + ret) < size) {
+				if (ret == 0 && (pn_size + 1) < size) {
 					strcat(buf, "\n");
 					ret++;
 					continue;
@@ -643,7 +643,7 @@ static int configs_list_node_configs_locked(
 				break;
 			}
 		} else {
-			ret = snprintf(buf + pn_size, size - pn_size, "\n");
+			ret = scnprintf(buf + pn_size, size - pn_size, "\n");
 			if (ret > 0)
 				pn_size += ret;
 		}
@@ -686,7 +686,7 @@ static int configs_list_nodes_in(struct mconfig_node *node,
 				MAX_PREFIX_NAME + MAX_ITEM_NAME);
 	mutex_lock(&node->lock);
 	if (mode & LIST_MODE_NODE_INFO) {
-		ret = snprintf(buf + pn_size, size - pn_size,
+		ret = scnprintf(buf + pn_size, size - pn_size,
 				"[NODE]%s%s:[%s/%d/%d/%d]\n",
 			     c_prefix,
 			     node->name,

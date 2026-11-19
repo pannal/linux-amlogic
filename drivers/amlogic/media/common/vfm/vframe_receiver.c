@@ -32,18 +32,19 @@
 struct vframe_receiver_s *receiver_table[MAX_RECEIVER_NUM];
 static DEFINE_MUTEX(mutex);
 
-int receiver_list(char *buf)
+int receiver_list(char *buf, int size)
 {
 	struct vframe_receiver_s *r = NULL;
 	int len = 0;
 	int i = 0;
 
-	len += sprintf(buf + len, "\nreceiver list:\n");
+	len += scnprintf(buf + len, size - len, "\nreceiver list:\n");
 	mutex_lock(&mutex);
 	for (i = 0; i < MAX_RECEIVER_NUM; i++) {
 		r = receiver_table[i];
 		if (r)
-			len += sprintf(buf + len, "   %s\n", r->name);
+			len += scnprintf(buf + len, size - len, "   %s\n",
+					 r->name);
 	}
 	mutex_unlock(&mutex);
 
@@ -51,19 +52,26 @@ int receiver_list(char *buf)
 }
 
 /*
- * get vframe provider from the provider list by receiver name.
- *
+ * The registered receiver the active maps route a provider to.
+ * vf_get_receiver_routed() also tells, in *routed unless that is NULL,
+ * whether any valid map routes the provider (vf_get_receiver_name_routed()).
+ * The receiver is looked up by a copy of its name from the maps, which an
+ * add may rewrite meanwhile.
  */
-struct vframe_receiver_s *vf_get_receiver(const char *provider_name)
+struct vframe_receiver_s *vf_get_receiver_routed(const char *provider_name,
+						 bool *routed)
 {
 	struct vframe_receiver_s *r = NULL;
-	char *receiver_name = NULL;
+	char receiver_name[VFM_NAME_LEN];
+	bool found;
 	int i;
 
-	receiver_name = vf_get_receiver_name(provider_name);
+	found = vf_get_receiver_name_routed(provider_name, receiver_name,
+					    sizeof(receiver_name), routed);
 	if (vfm_debug_flag & 2)
-		pr_info("%s:receiver_name:%s\n", __func__, receiver_name);
-	if (receiver_name) {
+		pr_info("%s:receiver_name:%s\n", __func__,
+			found ? receiver_name : NULL);
+	if (found) {
 		for (i = 0; i < MAX_RECEIVER_NUM; i++) {
 			r = receiver_table[i];
 			if (r) {
@@ -79,6 +87,11 @@ struct vframe_receiver_s *vf_get_receiver(const char *provider_name)
 			r = NULL;
 	}
 	return r;
+}
+
+struct vframe_receiver_s *vf_get_receiver(const char *provider_name)
+{
+	return vf_get_receiver_routed(provider_name, NULL);
 }
 EXPORT_SYMBOL(vf_get_receiver);
 
@@ -109,14 +122,15 @@ int vf_notify_receiver(const char *provider_name, int event_type, void *data)
 {
 	int ret = -1;
 	struct vframe_receiver_s *receiver = NULL;
+	bool routed;
 
-	receiver = vf_get_receiver(provider_name);
+	receiver = vf_get_receiver_routed(provider_name, &routed);
 	if (receiver) {
 		if (receiver->ops && receiver->ops->event_cb) {
 			ret = receiver->ops->event_cb(event_type, data,
 				receiver->op_arg);
 		}
-	} else {
+	} else if (vf_receiver_expected(routed)) {
 		pr_err("Error: %s, fail to get receiver of provider %s\n",
 			__func__, provider_name);
 	}
