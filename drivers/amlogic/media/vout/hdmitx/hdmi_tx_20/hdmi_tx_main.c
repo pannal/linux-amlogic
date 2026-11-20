@@ -3188,6 +3188,17 @@ static ssize_t store_vid_mute(struct device *dev,
 static ssize_t store_debug(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+	/* PRBS programs the PHY directly; other debug commands do not. */
+	if (!strncmp(buf, "prbs", 4)) {
+		mutex_lock(&setclk_mutex);
+		if (hdmitx_device.phy_inhibit) {
+			mutex_unlock(&setclk_mutex);
+			return -EBUSY;
+		}
+		hdmitx_device.hwop.debugfun(&hdmitx_device, buf);
+		mutex_unlock(&setclk_mutex);
+		return count;
+	}
 	hdmitx_device.hwop.debugfun(&hdmitx_device, buf);
 	return count;
 }
@@ -4264,8 +4275,51 @@ static ssize_t store_phy(struct device *dev,
 	else
 		pr_info(SYS "set phy wrong: %s\n", buf);
 
+	mutex_lock(&setclk_mutex);
 	hdmitx_device.hwop.cntlmisc(&hdmitx_device, MISC_TMDS_PHY_OP, cmd);
+	mutex_unlock(&setclk_mutex);
 	return count;
+}
+
+/* Output permission only: HPD, EDID, and ordinary modesets stay active. */
+static ssize_t store_phy_inhibit(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct hdmitx_dev *hdev = &hdmitx_device;
+	bool inhibit;
+
+	if (sysfs_streq(buf, "1"))
+		inhibit = true;
+	else if (sysfs_streq(buf, "0"))
+		inhibit = false;
+	else
+		return -EINVAL;
+
+	mutex_lock(&setclk_mutex);
+	if (hdev->phy_inhibit != inhibit) {
+		hdev->phy_inhibit = inhibit;
+		if (!inhibit && hdev->hpd_state == 1 && hdev->ready == 1 &&
+		    hdev->cur_VIC != HDMI_Unknown) {
+			/* Reapply the effective transport's SCDC before PHY enable. */
+			hdmitx_restore_phy(hdev);
+		} else {
+			hdev->hwop.cntlmisc(hdev, MISC_TMDS_PHY_OP,
+				TMDS_PHY_DISABLE);
+		}
+	}
+	mutex_unlock(&setclk_mutex);
+	return count;
+}
+
+static ssize_t show_phy_inhibit(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	bool inhibit;
+
+	mutex_lock(&setclk_mutex);
+	inhibit = hdmitx_device.phy_inhibit;
+	mutex_unlock(&setclk_mutex);
+	return snprintf(buf, PAGE_SIZE, "%u\n", inhibit);
 }
 
 static ssize_t show_phy(struct device *dev,
@@ -4690,7 +4744,9 @@ static ssize_t store_div40(struct device *dev,
 {
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	mutex_lock(&setclk_mutex);
 	hdev->hwop.cntlddc(hdev, DDC_SCDC_DIV40_SCRAMB, buf[0] == '1');
+	mutex_unlock(&setclk_mutex);
 
 	return count;
 }
@@ -5021,7 +5077,9 @@ static ssize_t show_rxsense_state(struct device *dev,
 	int sense;
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	mutex_lock(&setclk_mutex);
 	sense = hdev->hwop.cntlmisc(hdev, MISC_TMDS_RXSENSE, 0);
+	mutex_unlock(&setclk_mutex);
 
 	pos += snprintf(buf + pos, PAGE_SIZE, "%d", sense);
 	return pos;
@@ -5807,6 +5865,7 @@ static DEVICE_ATTR(avmute, 0664, show_avmute, store_avmute);
 static DEVICE_ATTR(swap, 0644, show_swap, store_swap);
 static DEVICE_ATTR(vic, 0664, show_vic, store_vic);
 static DEVICE_ATTR(phy, 0664, show_phy, store_phy);
+static DEVICE_ATTR(phy_inhibit, 0644, show_phy_inhibit, store_phy_inhibit);
 static DEVICE_ATTR(sspll, 0664, show_sspll, store_sspll);
 static DEVICE_ATTR(frac_rate_policy, 0664, show_frac_rate, store_frac_rate);
 static DEVICE_ATTR(rxsense_policy, 0644, show_rxsense_policy,
@@ -5969,6 +6028,9 @@ static int hdmitx_module_disable(enum vmode_e cur_vmod)
 {
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	mutex_lock(&setclk_mutex);
+	hdev->ready = 0;
+	hdev->cur_VIC = HDMI_Unknown;
 	hdev->hwop.cntlconfig(hdev, CONF_CLR_AVI_PACKET, 0);
 	hdev->hwop.cntlconfig(hdev, CONF_CLR_VSDB_PACKET, 0);
 	hdev->hwop.cntlmisc(hdev, MISC_TMDS_PHY_OP, TMDS_PHY_DISABLE);
@@ -5980,6 +6042,7 @@ static int hdmitx_module_disable(enum vmode_e cur_vmod)
 	if (hdev->rxsense_policy)
 		queue_delayed_work(hdmitx_device.rxsense_wq,
 			&hdmitx_device.work_rxsense, 0);
+	mutex_unlock(&setclk_mutex);
 
 	return 0;
 }
@@ -6315,9 +6378,14 @@ static void hdmitx_rxsense_process(struct work_struct *work)
 	struct hdmitx_dev *hdev = container_of((struct delayed_work *)work,
 		struct hdmitx_dev, work_rxsense);
 
-	sense = hdev->hwop.cntlmisc(hdev, MISC_TMDS_RXSENSE, 0);
-	extcon_set_state_sync(hdmitx_extcon_rxsense, EXTCON_DISP_HDMI, sense);
-	hdmitx_set_uevent(HDMITX_RXSENSE_EVENT, sense);
+	mutex_lock(&setclk_mutex);
+	/* Sensing can power the PHY. Do not publish a synthetic disconnect. */
+	if (!hdev->phy_inhibit) {
+		sense = hdev->hwop.cntlmisc(hdev, MISC_TMDS_RXSENSE, 0);
+		extcon_set_state_sync(hdmitx_extcon_rxsense, EXTCON_DISP_HDMI, sense);
+		hdmitx_set_uevent(HDMITX_RXSENSE_EVENT, sense);
+	}
+	mutex_unlock(&setclk_mutex);
 	queue_delayed_work(hdev->rxsense_wq, &hdev->work_rxsense, HZ);
 }
 
@@ -7328,6 +7396,7 @@ static int amhdmitx_probe(struct platform_device *pdev)
 	ret = device_create_file(dev, &dev_attr_swap);
 	ret = device_create_file(dev, &dev_attr_vic);
 	ret = device_create_file(dev, &dev_attr_phy);
+	ret = device_create_file(dev, &dev_attr_phy_inhibit);
 	ret = device_create_file(dev, &dev_attr_frac_rate_policy);
 	ret = device_create_file(dev, &dev_attr_sspll);
 	ret = device_create_file(dev, &dev_attr_rxsense_policy);
@@ -7485,6 +7554,7 @@ static int amhdmitx_remove(struct platform_device *pdev)
 	device_remove_file(dev, &dev_attr_stereo_mode);
 	device_remove_file(dev, &dev_attr_avmute);
 	device_remove_file(dev, &dev_attr_vic);
+	device_remove_file(dev, &dev_attr_phy_inhibit);
 	device_remove_file(dev, &dev_attr_frac_rate_policy);
 	device_remove_file(dev, &dev_attr_sspll);
 	device_remove_file(dev, &dev_attr_rxsense_policy);
