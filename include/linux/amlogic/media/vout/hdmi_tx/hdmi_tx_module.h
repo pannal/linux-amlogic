@@ -915,6 +915,7 @@ void hdmitx_hdr_packet_clean(struct hdmitx_dev *hdev, unsigned int pkt);
 void hdmitx_same_mode_hw_changed(void);
 #endif
 void hdmitx_hw_same_mode_refresh(struct hdmitx_dev *hdev);
+bool hdmitx_lldv_vsif_suppress_enabled(void);
 void hdmitx_refresh_display_pkts(struct hdmitx_dev *hdev, enum hdmi_vic vic);
 extern void hdmitx_video_mute_op(unsigned int flag);
 

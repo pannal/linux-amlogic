@@ -1197,10 +1197,9 @@ int hdmitx_construct_vsif(struct hdmitx_dev *hdev, enum vsif_type type,
 	case VT_HDMI14_4K:
 		ieeeoui = HDMI_IEEEOUI;
 		len = 5;
-		if (is_hdmi14_4k(hdev->cur_VIC)) {
+		/* The packet writer clears AVI VIC unless it is kept. */
+		if (is_hdmi14_4k(hdev->cur_VIC))
 			fill_hdmi4k_vsif_data(hdev->cur_VIC, DB, HB);
-			hdmitx_set_avi_vic(0);
-		}
 		break;
 	case VT_ALLM:
 		ieeeoui = HF_IEEEOUI;

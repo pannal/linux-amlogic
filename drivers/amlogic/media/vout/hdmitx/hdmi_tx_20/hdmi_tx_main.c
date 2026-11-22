@@ -3109,12 +3109,13 @@ void hdmitx_set_vsif_pkt(enum eotf_type type,
 	}
 
 	/*ver0 and ver1_15 and ver1_12bit with ll= 0 use hdmi 1.4b VSIF*/
-	if ((hdev->rxcap.dv_info.ver == 0) ||
+	if (!(type == EOTF_T_LL_MODE && hdmitx_lldv_vsif_suppress_enabled()) &&
+	    ((hdev->rxcap.dv_info.ver == 0) ||
 	    ((hdev->rxcap.dv_info.ver == 1) &&
 	    (hdev->rxcap.dv_info.length == 0xE)) ||
 	    ((hdev->rxcap.dv_info.ver == 1) &&
 	    (hdev->rxcap.dv_info.length == 0xB) &&
-	    (hdev->rxcap.dv_info.low_latency == 0))) {
+	    (hdev->rxcap.dv_info.low_latency == 0)))) {
 		if ((vic == HDMI_3840x2160p30_16x9) ||
 		    (vic == HDMI_3840x2160p25_16x9) ||
 		    (vic == HDMI_3840x2160p24_16x9) ||

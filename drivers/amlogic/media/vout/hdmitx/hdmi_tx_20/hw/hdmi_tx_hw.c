@@ -2286,6 +2286,24 @@ enum hdmi_tf_type hdmitx_get_cur_hdr_st(void)
 	return type;
 }
 
+/* Opt-in (default off) for sinks set up manually for LLDV, such as older JVC
+ * projectors: source-led LLDV omits its Dolby VSIF when the AVI VIC alone can
+ * declare the timing, and 4K timings the sink lists as CTA VICs are declared in
+ * the AVI InfoFrame instead of an HDMI 1.4 VSIF, so SDR and LLDV carry the same
+ * timing declaration.  TV-led DV and all other VSIFs are untouched; DV state is
+ * still reported from the remembered LLDV packet.
+ */
+static bool lldv_vsif_suppress;
+static bool lldv_vsif_suppressed;
+static bool lldv_vsif_saved;
+static unsigned char lldv_vsif_db[0x1b];
+static unsigned char lldv_vsif_hb[3];
+
+bool hdmitx_lldv_vsif_suppress_enabled(void)
+{
+	return lldv_vsif_suppress;
+}
+
 static bool hdmitx_vsif_en(void)
 {
 	if (!hdmitx_get_bit(HDMITX_DWC_FC_DATAUTO0, 3) ||
@@ -2307,8 +2325,13 @@ enum hdmi_tf_type hdmitx_get_cur_dv_st(void)
 	unsigned int size = hdmitx_rd_reg(HDMITX_DWC_FC_VSDSIZE);
 	unsigned int cs = hdmitx_rd_reg(HDMITX_DWC_FC_AVICONF0) & 0x3;
 
-	if (!hdmitx_vsif_en())
+	if (!hdmitx_vsif_en()) {
+		if (lldv_vsif_suppressed && cs == 0x1)
+			type = HDMI_DV_VSIF_LL;
+		if (lldv_vsif_suppressed && cs == 0x0)
+			type = HDMI_DV_VSIF_STD;
 		return type;
+	}
 
 	ieee_code = GET_IEEEOUI();
 
@@ -2354,11 +2377,129 @@ bool hdmitx_hdr10p_en(void)
 		HDMI_HDR10P_TYPE;
 }
 
+static bool hdmitx_use_avi_4k_vic(unsigned char *DB, unsigned char *HB)
+{
+	static const unsigned int hdmi14_vics[] = {
+		HDMI_3840x2160p30_16x9, HDMI_3840x2160p25_16x9,
+		HDMI_3840x2160p24_16x9, HDMI_4096x2160p24_256x135
+	};
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	unsigned int vic = hdev->cur_VIC;
+	unsigned int i;
+
+	if (!lldv_vsif_suppress)
+		return false;
+	/* A full modeset sends packets before cur_VIC is committed. */
+	if (vic == HDMI_Unknown && hdev->cur_video_param &&
+	    hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) == hdev->cur_video_param->VIC)
+		vic = hdev->cur_video_param->VIC;
+
+	if (!DB || !HB || HB[2] != 5 || DB[0] != 3 ||
+	    DB[1] != 12 || DB[2] != 0 || DB[3] != 0x20 ||
+	    !DB[4] || DB[4] > ARRAY_SIZE(hdmi14_vics) ||
+	    hdev->rxcap.hf_ieeeoui != HF_IEEEOUI ||
+	    vic != hdmi14_vics[DB[4] - 1])
+		return false;
+
+	for (i = 0; i < hdev->rxcap.VIC_count &&
+	     i < ARRAY_SIZE(hdev->rxcap.VIC); i++) {
+		if (hdev->rxcap.VIC[i] == vic) {
+			/* HDMI 2.x sinks explicitly advertising this CTA VIC
+			 * need no legacy HDMI-VIC declaration.
+			 */
+			if (hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) != vic) {
+				hdmitx_hdr_packet_untrusted(hdev,
+					HDMITX_HDR_PKT_AVI);
+				hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+			}
+			hdmitx_set_packet(HDMI_PACKET_VEND, NULL, NULL);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool hdmitx_is_lldv_vsif(unsigned char *DB, unsigned char *HB)
+{
+	return DB && HB && HB[2] == 0x1b && DB[0] == 0x46 && DB[1] == 0xd0 &&
+		DB[2] == 0x00 && (DB[3] & 0x3) == 0x3;
+}
+
+/* Returns the CTA VIC the AVI InfoFrame can carry alone, else 0. */
+static unsigned int hdmitx_lldv_avi_vic(struct hdmitx_dev *hdev)
+{
+	static const unsigned int hdmi14_vics[] = {
+		HDMI_3840x2160p30_16x9, HDMI_3840x2160p25_16x9,
+		HDMI_3840x2160p24_16x9, HDMI_4096x2160p24_256x135
+	};
+	unsigned int vic = hdev->cur_VIC;
+	unsigned int i;
+
+	if (vic == HDMI_Unknown && hdev->cur_video_param)
+		vic = hdev->cur_video_param->VIC;
+	if (vic == HDMI_Unknown || vic >= HDMITX_VESA_OFFSET)
+		return 0;
+	vic &= HDMITX_VIC_MASK;
+	for (i = 0; i < ARRAY_SIZE(hdmi14_vics); i++)
+		if (vic == hdmi14_vics[i])
+			break;
+	if (i == ARRAY_SIZE(hdmi14_vics))
+		return vic;
+	/* Legacy 4K timings need HDMI_VIC unless the sink takes the CTA VIC. */
+	if (hdev->rxcap.hf_ieeeoui != HF_IEEEOUI)
+		return 0;
+	for (i = 0; i < hdev->rxcap.VIC_count &&
+	     i < ARRAY_SIZE(hdev->rxcap.VIC); i++)
+		if (hdev->rxcap.VIC[i] == vic)
+			return vic;
+	return 0;
+}
+
+static bool hdmitx_lldv_vsif_take(unsigned char *DB, unsigned char *HB)
+{
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	unsigned int vic;
+	int i;
+
+	if (!hdmitx_is_lldv_vsif(DB, HB)) {
+		lldv_vsif_suppressed = false;
+		return false;
+	}
+	memcpy(lldv_vsif_db, DB, sizeof(lldv_vsif_db));
+	memcpy(lldv_vsif_hb, HB, sizeof(lldv_vsif_hb));
+	lldv_vsif_saved = true;
+	vic = lldv_vsif_suppress ? hdmitx_lldv_avi_vic(hdev) : 0;
+	if (!vic) {
+		lldv_vsif_suppressed = false;
+		return false;
+	}
+	if (hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) != vic) {
+		hdmitx_hdr_packet_untrusted(hdev, HDMITX_HDR_PKT_AVI);
+		hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+	}
+	/* Stop the auto-sent VSIF itself, not only this update. */
+	hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 0x0);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID0, 0x00);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID1, 0x00);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID2, 0x00);
+	for (i = 0; i < 24; i++)
+		hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD0 + i, 0x00);
+	if (!lldv_vsif_suppressed)
+		pr_info("hdmitx: LLDV Dolby VSIF suppressed, AVI VIC %u\n",
+			vic);
+	lldv_vsif_suppressed = true;
+	return true;
+}
+
 static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 {
 	int i;
 	int pkt_data_len = 0;
 	unsigned int ieee_code = 0;
+
+	if (type == HDMI_PACKET_VEND && hdmitx_use_avi_4k_vic(DB, HB))
+		return;
 
 	/* Disabling or an HDMI-OUI VSIF fully replaces any untracked VSIF. */
 	if (type == HDMI_PACKET_VEND && DB && HB &&
@@ -2369,6 +2510,8 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 	else if (type == HDMI_PACKET_VEND)
 		hdmitx_hdr_packet_clean(get_hdmitx_device(),
 			HDMITX_HDR_PKT_VSIF);
+	if (type == HDMI_PACKET_VEND && hdmitx_lldv_vsif_take(DB, HB))
+		return;
 	switch (type) {
 	case HDMI_PACKET_AVI:
 		break;
@@ -2405,6 +2548,18 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 				hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 6);
 		}
 		if ((ieee_code == DOVI_IEEEOUI) && (HB[2] == 0x1b)) {
+			if (lldv_vsif_suppress && (DB[3] & 0x3) == 0x3) {
+				struct hdmitx_dev *hdev = get_hdmitx_device();
+				unsigned int vic = hdev->cur_VIC & HDMITX_VIC_MASK;
+
+				/* LLDV replaces the HDMI-4K VSIF carrying the VIC. */
+				if (vic && hdev->cur_VIC < HDMITX_VESA_OFFSET &&
+				    !hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID)) {
+					hdmitx_hdr_packet_untrusted(hdev,
+						HDMITX_HDR_PKT_AVI);
+					hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+				}
+			}
 			/*set dolby vsif data information*/
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD1, DB[4]);
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD2, DB[5]);
@@ -2467,6 +2622,7 @@ static void hdmitx_disable_packet(int type)
 	case HDMI_PACKET_AVI:
 		break;
 	case HDMI_PACKET_VEND:
+		lldv_vsif_suppressed = false;
 		/* disable VSI packet */
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
 		hdmitx_wr_reg(HDMITX_DWC_FC_DATAUTO1, 0);
@@ -2488,6 +2644,12 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 	unsigned char *HB)
 {
 	int i;
+
+	if (type == HDMI_PACKET_VEND)
+		lldv_vsif_suppressed = false;
+	if (type == HDMI_PACKET_VEND && hdmitx_use_avi_4k_vic(DB, HB))
+		return;
+
 #if 0
 	pr_info("HB: %02x %02x %02x\nDB:", HB[0], HB[1], HB[2]);
 	for (i = 0; (i < 24) && (i < HB[2]); i++)
@@ -2501,6 +2663,10 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 0x0);
 			return;
 		}
+		/* HDMI-VIC replaces AVI VIC, decided after the modern path. */
+		if (HB[2] >= 5 && DB[0] == 0x03 && DB[1] == 0x0c &&
+		    DB[2] == 0x00 && DB[3] == 0x20)
+			hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, 0);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, HB[2]);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID0, DB[0]);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID1, DB[1]);
@@ -2518,6 +2684,37 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 	}
 }
 
+
+/* A runtime change re-applies the active LLDV packet under the new policy. */
+static int lldv_vsif_suppress_set(const char *val,
+	const struct kernel_param *kp)
+{
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	bool old = lldv_vsif_suppress;
+	unsigned long flags;
+	int ret = param_set_bool(val, kp);
+
+	if (ret || old == lldv_vsif_suppress)
+		return ret;
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (lldv_vsif_saved && (lldv_vsif_suppressed ||
+	    (hdmitx_vsif_en() && GET_IEEEOUI() == DOVI_IEEEOUI &&
+	     hdmitx_rd_reg(HDMITX_DWC_FC_VSDSIZE) == 0x1b &&
+	     (hdmitx_rd_reg(HDMITX_DWC_FC_VSDPAYLOAD0) & 0x3) == 0x3)))
+		hdmitx_set_packet(HDMI_PACKET_VEND, lldv_vsif_db,
+			lldv_vsif_hb);
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	return 0;
+}
+
+static const struct kernel_param_ops lldv_vsif_suppress_ops = {
+	.set = lldv_vsif_suppress_set,
+	.get = param_get_bool,
+};
+module_param_cb(lldv_vsif_suppress, &lldv_vsif_suppress_ops,
+	&lldv_vsif_suppress, 0644);
+MODULE_PARM_DESC(lldv_vsif_suppress,
+	"Omit source-led LLDV Dolby VSIF and declare listed 4K VICs in AVI (default 0)");
 
 static void hdmitx_setaudioinfoframe(unsigned char *AUD_DB,
 	unsigned char *CHAN_STAT_BUF)
