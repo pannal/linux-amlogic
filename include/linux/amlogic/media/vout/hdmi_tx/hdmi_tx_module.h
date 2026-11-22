@@ -611,6 +611,8 @@ struct hdmitx_dev {
 #define AUDIO_MUTE          0x1
 #define AUDIO_UNMUTE        0x2
 #define CONF_CLR_AUDINFO_PACKET (CMD_CONF_OFFSET + 0x1000 + 0x01)
+/* Publish requested audio state together with its hardware transition. */
+#define CONF_AUDIO_SET_STATE   (CMD_CONF_OFFSET + 0x1000 + 0x02)
 
 /***********************************************************************
  *             MISC control, hpd, hpll //cntlmisc

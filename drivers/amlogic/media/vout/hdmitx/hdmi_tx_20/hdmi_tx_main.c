@@ -2005,13 +2005,8 @@ void hdmitx_audio_mute_op(unsigned int flag)
 	if (hdmitx_device.hdmi_init != 1)
 		return;
 
-	hdmitx_device.tx_aud_cfg = flag;
-	if (flag == 0)
-		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
-			CONF_AUDIO_MUTE_OP, AUDIO_MUTE);
-	else
-		hdmitx_device.hwop.cntlconfig(&hdmitx_device,
-			CONF_AUDIO_MUTE_OP, AUDIO_UNMUTE);
+	hdmitx_device.hwop.cntlconfig(&hdmitx_device,
+		CONF_AUDIO_SET_STATE, flag);
 }
 EXPORT_SYMBOL(hdmitx_audio_mute_op);
 

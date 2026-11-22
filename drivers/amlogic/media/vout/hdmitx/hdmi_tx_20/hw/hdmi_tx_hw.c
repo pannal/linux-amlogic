@@ -2786,15 +2786,40 @@ static void set_aud_samp_pkt(struct hdmitx_dev *hdev,
 }
 
 static int amute_flag = -1;
-static void audio_mute_op(bool flag)
-{
-	if (amute_flag != flag)
-		amute_flag = flag;
-	else
-		return;
+static DEFINE_SPINLOCK(audio_mute_lock);
+enum audio_mute_action {
+	AUDIO_MUTE_APPLY,
+	AUDIO_MUTE_PUBLISH,
+	AUDIO_MUTE_CURRENT,
+};
 
-	if (flag == 0) {
-		hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
+/* Active sampler/FIFO reset windows in hdmitx_set_audmode(); see
+ * audio_cfg_clk_borrow(). Protected by audio_mute_lock.
+ */
+static unsigned int audio_cfg_clk_borrowers;
+
+static void audio_mute_op(struct hdmitx_dev *hdev,
+	enum audio_mute_action action, unsigned int flag)
+{
+	unsigned long flags, fiq_flags;
+	bool enabled;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	if (action == AUDIO_MUTE_PUBLISH)
+		WRITE_ONCE(hdev->tx_aud_cfg, flag);
+	else if (action == AUDIO_MUTE_CURRENT)
+		flag = READ_ONCE(hdev->tx_aud_cfg);
+	enabled = flag != 0;
+	if (amute_flag != enabled)
+		amute_flag = enabled;
+	else
+		goto out;
+
+	if (!enabled) {
+		if (!audio_cfg_clk_borrowers)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 0, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 3, 1);
 	} else {
@@ -2802,6 +2827,57 @@ static void audio_mute_op(bool flag)
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 3, 1);
 	}
+out:
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+}
+
+static void audio_acr_confirm(void)
+{
+	unsigned long flags, fiq_flags;
+	unsigned int data32;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
+	if ((data32 & 0x9) == 0x8) {
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
+		pr_info(HW "enable ACR: [0x10e3] = 0x%x\n", data32);
+	}
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+}
+
+/* The sampler and FIFO resets in hdmitx_set_audmode() run in the audio
+ * sampler clock domains, which audio_mute_op() gates while audio is muted
+ * (for example under the HDR pre-arm hold). Keep those clocks running for the
+ * reset window only: the clocks are live while unmuted or while any window
+ * is active, and the last window out re-gates them only if still muted.
+ * ACR and audio InfoFrame packets are not touched here.
+ */
+static bool audio_cfg_clk_borrow(bool borrow, bool entry_muted)
+{
+	unsigned long flags, fiq_flags;
+	bool muted;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	muted = amute_flag == 0;
+	if (borrow) {
+		if (!audio_cfg_clk_borrowers++ && muted)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 3, 2, 2);
+	} else if (!WARN_ON(!audio_cfg_clk_borrowers)) {
+		if (!--audio_cfg_clk_borrowers && muted)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
+		if (entry_muted || muted)
+			pr_info(HW "muted audio config used sampler clocks, mute=%d->%d\n",
+				entry_muted, muted);
+	}
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+	return muted;
 }
 
 struct hdmitx_audpara hdmiaud_config_data;
@@ -2811,6 +2887,7 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	struct hdmitx_audpara *audio_param)
 {
 	unsigned int data32;
+	bool clk_muted;
 
 	if (!hdev)
 		return 0;
@@ -2829,7 +2906,7 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	else
 		hsty_hdmiaud_config_num = 8;
 
-	audio_mute_op(hdev->tx_aud_cfg);
+	audio_mute_op(hdev, AUDIO_MUTE_CURRENT, 0);
 	/* PCM & multi channel use I2S */
 	if (audio_param->type == CT_PCM &&
 	    audio_param->channel_num > 2)
@@ -2916,17 +2993,15 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	}
 	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
 	pr_info(HW "[0x10e3] = 0x%x\n", data32);
+	clk_muted = audio_cfg_clk_borrow(true, false);
 	set_aud_fifo_rst();
 	udelay(10);
+	audio_cfg_clk_borrow(false, clk_muted);
 	hdmitx_wr_reg(HDMITX_DWC_AUD_N1, hdmitx_rd_reg(HDMITX_DWC_AUD_N1));
 	/* double confirm that ACR packet is enabled
 	 * simultaneously with audio sample packet
 	 */
-	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
-	if ((data32 & 0x9) == 0x8) {
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
-		pr_info(HW "enable ACR: [0x10e3] = 0x%x\n", data32);
-	}
+	audio_acr_confirm();
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 1, 0, 1);
 
 	return 1;
@@ -4233,7 +4308,11 @@ static int hdmitx_cntl_config(struct hdmitx_dev *hdev, unsigned int cmd,
 		ret = hdmitx_get_hdmi_dvi_config(hdev);
 		break;
 	case CONF_AUDIO_MUTE_OP:
-		audio_mute_op(argv == AUDIO_MUTE ? 0 : 1);
+		audio_mute_op(hdev, AUDIO_MUTE_APPLY,
+			argv == AUDIO_MUTE ? 0 : 1);
+		break;
+	case CONF_AUDIO_SET_STATE:
+		audio_mute_op(hdev, AUDIO_MUTE_PUBLISH, argv);
 		break;
 	case CONF_VIDEO_MUTE_OP:
 		hdmitx_set_video_mute(hdev, argv);

@@ -500,6 +500,7 @@ unsigned int sec_reg_read(unsigned int *addr)
 }
 
 static DEFINE_SPINLOCK(reg_lock);
+static DEFINE_SPINLOCK(reg_bits_lock);
 
 unsigned int hdmitx_rd_reg_old(unsigned int addr)
 {
@@ -682,11 +683,18 @@ void hdmitx_set_reg_bits(unsigned int addr, unsigned int value,
 	unsigned int offset, unsigned int len)
 {
 	unsigned int data32 = 0;
+	unsigned long flags, fiq_flags;
 
+	/* Packet and clock fields have writers on different CPUs and in IRQs. */
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&reg_bits_lock, flags);
 	data32 = hdmitx_rd_reg(addr);
 	data32 &= ~(((1 << len) - 1) << offset);
 	data32 |= (value & ((1 << len) - 1)) << offset;
 	hdmitx_wr_reg(addr, data32);
+	spin_unlock_irqrestore(&reg_bits_lock, flags);
+	raw_local_irq_restore(fiq_flags);
 }
 EXPORT_SYMBOL(hdmitx_set_reg_bits);
 
