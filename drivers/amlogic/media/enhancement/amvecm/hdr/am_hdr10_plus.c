@@ -607,6 +607,7 @@ static bool parse_aux_metadata(const u8 *data, int size)
 
 static void hdr10_plus_vf_md_parse(struct vframe_s *vf)
 {
+	static const u8 percentages[] = { 1, 5, 10, 25, 50, 75, 90, 95, 99 };
 	int i;
 	struct hdr10plus_para hdr10p_md_param;
 
@@ -711,7 +712,10 @@ static void hdr10_plus_vf_md_parse(struct vframe_s *vf)
 		"hdr_plus_sei.average_maxrgb[0] = %d\n",
 		hdr_plus_sei.average_maxrgb[0]);
 
-	for (i = 0; i < 9; i++) {
+	/* HDMI carries nine values with implicit percentage indices. */
+	hdr_plus_sei.num_distribution_maxrgb_percentiles[0] = ARRAY_SIZE(percentages);
+	for (i = 0; i < ARRAY_SIZE(percentages); i++) {
+		hdr_plus_sei.distribution_maxrgb_percentages[0][i] = percentages[i];
 		if (i == 2) {
 			hdr_plus_sei.distribution_maxrgb_percentiles[0][2] =
 				hdr10p_md_param.distribution_values[2];
@@ -914,7 +918,8 @@ void hdr10_plus_hdmitx_vsif_parser(
 		ave_maxrgb = 255;
 	hdmitx_hdr10plus_param->average_maxrgb = (u8)ave_maxrgb;
 
-	for (i = 0; i < 9; i++) {
+	for (i = 0; i < ARRAY_SIZE(distribution_values) &&
+	     i < hdr_plus_sei.num_distribution_maxrgb_percentiles[0]; i++) {
 		if ((i == 2) &&
 			/* V0 sei update */
 			(hdmitx_hdr10plus_param->application_version != 0)) {

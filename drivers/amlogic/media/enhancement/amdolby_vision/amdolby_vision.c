@@ -66,6 +66,7 @@
 #include <linux/amlogic/media/vout/lcd/lcd_notify.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
 #include "../../common/vfm/vfm.h"
+#include "../../common/vfm/vframe_aux.h"
 
 DEFINE_SPINLOCK(dovi_lock);
 
@@ -1253,13 +1254,22 @@ static bool skip_cvm_tbl[2][2][4][4] = {
 
 static bool need_skip_cvm(unsigned int is_graphic)
 {
+	unsigned int priority = READ_ONCE(dolby_vision_graphics_priority);
+	unsigned int src = new_dovi_setting.src_format == FORMAT_INVALID ?
+		FORMAT_SDR : new_dovi_setting.src_format;
+	unsigned int dst = new_dovi_setting.dovi_ll_enable ?
+		FORMAT_DOVI_LL : new_dovi_setting.dst_format;
+
 	if (dolby_vision_flags & FLAG_CERTIFICAION) return false;
 	if (dolby_vision_flags & FLAG_FORCE_CVM) return false;
 
-	return skip_cvm_tbl[is_graphic]
-		[dolby_vision_graphics_priority]
-		[new_dovi_setting.src_format == FORMAT_INVALID ? FORMAT_SDR : new_dovi_setting.src_format]
-		[new_dovi_setting.dovi_ll_enable ? FORMAT_DOVI_LL : new_dovi_setting.dst_format];
+	/* Keep CVM enabled for combinations without a bypass policy. */
+	if (is_graphic >= ARRAY_SIZE(skip_cvm_tbl) ||
+	    priority >= ARRAY_SIZE(skip_cvm_tbl[0]) ||
+	    src >= ARRAY_SIZE(skip_cvm_tbl[0][0]) ||
+	    dst >= ARRAY_SIZE(skip_cvm_tbl[0][0][0]))
+		return false;
+	return skip_cvm_tbl[is_graphic][priority][src][dst];
 }
 
 static int stb_dolby_core1_set
@@ -3924,6 +3934,7 @@ int is_dovi_frame(struct vframe_s *vf)
 {
 	struct provider_aux_req_s req;
 	char *p;
+	u32 remaining;
 	unsigned int size = 0;
 	unsigned int type = 0;
 	enum vframe_signal_fmt_e fmt;
@@ -3949,17 +3960,15 @@ int is_dovi_frame(struct vframe_s *vf)
 				 VFRAME_EVENT_RECEIVER_GET_AUX_DATA,
 				 (void *)&req);
 		if (req.dv_enhance_exist) return 1;
-		if (!req.aux_buf || !req.aux_size) return 0;
+		if (!req.aux_buf || req.aux_size <= 0) return 0;
 		p = req.aux_buf;
-		while (p < req.aux_buf + req.aux_size - 8) {
-			size = get_unaligned_be32(p);
-			p += 4;
-			type = get_unaligned_be32(p);
-			p += 4;
+		remaining = req.aux_size;
+		while (vframe_aux_record(p, remaining, &size, &type)) {
 			if (type == DV_SEI ||
 			    (type & 0xffff0000) == DV_AV1_SEI)
 				return 1;
-			p += size;
+			p += 8 + size;
+			remaining -= 8 + size;
 		}
 	}
 	return 0;
@@ -4259,6 +4268,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 {
 	int i;
 	char *p;
+	u32 remaining;
 	unsigned int size = 0;
 	unsigned int type = 0;
 	int md_size = 0;
@@ -4274,7 +4284,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 	static int parse_process_count;
 	static u32 last_play_id;
 
-	if (!aux_buf || aux_size == 0 || !fmt || !md_buf || !comp_buf ||
+	if (!aux_buf || aux_size <= 0 || !fmt || !md_buf || !comp_buf ||
 	    !total_comp_size || !total_md_size || !ret_flags)
 		return 1;
 
@@ -4298,21 +4308,15 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 	}
 
 	p = aux_buf;
-	while (p < aux_buf + aux_size - 8) {
-
-		size = get_unaligned_be32(p);
-		p += 4;
-		type = get_unaligned_be32(p);
-		p += 4;
+	remaining = aux_size;
+	while (remaining) {
+		if (!vframe_aux_record(p, remaining, &size, &type))
+			goto invalid_record;
+		remaining -= 8 + size;
+		p += 8;
 
 		if (debug_dolby & 4)
 			pr_dolby_dbg("metadata type=%08x, size=%d:\n", type, size);
-
-		if (size == 0 || size > aux_size) {
-			pr_dolby_dbg("invalid aux size %d\n", size);
-			ret = 1;
-			goto parse_err;
-		}
 
 		if (type == DV_SEI || /* hevc t35 sei */
 			(type & 0xffff0000) == DV_AV1_SEI) { /* av1 t35 obu */
@@ -4320,6 +4324,8 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 			*total_comp_size = 0;
 			*total_md_size = 0;
 
+			if ((type & 0xffff0000) == DV_AV1_SEI && size < 10)
+				goto invalid_record;
 			if ((type & 0xffff0000) == DV_AV1_SEI &&
 			    p[0] == 0xb5 &&
 			    p[1] == 0x00 &&
@@ -4332,13 +4338,16 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 			    p[8] == 0xcd &&
 			    p[9] == 0x08) {
 				/* AV1 dv meta in obu */
-				*src_format = FORMAT_DOVI;
 				meta_buf[0] = 0;
 				meta_buf[1] = 0;
 				meta_buf[2] = 0;
 				meta_buf[3] = 0x01;
 				meta_buf[4] = 0x19;
+				if (size < 12)
+					goto invalid_record;
 				if (p[11] & 0x10) {
+					if (size < 13)
+						goto invalid_record;
 					rpu_size = 0x100;
 					rpu_size |= (p[11] & 0x0f) << 4;
 					rpu_size |= (p[12] >> 4) & 0x0f;
@@ -4346,6 +4355,8 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 						pr_dolby_error("rpu exceed 512 bytes\n");
 						break;
 					}
+					if (rpu_size > size - 13 || rpu_size > sizeof(meta_buf) - 5)
+						goto invalid_record;
 					for (i = 0; i < rpu_size; i++) {
 						meta_buf[5 + i]  = (p[12 + i] & 0x07) << 5;
 						meta_buf[5 + i] |= (p[13 + i] >> 3) & 0x1f;
@@ -4354,6 +4365,8 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				} else {
 					rpu_size = (p[10] & 0x1f) << 3;
 					rpu_size |= (p[11] >> 5) & 0x07;
+					if (rpu_size > size - 12 || rpu_size > sizeof(meta_buf) - 5)
+						goto invalid_record;
 					for (i = 0; i < rpu_size; i++) {
 						meta_buf[5 + i]  = (p[11 + i] & 0x0f) << 4;
 						meta_buf[5 + i] |= (p[12 + i] >> 4) & 0x0f;
@@ -4362,7 +4375,6 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				}
 			} else {
 				/* HEVC dv meta in sei */
-				*src_format = FORMAT_DOVI;
 				if (size > (sizeof(meta_buf) - 3))
 					size = (sizeof(meta_buf) - 3);
 				meta_buf[0] = 0;
@@ -4372,6 +4384,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				rpu_size = size + 2;
 			}
 
+			*src_format = FORMAT_DOVI;
 			if ((debug_dolby & 4) && dump_enable)
 				dump_buffer("DOLBY: RPU metadata", meta_buf, rpu_size);
 
@@ -4469,6 +4482,8 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 		struct dv_vui_parameters vui_param;
 		static u32 len_2086_sei;
 		u32 len_2094_sei = 0;
+		const char *mastering_payload = NULL;
+		u32 mastering_size = len_2086_sei;
 		static u8 payload_2086_sei[MAX_LEN_2086_SEI];
 		u8 payload_2094_sei[MAX_LEN_2094_SEI];
 		unsigned char nal_type;
@@ -4497,12 +4512,12 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 		if ((debug_dolby & 0x200) && dump_enable)
 			dump_buffer("DOLBY: aux_buf", p, aux_size);
 
-		while (p < aux_buf + aux_size - 8) {
-
-			size = get_unaligned_be32(p);
-			p += 4;
-			type = get_unaligned_be32(p);
-			p += 4;
+		remaining = aux_size;
+		while (remaining) {
+			if (!vframe_aux_record(p, remaining, &size, &type))
+				goto invalid_record;
+			remaining -= 8 + size;
+			p += 8;
 
 			if (debug_dolby & 2)
 				pr_dolby_dbg("type: 0x%x\n", type);
@@ -4517,25 +4532,35 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 
 				if (nal_type == PREFIX_SEI_NUT_NAL ||
 					nal_type == SUFFIX_SEI_NUT_NAL) {
+					if (size < 4)
+						goto invalid_record;
 					sei_payload_type = *(p + 2);
 					sei_payload_size = *(p + 3);
+					if (sei_payload_size > size - 4)
+						goto invalid_record;
 					if (debug_dolby & 2)
 						pr_dolby_dbg("type %d, size %d\n",
 							     sei_payload_type, sei_payload_size);
 					if (sei_payload_type == SEI_TYPE_MASTERING_DISP_COLOUR_VOLUME) {
-						len_2086_sei = sei_payload_size;
-						memcpy(payload_2086_sei, p + 4, len_2086_sei);
+						mastering_size = sei_payload_size;
+						mastering_payload = p + 4;
 					} else if (sei_payload_type == SEI_TYPE_USERDATA_REGISTERED_ITUT_T35) {
 						len_2094_sei = sei_payload_size;
 						memcpy(payload_2094_sei, p + 4, len_2094_sei);
 					}
-					if (len_2086_sei > 0 && len_2094_sei > 0)
+					if (mastering_size && len_2094_sei)
 						break;
 				}
 			}
 			p += size;
 		}
 		if (len_2094_sei > 0) {
+			/* Commit mastering data only after the records used by
+			 * this frame have passed their length checks. */
+			if (mastering_payload) {
+				len_2086_sei = mastering_size;
+				memcpy(payload_2086_sei, mastering_payload, mastering_size);
+			}
 			/* source is VS10 */
 			*total_comp_size = 0;
 			*total_md_size = 0;
@@ -4594,10 +4619,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 				module_put(dv_legacy_owner);
 				spin_unlock_irqrestore(&dovi_lock, flags);
 				pr_dolby_error("meta(%d), pts(%lld) -> parser init fail\n",
-				               size, vf->pts_us64);
-				if (vf)
-					pr_dolby_error("meta(%d), pts(%lld) -> metadata parser init fail\n",
-					               size, vf->pts_us64);
+				               size, vf ? vf->pts_us64 : 0);
 				/* keep totals at 0 (zeroed at branch entry): a
 				 * failed VS10/ATSC T35 probe has no previous
 				 * metadata of its own to fall back to, and
@@ -4620,10 +4642,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 
 			if (rpu_ret < 0) {
 				pr_dolby_error("meta(%d), pts(%lld)->parser process fail\n",
-				               size, vf->pts_us64);
-				if (vf)
-					pr_dolby_error("meta(%d), pts(%lld) -> metadata parser process fail\n",
-					               size, vf->pts_us64);
+				               size, vf ? vf->pts_us64 : 0);
 				/* ret 4, not 3: a failed VS10/ATSC T35 probe is
 				 * a false DV detection (e.g. x265 SDR content
 				 * with T35 SEI), never a transient RPU error in
@@ -4671,6 +4690,10 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 parse_err:
 	parse_process_count--;
 	return ret;
+
+invalid_record:
+	ret = 1;
+	goto parse_err;
 }
 EXPORT_SYMBOL(parse_sei_and_meta_ext);
 
@@ -6868,9 +6891,9 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 	} else {
 		if ((dolby_vision_flags & FLAG_FORCE_DOVI_LL) ||
 		    dolby_vision_ll_policy >= DOLBY_VISION_LL_YUV422) {
-			graphic_max = dv_target_graphics_LL_max[src_format][dst_format];
+			graphic_max = dv_target_graphics_LL_max[target_lum_src(src_format)][dst_format];
 		} else {
-			graphic_max = dv_target_graphics_max[src_format][dst_format];
+			graphic_max = dv_target_graphics_max[target_lum_src(src_format)][dst_format];
 		}
 		if (dv_graphic_blend_test && dst_format == FORMAT_HDR10)
 			graphic_max = dv_HDR10_graphics_max;

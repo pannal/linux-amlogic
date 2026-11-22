@@ -88,6 +88,7 @@ MODULE_AMLOG(LOG_LEVEL_ERROR, 0, LOG_DEFAULT_LEVEL_DESC, LOG_MASK_DESC);
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
 
 #include "../common/vfm/vfm.h"
+#include "../common/vfm/vframe_aux.h"
 #include <linux/amlogic/media/amdolbyvision/dolby_vision.h>
 
 #include <linux/amlogic/media/di/di.h>
@@ -7926,11 +7927,9 @@ static int check_media_sei(char *sei, u32 sei_size, u32 sei_type)
 		return ret;
 
 	p = sei;
-	while (p < sei + sei_size - 8) {
-		size = get_unaligned_be32(p);
-		p += 4;
-		type = get_unaligned_be32(p);
-		p += 4;
+	while (vframe_aux_record(p, sei_size, &size, &type)) {
+		sei_size -= 8 + size;
+		p += 8;
 
 		if (((sei_type == DV_SEI || sei_type == HDR10P) &&
 			sei_type == type) ||
@@ -7940,21 +7939,17 @@ static int check_media_sei(char *sei, u32 sei_size, u32 sei_type)
 			break;
 		} else if ((sei_type == DV_SEI) && type == HDR10P) {
 			/* check DVB/ATSC as DV */
-			if (p >= sei + sei_size - 12)
-				break;
+			if (size < 12)
+				goto next_record;
 			nal_type = ((*p) & 0x7E) >> 1;
 			if (nal_type == PREFIX_SEI_NUT) {
 				sei_payload_type = *(p + 2);
 				sei_payload_size = *(p + 3);
 				if (sei_payload_type == SEI_ITU_T_T35 &&
-				    sei_payload_size >= 8) {
-					country_code = *(p + 4);
-					provider_code = (*(p + 5) << 8) |
-							*(p + 6);
-					user_id = (*(p + 7) << 24) |
-						(*(p + 8) << 16) |
-						(*(p + 9) << 8) |
-						(*(p + 10));
+				    sei_payload_size >= 8 && sei_payload_size <= size - 4) {
+					country_code = (u8)p[4];
+					provider_code = get_unaligned_be16(p + 5);
+					user_id = get_unaligned_be32(p + 7);
 					user_type_code = *(p + 11);
 					if (country_code == 0xB5 &&
 					    ((provider_code ==
@@ -7973,6 +7968,7 @@ static int check_media_sei(char *sei, u32 sei_size, u32 sei_type)
 				}
 			}
 		}
+next_record:
 		p += size;
 	}
 	return ret;
@@ -8007,8 +8003,6 @@ s32 update_vframe_src_fmt(
 	int ret = 0;
 #endif
 #endif
-	int i;
-	char *p;
 
 	if (!vf)
 		return -1;
@@ -8022,27 +8016,9 @@ s32 update_vframe_src_fmt(
 		pr_info("===update vf %p, sei %p, size %d, dual_layer %d play_id = %d ===\n",
 			vf, sei, size, dual_layer,
 			vf->src_fmt.play_id);
-		if (sei && size > 15) {
-			p = (char *)sei;
-			for (i = 0; i < size; i += 16)
-				pr_info("%02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-					p[i],
-					p[i + 1],
-					p[i + 2],
-					p[i + 3],
-					p[i + 4],
-					p[i + 5],
-					p[i + 6],
-					p[i + 7],
-					p[i + 8],
-					p[i + 9],
-					p[i + 10],
-					p[i + 11],
-					p[i + 12],
-					p[i + 13],
-					p[i + 14],
-					p[i + 15]);
-		}
+		if (sei && size)
+			print_hex_dump(KERN_INFO, "", DUMP_PREFIX_NONE, 16, 1,
+				       sei, size, false);
 	}
 
 	if (vf->type & VIDTYPE_MVC) {

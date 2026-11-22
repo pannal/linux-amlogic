@@ -19,7 +19,7 @@
 #define AM_HDR10_PLUS_OOTF_H
 
 #define N 10
-#define PERCENTILE_ORDER 10
+#define HDR10_PLUS_MAX_PERCENTILES 15
 #define NUM_P (N - 1)
 #define POINTS 149
 #define OOLUT_NUM 149
@@ -42,8 +42,8 @@ struct ebzcurveparameters {
 
 struct percentiles {
 	int num_percentile;
-	int percentilepercent[PERCENTILE_ORDER];
-	int percentilevalue[PERCENTILE_ORDER];
+	int percentilepercent[HDR10_PLUS_MAX_PERCENTILES];
+	int percentilevalue[HDR10_PLUS_MAX_PERCENTILES];
 };
 
 struct scene2094metadata {
@@ -59,8 +59,8 @@ struct hdr10_plus_sei_s {
 	int maxscl[3][3];
 	int average_maxrgb[3];
 	int num_distributions[3];
-	int distribution_index[3][9];
-	int distribution_values[3][9];
+	int distribution_index[3][HDR10_PLUS_MAX_PERCENTILES];
+	int distribution_values[3][HDR10_PLUS_MAX_PERCENTILES];
 
 	int tone_mapping_flag[3];
 	int knee_point_x[3];

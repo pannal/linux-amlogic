@@ -86,10 +86,10 @@ void metadatainit(
 			hdr10_plus_sei->maxscl[0][1]),
 			hdr10_plus_sei->maxscl[0][2]) / 10;
 
-	/*hdmitx vsif block have no maxscl,we can choose distribution value[8]*/
-	if (!metadata->maxscenesourceluminance)
+	/* Use the last supplied percentile if MaxSCL is absent. */
+	if (!metadata->maxscenesourceluminance && hdr10_plus_sei->num_distributions[0])
 		metadata->maxscenesourceluminance =
-			hdr10_plus_sei->distribution_values[0][8] / 10;
+			hdr10_plus_sei->distribution_values[0][hdr10_plus_sei->num_distributions[0] - 1] / 10;
 
 	metadata->minluminance = MIN_LUMINANCE;
 	metadata->referenceluminance =
@@ -100,7 +100,7 @@ void metadatainit(
 	metadata->ebzcurveparameters.sy = hdr10_plus_sei->knee_point_y[0];
 	metadata->ebzcurveparameters.order =
 		hdr10_plus_sei->num_bezier_curve_anchors[0];
-	for (i = 0; i < N - 1; i++)
+	for (i = 0; i < metadata->ebzcurveparameters.order; i++)
 		metadata->ebzcurveparameters.anchor[i] =
 			hdr10_plus_sei->bezier_curve_anchors[0][i];
 }
@@ -117,7 +117,7 @@ void getmetadata(
 			metadata->ebzcurveparameters.order + 1;
 		referencebezierparams->sy = metadata->ebzcurveparameters.sy;
 		referencebezierparams->sx = metadata->ebzcurveparameters.sx;
-		for (i = 0; i < referencebezierparams->order; i++)
+		for (i = 0; i < referencebezierparams->order - 1; i++)
 			referencebezierparams->anchor[i] =
 				metadata->ebzcurveparameters.anchor[i];
 	} else {
@@ -201,7 +201,7 @@ void getpercentile_50_99(
 	int *psll50, int *psll99)
 {
 	int i;
-	int npsll  = PERCENTILE_ORDER;
+	int npsll = scenepercentiles->num_percentile;
 	int delta;
 
 	/*Find exact percentiles if provided , else interpolate*/
@@ -787,10 +787,6 @@ void vframe_hdr_plus_sei_s_init(struct hdr10_plus_sei_s *hdr10_plus_sei)
 
 	int i;
 	int P_init[N - 1] = {181, 406, 607, 796, 834, 863, 890, 917, 938};
-	int percentilepercent_init[PERCENTILE_ORDER] = {
-		1, 5, 10, 25, 50, 75, 90, 95, 99};
-	/*int percentilevalue_init[PERCENTILE_ORDER] = {*/
-	/*	0, 1, 2, 79, 2537, 9900, 9901, 9902, 9904};*/
 
 	for (i = 0; i < 3; i++)
 		hdr10_plus_sei->maxscl[0][i] = hdr_plus_sei.maxscl[0][i];
@@ -798,20 +794,13 @@ void vframe_hdr_plus_sei_s_init(struct hdr10_plus_sei_s *hdr10_plus_sei)
 	hdr10_plus_sei->targeted_system_display_maximum_luminance =
 		hdr_plus_sei.tgt_sys_disp_max_lumi;
 
-	/*for hdmitx output no number, default 9*/
-	if (hdr_plus_sei.num_distribution_maxrgb_percentiles[0] == 0)
-		hdr10_plus_sei->num_distributions[0] = 9;
-	else
-		hdr10_plus_sei->num_distributions[0] =
-			hdr_plus_sei.num_distribution_maxrgb_percentiles[0];
+	hdr10_plus_sei->num_distributions[0] =
+		min_t(unsigned int, hdr_plus_sei.num_distribution_maxrgb_percentiles[0],
+		      ARRAY_SIZE(hdr10_plus_sei->distribution_values[0]));
 
 	for (i = 0; i < (hdr10_plus_sei->num_distributions[0]); i++) {
 		hdr10_plus_sei->distribution_index[0][i] =
 			hdr_plus_sei.distribution_maxrgb_percentages[0][i];
-		/*hdmitx have no distribution index, default init*/
-		if (hdr10_plus_sei->distribution_index[0][i] == 0)
-			hdr10_plus_sei->distribution_index[0][i] =
-				percentilepercent_init[i];
 
 		hdr10_plus_sei->distribution_values[0][i] =
 			hdr_plus_sei.distribution_maxrgb_percentiles[0][i];
@@ -822,7 +811,7 @@ void vframe_hdr_plus_sei_s_init(struct hdr10_plus_sei_s *hdr10_plus_sei)
 
 	if (hdr_plus_sei.num_bezier_curve_anchors[0]) {
 		hdr10_plus_sei->num_bezier_curve_anchors[0] =
-			hdr_plus_sei.num_bezier_curve_anchors[0];
+			min_t(unsigned int, hdr_plus_sei.num_bezier_curve_anchors[0], N - 1);
 		for (i = 0;
 			i < (hdr10_plus_sei->num_bezier_curve_anchors[0]);
 			i++)
@@ -901,10 +890,10 @@ void vframe_hdr_sei_s_init(
 {
 	int i;
 	int P_init[N - 1] = {181, 406, 607, 796, 834, 863, 890, 917, 938};
-	int percentilepercent_init[PERCENTILE_ORDER] = {
+	int percentilepercent_init[] = {
 		1, 5, 10, 25, 50, 75, 90, 95, 99
 	};
-	int percentilevalue_init[PERCENTILE_ORDER] = {
+	int percentilevalue_init[] = {
 		0, 10000, 90, 2000, 4000, 8000, 10000, 10001, 10002
 	};
 
@@ -918,8 +907,6 @@ void vframe_hdr_sei_s_init(
 				i, percentilevalue_init[i]);
 		}
 	}
-
-	hdr10_plus_sei->num_distributions[0] = PERCENTILE_ORDER - 1;
 
 	for (i = 0; i < 3; i++)
 		hdr10_plus_sei->maxscl[0][i] = percentilevalue_init[8] * 10;
@@ -943,9 +930,8 @@ void vframe_hdr_sei_s_init(
 			P_init[i] << (PROCESSING_MAX - 10);
 
 	for (i = 0; i < 3; i++)
-		hdr_plus_sei.average_maxrgb[i] = percentilevalue_init[8];
+		hdr10_plus_sei->average_maxrgb[i] = percentilevalue_init[8];
 
-	hdr_plus_sei.num_distribution_maxrgb_percentiles[0] = 0;
 }
 
 unsigned int gain[POINTS];
