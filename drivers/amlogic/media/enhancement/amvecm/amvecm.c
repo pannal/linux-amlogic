@@ -701,24 +701,21 @@ static ssize_t amvecm_usage_show(struct class *cla,
 	return 0;
 }
 
-static void parse_param_amvecm(char *buf_orig, char **parm)
+static int parse_param_amvecm(char *buf, char **parm, unsigned int capacity)
 {
-	char *ps, *token;
+	char *token;
 	unsigned int n = 0;
-	char delim1[3] = " ";
-	char delim2[2] = "\n";
 
-	ps = buf_orig;
-	strcat(delim1, delim2);
-	while (1) {
-		token = strsep(&ps, delim1);
-		if (token == NULL)
-			break;
-		if (*token == '\0')
+	while ((token = strsep(&buf, " \t\r\n")) != NULL) {
+		if (!*token)
 			continue;
+		if (n == capacity)
+			return -E2BIG;
 		parm[n++] = token;
 	}
+	return n;
 }
+
 static void amvecm_3d_sync_status(void)
 {
 	unsigned int sync_h_start, sync_h_end, sync_v_start,
@@ -792,7 +789,10 @@ static ssize_t amvecm_3d_sync_store(struct class *cla,
 	}
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "hstart", 6)) {
 		if (kstrtol(parm[1], 10, &val) < 0)
 			return -EINVAL;
@@ -2412,8 +2412,9 @@ static long amvecm_ioctl(struct file *file,
 		break;
 	case AMVECM_IOC_G_PQ_CTRL:
 		argp = (void __user *)arg;
-		pq_ctrl.length = sizeof(struct pq_ctrl_s);
-		pq_ctrl.ptr = (void *)&pq_cfg;
+		/* This _IOR returns a descriptor. Its pointer is kernel-private. */
+		memset(&pq_ctrl, 0, sizeof(pq_ctrl));
+		pq_ctrl.length = sizeof(pq_cfg);
 		if (copy_to_user(
 			argp,
 			&pq_ctrl,
@@ -2759,7 +2760,11 @@ static ssize_t amvecm_dnlp_debug_store(struct class *cla,
 	memset(dnlp_rd_curve, 0, 400);
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(stemp);
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!dnlp_insmod_ok) {
 		pr_info("dnlp insmod fial\n");
@@ -3451,7 +3456,10 @@ static ssize_t amvecm_cabc_aad_store(
 		return count;
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	ret = cabc_aad_debug(parm);
 
@@ -3482,7 +3490,10 @@ static ssize_t amvecm_bls_dbg_store(
 		return count;
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	ret = bls_par_dbg(parm);
 
@@ -3818,7 +3829,10 @@ static ssize_t amvecm_cm_reg_store(struct class *cls,
 	if (!buffer)
 		return count;
 	buf_orig = kstrdup(buffer, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (kstrtoul(parm[0], 16, &val) < 0) {
 		kfree(buf_orig);
@@ -3876,7 +3890,10 @@ static ssize_t amvecm_write_reg_store(struct class *cls,
 	if (!buffer)
 		return count;
 	buf_orig = kstrdup(buffer, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strncmp(parm[0], "r", 1)) {
 		if (kstrtoul(parm[1], 16, &val) < 0) {
@@ -4278,7 +4295,10 @@ static ssize_t amvecm_wb_store(struct class *cls,
 	if (!buffer)
 		return count;
 	buf_orig = kstrdup(buffer, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strncmp(parm[0], "r", 1)) {
 		if (!strncmp(parm[1], "pre_r", 5)) {
@@ -4470,44 +4490,20 @@ static ssize_t custom_lut_store(struct class *cls,
 			struct class_attribute *attr,
 			const char *buf, size_t count)
 {
-	unsigned int argn = 0;
-	char *p = NULL, *para = NULL, *argv[2] = {NULL};
-	unsigned int path_length = 0;
-	unsigned int lut = 0;
-	enum vpp_lut_sel_e lut_sel;
+	char *command, *argv[2];
+	unsigned int lut;
+	ssize_t ret = -EINVAL;
 
-	p = kstrdup(buf, GFP_KERNEL);
-	if (p == NULL)
-		return count;
-
-	do {
-		para = strsep(&p, " ");
-		if (para != NULL) {
-			argv[argn] = para;
-			argn++;
-			if (argn > 2)
-				break;
-		}
-	} while (para != NULL);
-
-	kfree(p);
-
-	if (argn != 2 || kstrtoint(argv[0], 10, &lut) || lut >= NUM_LUT) {
-		pr_info("[%s] cmd format: lut_sel lut_file_path\n",
-			__func__);
-		return count;
+	command = kstrdup(buf, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	if (parse_param_amvecm(command, argv, ARRAY_SIZE(argv)) == 2 &&
+	    !kstrtouint(argv[0], 10, &lut) && lut < NUM_LUT) {
+		vpp_lut_curve_load(lut, argv[1]);
+		ret = count;
 	}
-
-	lut_sel = lut;
-
-	/* clean '\n' from file path*/
-	path_length = strlen(argv[1]);
-	if (argv[1][path_length - 1] == '\n')
-		argv[1][path_length - 1] = 0x0;
-
-	vpp_lut_curve_load(lut_sel, argv[1]);
-
-	return count;
+	kfree(command);
+	return ret;
 }
 
 static ssize_t amvecm_set_post_matrix_show(struct class *cla,
@@ -4576,7 +4572,10 @@ static ssize_t amvecm_post_matrix_pos_store(struct class *cla,
 	if (!buf)
 		return count;
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (kstrtoint(parm[0], 10, &val_x) < 0) {
 		kfree(buf_orig);
@@ -4824,25 +4823,24 @@ static ssize_t amvecm_dump_vpp_hist_store(struct class *cla,
 		struct class_attribute *attr,
 		const char *buf, size_t count)
 {
-	size_t r;
-	int i, val[5] = {0,-1,-1,-1,-1};
-	char *buf_orig, *parm[5] = {NULL};
-
-	if (!buf)
-		return count;
+	int i, n, val[5] = { 0, -1, -1, -1, -1 };
+	char *buf_orig, *parm[ARRAY_SIZE(val)];
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
-	for( i = 0; (i < 6) && parm[i]; i++)
-	{
-		r = sscanf(parm[i], "%d\n", &val[i]);
-		if ((r != 1))
-			break;
+	if (!buf_orig)
+		return -ENOMEM;
+	n = parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm));
+	if (n <= 0)
+		goto invalid;
+	for (i = 0; i < n; i++) {
+		if (kstrtoint(parm[i], 10, &val[i]))
+			goto invalid;
 	}
-	if (val[0] < 0) return;
+	if (val[0] < 0)
+		goto invalid;
 	WRITE_VPP_REG_BITS(VI_HIST_CTRL, val[0] & 0x7, 11, 3);
 	if (val[1] > -1 && val[2] > -1 && val[3] > 0 && val[4] > 0
-	&& val[1] + val[3] < 0x1000 && val[2] + val[4] < 0x1000)
+	&& val[1] < 0x1000 - val[3] && val[2] < 0x1000 - val[4])
 	{
 		/* define a window */
 		WRITE_VPP_REG_BITS(VI_HIST_CTRL, 1, 1, 1);
@@ -4860,6 +4858,10 @@ static ssize_t amvecm_dump_vpp_hist_store(struct class *cla,
 
 	kfree(buf_orig);
 	return count;
+
+invalid:
+	kfree(buf_orig);
+	return -EINVAL;
 }
 
 static ssize_t amvecm_hdr_dbg_show(struct class *cla,
@@ -4891,7 +4893,11 @@ static ssize_t amvecm_hdr_dbg_store(struct class *cla,
 	memset(stemp, 0, 400);
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(stemp);
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strncmp(parm[0], "hdr_dbg", 7)) {
 		if (kstrtoul(parm[1], 16, &val) < 0)
@@ -5420,7 +5426,10 @@ static ssize_t amvecm_pq_user_store(struct class *cla,
 	if (!buf)
 		return count;
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strncmp(parm[0], "blk_ext_en", 10))
 		pq_user_latch_flag |= PQ_USER_BLK_EN;
@@ -6262,7 +6271,10 @@ static ssize_t amvecm_cpu_ver_store(struct class *cla,
 	buf_orig = kstrdup(buf, GFP_KERNEL);
 	if (!buf_orig)
 		return -ENOMEM;
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strncmp(parm[0], "r", 1)) {
 		if (!strncmp(parm[1], "cpu_ver", 7)) {
@@ -6312,7 +6324,10 @@ static ssize_t amvecm_cm2_hue_store(struct class *cla,
 	buf_orig = kstrdup(buf, GFP_KERNEL);
 	if (!buf_orig)
 		return -ENOMEM;
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "cm2_hue", 7)) {
 		if (kstrtoul(parm[1], 10, &val) < 0)
 			goto kfree_buf;
@@ -6364,7 +6379,10 @@ static ssize_t amvecm_cm2_luma_store(struct class *cla,
 	buf_orig = kstrdup(buf, GFP_KERNEL);
 	if (!buf_orig)
 		return -ENOMEM;
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "cm2_luma", 7)) {
 		if (kstrtoul(parm[1], 10, &val) < 0)
 			goto kfree_buf;
@@ -6416,7 +6434,10 @@ static ssize_t amvecm_cm2_sat_store(struct class *cla,
 	buf_orig = kstrdup(buf, GFP_KERNEL);
 	if (!buf_orig)
 		return -ENOMEM;
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "cm2_sat", 7)) {
 		if (kstrtoul(parm[1], 10, &val) < 0)
 			goto kfree_buf;
@@ -6470,7 +6491,10 @@ static ssize_t amvecm_cm2_hue_by_hs_store(struct class *cla,
 	buf_orig = kstrdup(buf, GFP_KERNEL);
 	if (!buf_orig)
 		return -ENOMEM;
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "cm2_hue_by_hs", 7)) {
 		if (kstrtoul(parm[1], 10, &val) < 0)
 			goto kfree_buf;
@@ -6726,7 +6750,10 @@ static ssize_t amvecm_debug_store(struct class *cla,
 	if (!buf)
 		return count;
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strncmp(parm[0], "vpp_size", 8))
 		dump_vpp_size_info();
 	else if (!strncmp(parm[0], "vpp_state", 9))
@@ -7576,7 +7603,10 @@ static ssize_t amvecm_reg_store(struct class *cla,
 	if (!buf)
 		return count;
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 	if (!strcmp(parm[0], "rv")) {
 		if (kstrtoul(parm[1], 16, &val) < 0) {
 			kfree(buf_orig);
@@ -8190,7 +8220,11 @@ static ssize_t amvecm_lc_store(struct class *cls,
 	memset(stemp, 0, 100);
 	memset(lc_dbg_curve, 0, sizeof(char) * 100);
 	buf_orig = kstrdup(buf, GFP_KERNEL);
-	parse_param_amvecm(buf_orig, (char **)&parm);
+	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
+		kfree(stemp);
+		kfree(buf_orig);
+		return -EINVAL;
+	}
 
 	if (!strcmp(parm[0], "lc")) {
 		if (!strcmp(parm[1], "enable"))
