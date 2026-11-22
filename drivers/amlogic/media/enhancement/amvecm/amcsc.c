@@ -7358,7 +7358,8 @@ static bool hdr10_plus_metadata_update(
 	if (csc_type < VPP_MATRIX_BT2020YUV_BT2020RGB_DYNAMIC)
 		return false;
 
-	parser_dynmic_metadata(vf);
+	if (!parser_dynmic_metadata(vf))
+		return false;
 
 	cuva_hdr_vsif_pkt_update(&vsif_para);
 	cuva_hdr_emds_pkt_update(&emds_para);
@@ -7414,7 +7415,8 @@ static bool cuva_metadata_update(
 	if (csc_type < VPP_MATRIX_BT2020YUV_BT2020RGB_CUVA)
 		return false;
 
-	parser_dynmic_metadata(vf);
+	if (!parser_dynmic_metadata(vf))
+		return false;
 
 	cuva_hdr_vsif_pkt_update(vsif_paras);
 	cuva_hdr_emds_pkt_update(emds_paras);

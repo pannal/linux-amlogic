@@ -47,426 +47,140 @@ uint debug_hdr;
 
 #define HDR10_PLUS_VERSION  "hdr10_plus v1_20181024"
 
-struct hdr_plus_bits_s sei_md_bits = {
-	.len_itu_t_t35_country_code = 8,
-	.len_itu_t_t35_terminal_provider_code = 16,
-	.len_itu_t_t35_terminal_provider_oriented_code = 16,
-	.len_application_identifier = 8,
-	.len_application_version = 8,
-	.len_num_windows = 2,
-	.len_window_upper_left_corner_x = 16,
-	.len_window_upper_left_corner_y = 16,
-	.len_window_lower_right_corner_x = 16,
-	.len_window_lower_right_corner_y = 16,
-	.len_center_of_ellipse_x = 16,
-	.len_center_of_ellipse_y = 16,
-	.len_rotation_angle = 8,
-	.len_semimajor_axis_internal_ellipse = 16,
-	.len_semimajor_axis_external_ellipse = 16,
-	.len_semiminor_axis_external_ellipse = 16,
-	.len_overlap_process_option = 1,
-	.len_tgt_sys_disp_max_lumi = 27,
-	.len_tgt_sys_disp_act_pk_lumi_flag = 1,
-	.len_num_rows_tgt_sys_disp_act_pk_lumi = 5,
-	.len_num_cols_tgt_sys_disp_act_pk_lumi = 5,
-	.len_tgt_sys_disp_act_pk_lumi = 4,
-	.len_maxscl = 17,
-	.len_average_maxrgb = 17,
-	.len_num_distribution_maxrgb_percentiles = 4,
-	.len_distribution_maxrgb_percentages = 7,
-	.len_distribution_maxrgb_percentiles = 17,
-	.len_fraction_bright_pixels = 10,
-	.len_mast_disp_act_pk_lumi_flag = 1,
-	.len_num_rows_mast_disp_act_pk_lumi = 5,
-	.len_num_cols_mast_disp_act_pk_lumi = 5,
-	.len_mast_disp_act_pk_lumi = 4,
-	.len_tone_mapping_flag = 1,
-	.len_knee_point_x = 12,
-	.len_knee_point_y = 12,
-	.len_num_bezier_curve_anchors = 4,
-	.len_bezier_curve_anchors = 10,
-	.len_color_saturation_mapping_flag = 1,
-	.len_color_saturation_weight = 6
-};
-
 struct vframe_hdr_plus_sei hdr_plus_sei;
 #define NAL_UNIT_SEI 39
 #define NAL_UNIT_SEI_SUFFIX 40
 
-int GetBits(char buffer[], int totbitoffset, int *info, int bytecount,
-	int numbits)
+static int GetBits(const char *buffer, int offset, int *info, int size, int width)
 {
-	int inf;
-	int  bitoffset  = (totbitoffset & 0x07);/*bit from start of byte*/
-	long byteoffset = (totbitoffset >> 3);/*byte from start of buffer*/
-	int  bitcounter = numbits;
-	static char *curbyte;
+	unsigned int value = 0;
+	int i;
 
-	if ((byteoffset) + ((numbits + bitoffset) >> 3) > bytecount)
-		return -1;
-
-	curbyte = &(buffer[byteoffset]);
-	bitoffset = 7 - bitoffset;
-	inf = 0;
-
-	while (numbits--) {
-		inf <<= 1;
-		inf |= ((*curbyte) >> (bitoffset--)) & 0x01;
-
-		if (bitoffset < 0) {
-			curbyte++;
-			bitoffset = 7;
-		}
-	/*curbyte   -= (bitoffset >> 3);*/
-	/*bitoffset &= 0x07;*/
-	/*curbyte   += (bitoffset == 7);*/
+	if (offset < 0 || size < 0 || width < 0 || width > 31 ||
+	    (u64)offset + width > (u64)size * 8) {
+		*info = 0;
+		return -EINVAL;
 	}
 
-	*info = inf;
-	return bitcounter;
+	for (i = 0; i < width; i++, offset++)
+		value = (value << 1) |
+			(((u8)buffer[offset / 8] >> (7 - offset % 8)) & 1);
+	*info = value;
+	return width;
 }
 
-void parser_hdr10_plus_medata(char *metadata, uint32_t size)
+struct hdr10_plus_reader {
+	const char *data;
+	int size;
+	int offset;
+	bool error;
+};
+
+static unsigned int hdr10_plus_bits(struct hdr10_plus_reader *r, int width)
 {
-	int totbitoffset = 0;
-	int value = 0;
-	int i = 0;
-	int j = 0;
-	int num_win;
-	unsigned int num_col_tsdapl = 0, num_row_tsdapl = 0;
-	unsigned int tar_sys_disp_act_pk_lumi_flag = 0;
-	unsigned int num_d_m_p = 0;
-	unsigned int m_d_a_p_l_flag = 0;
-	unsigned int num_row_m_d_a_p_l = 0, num_col_m_d_a_p_l = 0;
-	unsigned int tone_mapping_flag = 0;
-	unsigned int num_bezier_curve_anchors = 0;
-	unsigned int color_saturation_mapping_flag = 0;
+	int value;
 
-	memset(&hdr_plus_sei, 0, sizeof(struct vframe_hdr_plus_sei));
+	if (r->error)
+		return 0;
+	if (GetBits(r->data, r->offset, &value, r->size, width) < 0) {
+		r->error = true;
+		return 0;
+	}
+	r->offset += width;
+	return value;
+}
 
-	GetBits(metadata, totbitoffset,
-		&value, size, sei_md_bits.len_itu_t_t35_country_code);
-	hdr_plus_sei.itu_t_t35_country_code = (u16)value;
-	totbitoffset += sei_md_bits.len_itu_t_t35_country_code;
+static bool read_peak_matrix(struct hdr10_plus_reader *r, u16 *rows, u16 *cols,
+			     u16 matrix[][HDR10_PLUS_PEAK_DIM], size_t max_rows)
+{
+	unsigned int i, j;
 
-	GetBits(metadata, totbitoffset,
-		&value, size, sei_md_bits.len_itu_t_t35_terminal_provider_code);
-	hdr_plus_sei.itu_t_t35_terminal_provider_code = (u16)value;
-	totbitoffset += sei_md_bits.len_itu_t_t35_terminal_provider_code;
+	*rows = hdr10_plus_bits(r, 5);
+	*cols = hdr10_plus_bits(r, 5);
+	if (r->error || *rows < 2 || *rows > max_rows ||
+	    *cols < 2 || *cols > ARRAY_SIZE(matrix[0]) ||
+	    *rows * *cols * 4 > (u64)r->size * 8 - r->offset)
+		return false;
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_itu_t_t35_terminal_provider_oriented_code);
-	hdr_plus_sei.itu_t_t35_terminal_provider_oriented_code =
-		(u16)value;
-	totbitoffset +=
-		sei_md_bits.len_itu_t_t35_terminal_provider_oriented_code;
+	for (i = 0; i < *rows; i++)
+		for (j = 0; j < *cols; j++)
+			matrix[i][j] = hdr10_plus_bits(r, 4);
+	return !r->error;
+}
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_application_identifier);
-	hdr_plus_sei.application_identifier = (u16)value;
-	totbitoffset += sei_md_bits.len_application_identifier;
+static bool parse_hdr10_plus(const char *data, int size,
+			     struct vframe_hdr_plus_sei *m)
+{
+	struct hdr10_plus_reader r = { .data = data, .size = size };
+	unsigned int i, j;
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_application_version);
-	hdr_plus_sei.application_version = (u16)value;
-	totbitoffset += sei_md_bits.len_application_version;
+	memset(m, 0, sizeof(*m));
+	m->itu_t_t35_country_code = hdr10_plus_bits(&r, 8);
+	m->itu_t_t35_terminal_provider_code = hdr10_plus_bits(&r, 16);
+	m->itu_t_t35_terminal_provider_oriented_code = hdr10_plus_bits(&r, 16);
+	m->application_identifier = hdr10_plus_bits(&r, 8);
+	m->application_version = hdr10_plus_bits(&r, 8);
+	m->num_windows = hdr10_plus_bits(&r, 2);
+	if (!m->num_windows || m->num_windows > ARRAY_SIZE(m->maxscl))
+		return false;
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_num_windows);
-	hdr_plus_sei.num_windows = (u16)value;
-	totbitoffset += sei_md_bits.len_num_windows;
-
-	num_win = value;
-
-	if (value > 1) {
-		for (i = 1; i < num_win; i++) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_window_upper_left_corner_x);
-			hdr_plus_sei.window_upper_left_corner_x[i] = (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_window_upper_left_corner_x;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_window_upper_left_corner_y);
-			hdr_plus_sei.window_upper_left_corner_y[i] = (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_window_upper_left_corner_y;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_window_lower_right_corner_x);
-			hdr_plus_sei.window_lower_right_corner_x[i]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_window_lower_right_corner_x;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_window_lower_right_corner_y);
-			hdr_plus_sei.window_lower_right_corner_y[i]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_window_lower_right_corner_y;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_center_of_ellipse_x);
-			hdr_plus_sei.center_of_ellipse_x[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_center_of_ellipse_x;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_center_of_ellipse_y);
-			hdr_plus_sei.center_of_ellipse_y[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_center_of_ellipse_y;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_rotation_angle);
-			hdr_plus_sei.rotation_angle[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_rotation_angle;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-			sei_md_bits.len_semimajor_axis_internal_ellipse);
-			hdr_plus_sei.semimajor_axis_internal_ellipse[i]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_semimajor_axis_internal_ellipse;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-			sei_md_bits.len_semimajor_axis_external_ellipse);
-			hdr_plus_sei.semimajor_axis_external_ellipse[i]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_semimajor_axis_external_ellipse;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-			sei_md_bits.len_semiminor_axis_external_ellipse);
-			hdr_plus_sei.semiminor_axis_external_ellipse[i]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_semiminor_axis_external_ellipse;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_overlap_process_option);
-			hdr_plus_sei.overlap_process_option[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_overlap_process_option;
-		}
+	for (i = 1; i < m->num_windows; i++) {
+		m->window_upper_left_corner_x[i] = hdr10_plus_bits(&r, 16);
+		m->window_upper_left_corner_y[i] = hdr10_plus_bits(&r, 16);
+		m->window_lower_right_corner_x[i] = hdr10_plus_bits(&r, 16);
+		m->window_lower_right_corner_y[i] = hdr10_plus_bits(&r, 16);
+		m->center_of_ellipse_x[i] = hdr10_plus_bits(&r, 16);
+		m->center_of_ellipse_y[i] = hdr10_plus_bits(&r, 16);
+		m->rotation_angle[i] = hdr10_plus_bits(&r, 8);
+		m->semimajor_axis_internal_ellipse[i] = hdr10_plus_bits(&r, 16);
+		m->semimajor_axis_external_ellipse[i] = hdr10_plus_bits(&r, 16);
+		m->semiminor_axis_external_ellipse[i] = hdr10_plus_bits(&r, 16);
+		m->overlap_process_option[i] = hdr10_plus_bits(&r, 1);
 	}
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_tgt_sys_disp_max_lumi);
-		hdr_plus_sei.tgt_sys_disp_max_lumi = value;
-	totbitoffset +=
-		sei_md_bits.len_tgt_sys_disp_max_lumi;
+	m->tgt_sys_disp_max_lumi = hdr10_plus_bits(&r, 27);
+	m->tgt_sys_disp_act_pk_lumi_flag = hdr10_plus_bits(&r, 1);
+	if (m->tgt_sys_disp_act_pk_lumi_flag &&
+	    !read_peak_matrix(&r, &m->num_rows_tgt_sys_disp_act_pk_lumi,
+			      &m->num_cols_tgt_sys_disp_act_pk_lumi,
+			      m->tgt_sys_disp_act_pk_lumi,
+			      ARRAY_SIZE(m->tgt_sys_disp_act_pk_lumi)))
+		return false;
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_tgt_sys_disp_act_pk_lumi_flag);
-	hdr_plus_sei.tgt_sys_disp_act_pk_lumi_flag
-		= (u16)value;
-	totbitoffset +=
-		sei_md_bits.len_tgt_sys_disp_act_pk_lumi_flag;
-
-	tar_sys_disp_act_pk_lumi_flag = value;
-
-	if (tar_sys_disp_act_pk_lumi_flag) {
-		GetBits(metadata, totbitoffset,
-			&value, size,
-		sei_md_bits.len_num_rows_tgt_sys_disp_act_pk_lumi);
-		hdr_plus_sei.num_rows_tgt_sys_disp_act_pk_lumi
-			= (u16)value;
-		totbitoffset +=
-		sei_md_bits.len_num_rows_tgt_sys_disp_act_pk_lumi;
-
-		num_row_tsdapl = value;
-
-		GetBits(metadata, totbitoffset,
-			&value, size,
-		sei_md_bits.len_num_cols_tgt_sys_disp_act_pk_lumi);
-		hdr_plus_sei.num_cols_tgt_sys_disp_act_pk_lumi
-			= (u16)value;
-		totbitoffset +=
-		sei_md_bits.len_num_cols_tgt_sys_disp_act_pk_lumi;
-
-		num_col_tsdapl = value;
-
-		for (i = 0; i < num_row_tsdapl; i++) {
-			for (j = 0; j < num_col_tsdapl; j++) {
-				GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_tgt_sys_disp_act_pk_lumi);
-				hdr_plus_sei.tgt_sys_disp_act_pk_lumi[i][j]
-					= (u16)value;
-				totbitoffset +=
-				sei_md_bits.len_tgt_sys_disp_act_pk_lumi;
-			}
+	for (i = 0; i < m->num_windows; i++) {
+		for (j = 0; j < ARRAY_SIZE(m->maxscl[i]); j++)
+			m->maxscl[i][j] = hdr10_plus_bits(&r, 17);
+		m->average_maxrgb[i] = hdr10_plus_bits(&r, 17);
+		m->num_distribution_maxrgb_percentiles[i] = hdr10_plus_bits(&r, 4);
+		for (j = 0; j < m->num_distribution_maxrgb_percentiles[i]; j++) {
+			m->distribution_maxrgb_percentages[i][j] = hdr10_plus_bits(&r, 7);
+			m->distribution_maxrgb_percentiles[i][j] = hdr10_plus_bits(&r, 17);
 		}
-	}
-	for (i = 0; i < num_win; i++) {
-		for (j = 0; j < 3; j++) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_maxscl);
-			hdr_plus_sei.maxscl[i][j] = value;
-			totbitoffset += sei_md_bits.len_maxscl;
-		}
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_average_maxrgb);
-		hdr_plus_sei.average_maxrgb[i] = value;
-		totbitoffset += sei_md_bits.len_average_maxrgb;
-
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_num_distribution_maxrgb_percentiles);
-		hdr_plus_sei.num_distribution_maxrgb_percentiles[i]
-			= (u16)value;
-		totbitoffset +=
-			sei_md_bits.len_num_distribution_maxrgb_percentiles;
-
-		num_d_m_p = value;
-		for (j = 0; j < num_d_m_p; j++) {
-			GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_distribution_maxrgb_percentages);
-			hdr_plus_sei.distribution_maxrgb_percentages[i][j]
-				= (u16)value;
-			totbitoffset +=
-				sei_md_bits.len_distribution_maxrgb_percentages;
-
-			GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_distribution_maxrgb_percentiles);
-			hdr_plus_sei.distribution_maxrgb_percentiles[i][j]
-				= value;
-			totbitoffset +=
-				sei_md_bits.len_distribution_maxrgb_percentiles;
-		}
-
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_fraction_bright_pixels);
-		hdr_plus_sei.fraction_bright_pixels[i] = (u16)value;
-		totbitoffset += sei_md_bits.len_fraction_bright_pixels;
+		m->fraction_bright_pixels[i] = hdr10_plus_bits(&r, 10);
 	}
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		sei_md_bits.len_mast_disp_act_pk_lumi_flag);
-	hdr_plus_sei.mast_disp_act_pk_lumi_flag
-		= (u16)value;
-	totbitoffset +=
-		sei_md_bits.len_mast_disp_act_pk_lumi_flag;
+	m->mast_disp_act_pk_lumi_flag = hdr10_plus_bits(&r, 1);
+	if (m->mast_disp_act_pk_lumi_flag &&
+	    !read_peak_matrix(&r, &m->num_rows_mast_disp_act_pk_lumi,
+			      &m->num_cols_mast_disp_act_pk_lumi,
+			      m->mast_disp_act_pk_lumi,
+			      ARRAY_SIZE(m->mast_disp_act_pk_lumi)))
+		return false;
 
-	m_d_a_p_l_flag = value;
-	if (m_d_a_p_l_flag) {
-		GetBits(metadata, totbitoffset,
-			&value, size,
-		sei_md_bits.len_num_rows_mast_disp_act_pk_lumi);
-		hdr_plus_sei.num_rows_mast_disp_act_pk_lumi
-			= (u16)value;
-		totbitoffset +=
-			sei_md_bits.len_num_rows_mast_disp_act_pk_lumi;
-
-		num_row_m_d_a_p_l = value;
-
-		GetBits(metadata, totbitoffset,
-			&value, size,
-		sei_md_bits.len_num_cols_mast_disp_act_pk_lumi);
-		hdr_plus_sei.num_cols_mast_disp_act_pk_lumi
-			= (u16)value;
-		totbitoffset +=
-		sei_md_bits.len_num_cols_mast_disp_act_pk_lumi;
-
-		num_col_m_d_a_p_l = value;
-
-		for (i = 0; i < num_row_m_d_a_p_l; i++) {
-			for (j = 0; j < num_col_m_d_a_p_l; j++) {
-				GetBits(metadata, totbitoffset,
-					&value, size,
-				sei_md_bits.len_mast_disp_act_pk_lumi);
-				hdr_plus_sei.mast_disp_act_pk_lumi[i][j]
-					= (u16)value;
-				totbitoffset +=
-					sei_md_bits.len_mast_disp_act_pk_lumi;
-			}
+	for (i = 0; i < m->num_windows; i++) {
+		m->tone_mapping_flag[i] = hdr10_plus_bits(&r, 1);
+		if (m->tone_mapping_flag[i]) {
+			m->knee_point_x[i] = hdr10_plus_bits(&r, 12);
+			m->knee_point_y[i] = hdr10_plus_bits(&r, 12);
+			m->num_bezier_curve_anchors[i] = hdr10_plus_bits(&r, 4);
+			for (j = 0; j < m->num_bezier_curve_anchors[i]; j++)
+				m->bezier_curve_anchors[i][j] = hdr10_plus_bits(&r, 10);
 		}
+		m->color_saturation_mapping_flag[i] = hdr10_plus_bits(&r, 1);
+		if (m->color_saturation_mapping_flag[i])
+			m->color_saturation_weight[i] = hdr10_plus_bits(&r, 6);
 	}
-
-	for (i = 0; i < num_win; i++) {
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_tone_mapping_flag);
-		hdr_plus_sei.tone_mapping_flag[i] = (u16)value;
-		totbitoffset += sei_md_bits.len_tone_mapping_flag;
-
-		tone_mapping_flag = value;
-
-		if (tone_mapping_flag) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_knee_point_x);
-			hdr_plus_sei.knee_point_x[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_knee_point_x;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_knee_point_y);
-			hdr_plus_sei.knee_point_y[i] = (u16)value;
-			totbitoffset += sei_md_bits.len_knee_point_y;
-
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_num_bezier_curve_anchors);
-			hdr_plus_sei.num_bezier_curve_anchors[i] =
-				(u16)value;
-			totbitoffset +=
-				sei_md_bits.len_num_bezier_curve_anchors;
-
-			num_bezier_curve_anchors = value;
-
-			for (j = 0; j < num_bezier_curve_anchors; j++) {
-				GetBits(metadata, totbitoffset,
-					&value, size,
-					sei_md_bits.len_bezier_curve_anchors);
-				hdr_plus_sei.bezier_curve_anchors[i][j] =
-					(u16)value;
-				totbitoffset +=
-					sei_md_bits.len_bezier_curve_anchors;
-			}
-		}
-
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			sei_md_bits.len_color_saturation_mapping_flag);
-		hdr_plus_sei.color_saturation_mapping_flag[i] =
-			(u16)value;
-		totbitoffset +=
-			sei_md_bits.len_color_saturation_mapping_flag;
-
-		color_saturation_mapping_flag = value;
-		if (color_saturation_mapping_flag) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				sei_md_bits.len_color_saturation_weight);
-			hdr_plus_sei.color_saturation_weight[i] =
-				(u16)value;
-			totbitoffset +=
-				sei_md_bits.len_color_saturation_weight;
-		}
-	}
+	return !r.error;
 }
 
 void cuva_metadata_bits_parse(struct cuva_md_bits_s *md_bits)
@@ -803,51 +517,92 @@ void cuva_hdr_metadata_parse(char *metadata, uint32_t size)
 	}
 }
 
-static int parse_sei(char *sei_buf, uint32_t size)
+static bool read_sei_value(const u8 **pos, const u8 *end, u32 *value)
 {
-	char *p = sei_buf;
-	char *p_sei;
-	uint16_t header;
-	uint8_t nal_unit_type;
-	uint8_t payload_type, payload_size;
+	u8 byte;
+
+	*value = 0;
+	do {
+		if (*pos == end)
+			return false;
+		byte = *(*pos)++;
+		if (*value > U32_MAX - byte)
+			return false;
+		*value += byte;
+	} while (byte == 0xff);
+	return true;
+}
+
+static bool parse_sei(const u8 *data, size_t size,
+		      struct vframe_hdr_plus_sei **pending)
+{
+	static const u8 hdr10_plus_id[] = { 0xb5, 0, 0x3c, 0, 1, 4 };
+	static const u8 cuva_id[] = { 0x26, 0, 4, 0, 5 };
+	const u8 *end = data + size;
+	u32 type, length;
 
 	if (size < 2)
-		return 0;
-	header = *p++;
-	header <<= 8;
-	header += *p++;
-	nal_unit_type = header >> 9;
-	if ((nal_unit_type != NAL_UNIT_SEI)
-	&& (nal_unit_type != NAL_UNIT_SEI_SUFFIX))
-		return 0;
-	while (p+2 <= sei_buf+size) {
-		payload_type = *p++;
-		payload_size = *p++;
-		if (p + payload_size <= sei_buf + size) {
-			switch (payload_type) {
-			case SEI_Syntax:
-				p_sei = p;
-				if (p_sei[0] == 0xB5 &&
-					p_sei[1] == 0x00 &&
-					p_sei[2] == 0x3C &&
-					p_sei[3] == 0x00 &&
-					p_sei[4] == 0x01 &&
-					p_sei[5] == 0x04)
-					parser_hdr10_plus_medata(p_sei, payload_size);
-				else if (p_sei[0] == 0x26 &&
-					p_sei[1] == 0x00 &&
-					p_sei[2] == 0x04 &&
-					p_sei[3] == 0x00 &&
-					p_sei[4] == 0x05)
-					cuva_hdr_metadata_parse(p_sei, payload_size);
-				break;
-			default:
-				break;
+		return false;
+	type = (data[0] >> 1) & 0x3f;
+	if (type != NAL_UNIT_SEI && type != NAL_UNIT_SEI_SUFFIX)
+		return true;
+	data += 2;
+
+	while (data < end) {
+		if (*data == 0x80 && !memchr_inv(data + 1, 0, end - data - 1))
+			break;
+		if (!read_sei_value(&data, end, &type) ||
+		    !read_sei_value(&data, end, &length) || length > end - data)
+			return false;
+		if (type == SEI_Syntax) {
+			if (length >= sizeof(hdr10_plus_id) &&
+			    !memcmp(data, hdr10_plus_id, sizeof(hdr10_plus_id))) {
+				if (!*pending) {
+					*pending = kmalloc(sizeof(**pending), GFP_ATOMIC);
+					if (!*pending)
+						return false;
+				}
+				if (!parse_hdr10_plus((const char *)data, length, *pending))
+					return false;
+			} else if (length >= sizeof(cuva_id) &&
+				   !memcmp(data, cuva_id, sizeof(cuva_id))) {
+				cuva_hdr_metadata_parse((char *)data, length);
 			}
 		}
-		p += payload_size;
+		data += length;
 	}
-	return 0;
+	return true;
+}
+
+static bool parse_aux_metadata(const u8 *data, int size)
+{
+	struct vframe_hdr_plus_sei *pending = NULL;
+	bool valid = true;
+
+	while (size > 0) {
+		u32 length, type;
+
+		if (size < 8) {
+			valid = false;
+			break;
+		}
+		length = get_unaligned_be32(data);
+		type = get_unaligned_be32(data + 4);
+		data += 8;
+		size -= 8;
+		if (length > size ||
+		    (type == 0x02000000 && !parse_sei(data, length, &pending))) {
+			valid = false;
+			break;
+		}
+		data += length;
+		size -= length;
+	}
+	/* Vsync consumes this state. Keep the last complete frame on failure. */
+	if (valid && pending)
+		hdr_plus_sei = *pending;
+	kfree(pending);
+	return valid;
 }
 
 static void hdr10_plus_vf_md_parse(struct vframe_s *vf)
@@ -1008,12 +763,11 @@ static void hdr10_plus_vf_md_parse(struct vframe_s *vf)
 
 }
 
-void parser_dynmic_metadata(struct vframe_s *vf)
+bool parser_dynmic_metadata(struct vframe_s *vf)
 {
 	struct provider_aux_req_s req;
-	char *p;
+	bool valid = true;
 	unsigned int size = 0;
-	unsigned int type = 0;
 	int i;
 	int j;
 	char *meta_buf;
@@ -1051,8 +805,8 @@ void parser_dynmic_metadata(struct vframe_s *vf)
 				"hdr10 source_type = %d src_fmt = %d metadata(%d):\n",
 				get_vframe_src_fmt(vf),
 				vf->source_type, req.aux_size);
-			for (i = 0; i < req.aux_size + 8; i += 8) {
-				len = req.aux_size - i;
+			for (i = 0; i < req.aux_size; i += len) {
+				len = min(req.aux_size - i, 8);
 				if (len < 8) {
 					pr_csc(0x10, "\t i = %02d", i);
 					for (j = 0; j < len; j++)
@@ -1074,24 +828,14 @@ void parser_dynmic_metadata(struct vframe_s *vf)
 				}
 			}
 		}
-		if (req.aux_buf && req.aux_size) {
-			p = req.aux_buf;
-			while (p < req.aux_buf
-				+ req.aux_size - 8) {
-				size = get_unaligned_be32(p);
-				p += 4;
-				type = get_unaligned_be32(p);
-				p += 4;
-				if (type == 0x02000000)
-					parse_sei(p, size);
-
-				p += size;
-			}
-		}
+		if (req.aux_buf)
+			valid = req.aux_size >= 0 &&
+				parse_aux_metadata((const u8 *)req.aux_buf, req.aux_size);
 	}
 
 	if (debug_hdr >= 1)
 		debug_hdr--;
+	return valid;
 }
 
 struct hdr10plus_para dbg_hdr10plus_pkt;
