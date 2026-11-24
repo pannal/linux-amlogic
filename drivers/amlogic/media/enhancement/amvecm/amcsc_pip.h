@@ -29,7 +29,8 @@ extern void hdmi_packet_process(
 	struct cuva_hdr_vsif_para *hdmitx_vsif_param,
 	struct cuva_hdr_vs_emds_para *hdmitx_edms_param,
 	enum vd_path_e vd_path,
-	enum hdr_type_e *source_type);
+	enum hdr_type_e *source_type,
+	bool unforced_path);
 extern void video_post_process(
 	struct vframe_s *vf,
 	enum vpp_matrix_csc_e csc_type,
@@ -37,4 +38,5 @@ extern void video_post_process(
 	enum vd_path_e vd_path,
 	struct vframe_master_display_colour_s *master_info,
 	enum hdr_type_e *source_type);
+extern bool sdr_bt2020_video_off(struct vinfo_s *vinfo);
 #endif

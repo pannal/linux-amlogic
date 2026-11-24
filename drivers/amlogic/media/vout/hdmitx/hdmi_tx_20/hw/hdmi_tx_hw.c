@@ -659,6 +659,8 @@ static irqreturn_t intr_handler(int irq, void *dev)
 	unsigned int dat_dwc = hdmitx_rd_reg(HDMITX_DWC_HDCP22REG_STAT);
 	struct hdmitx_dev *hdev = (struct hdmitx_dev *)dev;
 
+	if (dat_top & 0x6)
+		hdmitx_hdr_link_changed(hdev);
 	/* ack INTERNAL_INTR or else we stuck with no interrupts at all */
 	hdmitx_wr_reg(HDMITX_TOP_INTR_STAT_CLR, ~0);
 	hdmitx_wr_reg(HDMITX_DWC_HDCP22REG_STAT, 0xff);
@@ -2229,6 +2231,8 @@ void hdmitx_set_enc_hw(struct hdmitx_dev *hdev)
 
 static int hdmitx_set_dispmode(struct hdmitx_dev *hdev)
 {
+	hdmitx_same_mode_hw_changed();
+	hdmitx_hdr_transport_changed(hdev);
 	if (hdev->cur_video_param == NULL) /* disable HDMI */
 		return 0;
 	if (!hdmitx_edid_VIC_support(hdev->cur_video_param->VIC))
@@ -2282,6 +2286,24 @@ enum hdmi_tf_type hdmitx_get_cur_hdr_st(void)
 	return type;
 }
 
+/* Opt-in (default off) for sinks set up manually for LLDV, such as older JVC
+ * projectors: source-led LLDV omits its Dolby VSIF when the AVI VIC alone can
+ * declare the timing, and 4K timings the sink lists as CTA VICs are declared in
+ * the AVI InfoFrame instead of an HDMI 1.4 VSIF, so SDR and LLDV carry the same
+ * timing declaration.  TV-led DV and all other VSIFs are untouched; DV state is
+ * still reported from the remembered LLDV packet.
+ */
+static bool lldv_vsif_suppress;
+static bool lldv_vsif_suppressed;
+static bool lldv_vsif_saved;
+static unsigned char lldv_vsif_db[0x1b];
+static unsigned char lldv_vsif_hb[3];
+
+bool hdmitx_lldv_vsif_suppress_enabled(void)
+{
+	return lldv_vsif_suppress;
+}
+
 static bool hdmitx_vsif_en(void)
 {
 	if (!hdmitx_get_bit(HDMITX_DWC_FC_DATAUTO0, 3) ||
@@ -2303,8 +2325,13 @@ enum hdmi_tf_type hdmitx_get_cur_dv_st(void)
 	unsigned int size = hdmitx_rd_reg(HDMITX_DWC_FC_VSDSIZE);
 	unsigned int cs = hdmitx_rd_reg(HDMITX_DWC_FC_AVICONF0) & 0x3;
 
-	if (!hdmitx_vsif_en())
+	if (!hdmitx_vsif_en()) {
+		if (lldv_vsif_suppressed && cs == 0x1)
+			type = HDMI_DV_VSIF_LL;
+		if (lldv_vsif_suppressed && cs == 0x0)
+			type = HDMI_DV_VSIF_STD;
 		return type;
+	}
 
 	ieee_code = GET_IEEEOUI();
 
@@ -2350,12 +2377,141 @@ bool hdmitx_hdr10p_en(void)
 		HDMI_HDR10P_TYPE;
 }
 
+static bool hdmitx_use_avi_4k_vic(unsigned char *DB, unsigned char *HB)
+{
+	static const unsigned int hdmi14_vics[] = {
+		HDMI_3840x2160p30_16x9, HDMI_3840x2160p25_16x9,
+		HDMI_3840x2160p24_16x9, HDMI_4096x2160p24_256x135
+	};
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	unsigned int vic = hdev->cur_VIC;
+	unsigned int i;
+
+	if (!lldv_vsif_suppress)
+		return false;
+	/* A full modeset sends packets before cur_VIC is committed. */
+	if (vic == HDMI_Unknown && hdev->cur_video_param &&
+	    hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) == hdev->cur_video_param->VIC)
+		vic = hdev->cur_video_param->VIC;
+
+	if (!DB || !HB || HB[2] != 5 || DB[0] != 3 ||
+	    DB[1] != 12 || DB[2] != 0 || DB[3] != 0x20 ||
+	    !DB[4] || DB[4] > ARRAY_SIZE(hdmi14_vics) ||
+	    hdev->rxcap.hf_ieeeoui != HF_IEEEOUI ||
+	    vic != hdmi14_vics[DB[4] - 1])
+		return false;
+
+	for (i = 0; i < hdev->rxcap.VIC_count &&
+	     i < ARRAY_SIZE(hdev->rxcap.VIC); i++) {
+		if (hdev->rxcap.VIC[i] == vic) {
+			/* HDMI 2.x sinks explicitly advertising this CTA VIC
+			 * need no legacy HDMI-VIC declaration.
+			 */
+			if (hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) != vic) {
+				hdmitx_hdr_packet_untrusted(hdev,
+					HDMITX_HDR_PKT_AVI);
+				hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+			}
+			hdmitx_set_packet(HDMI_PACKET_VEND, NULL, NULL);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool hdmitx_is_lldv_vsif(unsigned char *DB, unsigned char *HB)
+{
+	return DB && HB && HB[2] == 0x1b && DB[0] == 0x46 && DB[1] == 0xd0 &&
+		DB[2] == 0x00 && (DB[3] & 0x3) == 0x3;
+}
+
+/* Returns the CTA VIC the AVI InfoFrame can carry alone, else 0. */
+static unsigned int hdmitx_lldv_avi_vic(struct hdmitx_dev *hdev)
+{
+	static const unsigned int hdmi14_vics[] = {
+		HDMI_3840x2160p30_16x9, HDMI_3840x2160p25_16x9,
+		HDMI_3840x2160p24_16x9, HDMI_4096x2160p24_256x135
+	};
+	unsigned int vic = hdev->cur_VIC;
+	unsigned int i;
+
+	if (vic == HDMI_Unknown && hdev->cur_video_param)
+		vic = hdev->cur_video_param->VIC;
+	if (vic == HDMI_Unknown || vic >= HDMITX_VESA_OFFSET)
+		return 0;
+	vic &= HDMITX_VIC_MASK;
+	for (i = 0; i < ARRAY_SIZE(hdmi14_vics); i++)
+		if (vic == hdmi14_vics[i])
+			break;
+	if (i == ARRAY_SIZE(hdmi14_vics))
+		return vic;
+	/* Legacy 4K timings need HDMI_VIC unless the sink takes the CTA VIC. */
+	if (hdev->rxcap.hf_ieeeoui != HF_IEEEOUI)
+		return 0;
+	for (i = 0; i < hdev->rxcap.VIC_count &&
+	     i < ARRAY_SIZE(hdev->rxcap.VIC); i++)
+		if (hdev->rxcap.VIC[i] == vic)
+			return vic;
+	return 0;
+}
+
+static bool hdmitx_lldv_vsif_take(unsigned char *DB, unsigned char *HB)
+{
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	unsigned int vic;
+	int i;
+
+	if (!hdmitx_is_lldv_vsif(DB, HB)) {
+		lldv_vsif_suppressed = false;
+		return false;
+	}
+	memcpy(lldv_vsif_db, DB, sizeof(lldv_vsif_db));
+	memcpy(lldv_vsif_hb, HB, sizeof(lldv_vsif_hb));
+	lldv_vsif_saved = true;
+	vic = lldv_vsif_suppress ? hdmitx_lldv_avi_vic(hdev) : 0;
+	if (!vic) {
+		lldv_vsif_suppressed = false;
+		return false;
+	}
+	if (hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID) != vic) {
+		hdmitx_hdr_packet_untrusted(hdev, HDMITX_HDR_PKT_AVI);
+		hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+	}
+	/* Stop the auto-sent VSIF itself, not only this update. */
+	hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 0x0);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID0, 0x00);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID1, 0x00);
+	hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID2, 0x00);
+	for (i = 0; i < 24; i++)
+		hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD0 + i, 0x00);
+	if (!lldv_vsif_suppressed)
+		pr_info("hdmitx: LLDV Dolby VSIF suppressed, AVI VIC %u\n",
+			vic);
+	lldv_vsif_suppressed = true;
+	return true;
+}
+
 static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 {
 	int i;
 	int pkt_data_len = 0;
 	unsigned int ieee_code = 0;
 
+	if (type == HDMI_PACKET_VEND && hdmitx_use_avi_4k_vic(DB, HB))
+		return;
+
+	/* Disabling or an HDMI-OUI VSIF fully replaces any untracked VSIF. */
+	if (type == HDMI_PACKET_VEND && DB && HB &&
+	    !(HB[2] >= 4 && DB[0] == 0x03 && DB[1] == 0x0c &&
+	      DB[2] == 0x00 && (DB[3] == 0 || DB[3] == 0x20)))
+		hdmitx_hdr_packet_untrusted(get_hdmitx_device(),
+			HDMITX_HDR_PKT_VSIF);
+	else if (type == HDMI_PACKET_VEND)
+		hdmitx_hdr_packet_clean(get_hdmitx_device(),
+			HDMITX_HDR_PKT_VSIF);
+	if (type == HDMI_PACKET_VEND && hdmitx_lldv_vsif_take(DB, HB))
+		return;
 	switch (type) {
 	case HDMI_PACKET_AVI:
 		break;
@@ -2392,6 +2548,18 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 				hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 6);
 		}
 		if ((ieee_code == DOVI_IEEEOUI) && (HB[2] == 0x1b)) {
+			if (lldv_vsif_suppress && (DB[3] & 0x3) == 0x3) {
+				struct hdmitx_dev *hdev = get_hdmitx_device();
+				unsigned int vic = hdev->cur_VIC & HDMITX_VIC_MASK;
+
+				/* LLDV replaces the HDMI-4K VSIF carrying the VIC. */
+				if (vic && hdev->cur_VIC < HDMITX_VESA_OFFSET &&
+				    !hdmitx_rd_reg(HDMITX_DWC_FC_AVIVID)) {
+					hdmitx_hdr_packet_untrusted(hdev,
+						HDMITX_HDR_PKT_AVI);
+					hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic);
+				}
+			}
 			/*set dolby vsif data information*/
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD1, DB[4]);
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD2, DB[5]);
@@ -2454,6 +2622,7 @@ static void hdmitx_disable_packet(int type)
 	case HDMI_PACKET_AVI:
 		break;
 	case HDMI_PACKET_VEND:
+		lldv_vsif_suppressed = false;
 		/* disable VSI packet */
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
 		hdmitx_wr_reg(HDMITX_DWC_FC_DATAUTO1, 0);
@@ -2475,6 +2644,12 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 	unsigned char *HB)
 {
 	int i;
+
+	if (type == HDMI_PACKET_VEND)
+		lldv_vsif_suppressed = false;
+	if (type == HDMI_PACKET_VEND && hdmitx_use_avi_4k_vic(DB, HB))
+		return;
+
 #if 0
 	pr_info("HB: %02x %02x %02x\nDB:", HB[0], HB[1], HB[2]);
 	for (i = 0; (i < 24) && (i < HB[2]); i++)
@@ -2488,6 +2663,10 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 			hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 0x0);
 			return;
 		}
+		/* HDMI-VIC replaces AVI VIC, decided after the modern path. */
+		if (HB[2] >= 5 && DB[0] == 0x03 && DB[1] == 0x0c &&
+		    DB[2] == 0x00 && DB[3] == 0x20)
+			hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, 0);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, HB[2]);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID0, DB[0]);
 		hdmitx_wr_reg(HDMITX_DWC_FC_VSDIEEEID1, DB[1]);
@@ -2505,6 +2684,37 @@ static void hdmitx_set_datapacket(int type, unsigned char *DB,
 	}
 }
 
+
+/* A runtime change re-applies the active LLDV packet under the new policy. */
+static int lldv_vsif_suppress_set(const char *val,
+	const struct kernel_param *kp)
+{
+	struct hdmitx_dev *hdev = get_hdmitx_device();
+	bool old = lldv_vsif_suppress;
+	unsigned long flags;
+	int ret = param_set_bool(val, kp);
+
+	if (ret || old == lldv_vsif_suppress)
+		return ret;
+	spin_lock_irqsave(&hdev->edid_spinlock, flags);
+	if (lldv_vsif_saved && (lldv_vsif_suppressed ||
+	    (hdmitx_vsif_en() && GET_IEEEOUI() == DOVI_IEEEOUI &&
+	     hdmitx_rd_reg(HDMITX_DWC_FC_VSDSIZE) == 0x1b &&
+	     (hdmitx_rd_reg(HDMITX_DWC_FC_VSDPAYLOAD0) & 0x3) == 0x3)))
+		hdmitx_set_packet(HDMI_PACKET_VEND, lldv_vsif_db,
+			lldv_vsif_hb);
+	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	return 0;
+}
+
+static const struct kernel_param_ops lldv_vsif_suppress_ops = {
+	.set = lldv_vsif_suppress_set,
+	.get = param_get_bool,
+};
+module_param_cb(lldv_vsif_suppress, &lldv_vsif_suppress_ops,
+	&lldv_vsif_suppress, 0644);
+MODULE_PARM_DESC(lldv_vsif_suppress,
+	"Omit source-led LLDV Dolby VSIF and declare listed 4K VICs in AVI (default 0)");
 
 static void hdmitx_setaudioinfoframe(unsigned char *AUD_DB,
 	unsigned char *CHAN_STAT_BUF)
@@ -2773,15 +2983,40 @@ static void set_aud_samp_pkt(struct hdmitx_dev *hdev,
 }
 
 static int amute_flag = -1;
-static void audio_mute_op(bool flag)
-{
-	if (amute_flag != flag)
-		amute_flag = flag;
-	else
-		return;
+static DEFINE_SPINLOCK(audio_mute_lock);
+enum audio_mute_action {
+	AUDIO_MUTE_APPLY,
+	AUDIO_MUTE_PUBLISH,
+	AUDIO_MUTE_CURRENT,
+};
 
-	if (flag == 0) {
-		hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
+/* Active sampler/FIFO reset windows in hdmitx_set_audmode(); see
+ * audio_cfg_clk_borrow(). Protected by audio_mute_lock.
+ */
+static unsigned int audio_cfg_clk_borrowers;
+
+static void audio_mute_op(struct hdmitx_dev *hdev,
+	enum audio_mute_action action, unsigned int flag)
+{
+	unsigned long flags, fiq_flags;
+	bool enabled;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	if (action == AUDIO_MUTE_PUBLISH)
+		WRITE_ONCE(hdev->tx_aud_cfg, flag);
+	else if (action == AUDIO_MUTE_CURRENT)
+		flag = READ_ONCE(hdev->tx_aud_cfg);
+	enabled = flag != 0;
+	if (amute_flag != enabled)
+		amute_flag = enabled;
+	else
+		goto out;
+
+	if (!enabled) {
+		if (!audio_cfg_clk_borrowers)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 0, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 3, 1);
 	} else {
@@ -2789,6 +3024,57 @@ static void audio_mute_op(bool flag)
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
 		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 3, 1);
 	}
+out:
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+}
+
+static void audio_acr_confirm(void)
+{
+	unsigned long flags, fiq_flags;
+	unsigned int data32;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
+	if ((data32 & 0x9) == 0x8) {
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
+		pr_info(HW "enable ACR: [0x10e3] = 0x%x\n", data32);
+	}
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+}
+
+/* The sampler and FIFO resets in hdmitx_set_audmode() run in the audio
+ * sampler clock domains, which audio_mute_op() gates while audio is muted
+ * (for example under the HDR pre-arm hold). Keep those clocks running for the
+ * reset window only: the clocks are live while unmuted or while any window
+ * is active, and the last window out re-gates them only if still muted.
+ * ACR and audio InfoFrame packets are not touched here.
+ */
+static bool audio_cfg_clk_borrow(bool borrow, bool entry_muted)
+{
+	unsigned long flags, fiq_flags;
+	bool muted;
+
+	raw_local_save_flags(fiq_flags);
+	local_fiq_disable();
+	spin_lock_irqsave(&audio_mute_lock, flags);
+	muted = amute_flag == 0;
+	if (borrow) {
+		if (!audio_cfg_clk_borrowers++ && muted)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 3, 2, 2);
+	} else if (!WARN_ON(!audio_cfg_clk_borrowers)) {
+		if (!--audio_cfg_clk_borrowers && muted)
+			hdmitx_set_reg_bits(HDMITX_TOP_CLK_CNTL, 0, 2, 2);
+		if (entry_muted || muted)
+			pr_info(HW "muted audio config used sampler clocks, mute=%d->%d\n",
+				entry_muted, muted);
+	}
+	spin_unlock_irqrestore(&audio_mute_lock, flags);
+	raw_local_irq_restore(fiq_flags);
+	return muted;
 }
 
 struct hdmitx_audpara hdmiaud_config_data;
@@ -2798,6 +3084,7 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	struct hdmitx_audpara *audio_param)
 {
 	unsigned int data32;
+	bool clk_muted;
 
 	if (!hdev)
 		return 0;
@@ -2816,7 +3103,7 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	else
 		hsty_hdmiaud_config_num = 8;
 
-	audio_mute_op(hdev->tx_aud_cfg);
+	audio_mute_op(hdev, AUDIO_MUTE_CURRENT, 0);
 	/* PCM & multi channel use I2S */
 	if (audio_param->type == CT_PCM &&
 	    audio_param->channel_num > 2)
@@ -2903,17 +3190,15 @@ static int hdmitx_set_audmode(struct hdmitx_dev *hdev,
 	}
 	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
 	pr_info(HW "[0x10e3] = 0x%x\n", data32);
+	clk_muted = audio_cfg_clk_borrow(true, false);
 	set_aud_fifo_rst();
 	udelay(10);
+	audio_cfg_clk_borrow(false, clk_muted);
 	hdmitx_wr_reg(HDMITX_DWC_AUD_N1, hdmitx_rd_reg(HDMITX_DWC_AUD_N1));
 	/* double confirm that ACR packet is enabled
 	 * simultaneously with audio sample packet
 	 */
-	data32 = hdmitx_rd_reg(HDMITX_DWC_FC_PACKET_TX_EN);
-	if ((data32 & 0x9) == 0x8) {
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 0, 1);
-		pr_info(HW "enable ACR: [0x10e3] = 0x%x\n", data32);
-	}
+	audio_acr_confirm();
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 1, 0, 1);
 
 	return 1;
@@ -2967,6 +3252,9 @@ static void hw_reset_dbg(void)
 static int hdmitx_cntl(struct hdmitx_dev *hdev, unsigned int cmd,
 	unsigned int argv)
 {
+	if (cmd == HDMITX_EARLY_SUSPEND_RESUME_CNTL ||
+	    cmd == HDMITX_HWCMD_TURNOFF_HDMIHW)
+		hdmitx_hdr_transport_untrusted(hdev);
 	if (cmd == HDMITX_AVMUTE_CNTL) {
 		return 0;
 	} else if (cmd == HDMITX_EARLY_SUSPEND_RESUME_CNTL) {
@@ -3123,6 +3411,12 @@ static void hdmitx_set_fake_vic(struct hdmitx_dev *hdev)
 #undef pr_fmt
 #define pr_fmt(fmt) "hdmitx: " fmt
 
+/* Interrupt dumps only read registers, so they keep the HDR transport trusted. */
+static bool hdmitx_debug_read_only(const char *cmd)
+{
+	return strncmp(cmd, "dumpintr", 8) == 0;
+}
+
 static void hdmitx_debug(struct hdmitx_dev *hdev, const char *buf)
 {
 	char tmpbuf[128];
@@ -3136,6 +3430,8 @@ static void hdmitx_debug(struct hdmitx_dev *hdev, const char *buf)
 		i++;
 	}
 	tmpbuf[i] = 0;
+	if (!hdmitx_debug_read_only(tmpbuf))
+		hdmitx_hdr_debug_untrusted(hdev);
 
 	if (strncmp(tmpbuf, "testhpll", 8) == 0) {
 		ret = kstrtoul(tmpbuf + 8, 10, &value);
@@ -3884,6 +4180,11 @@ static int hdmitx_cntl_ddc(struct hdmitx_dev *hdev, unsigned int cmd,
 	unsigned int val;
 	unsigned char tmp[5];
 
+	if (cmd == DDC_RESET_EDID || cmd == DDC_EDID_READ_DATA ||
+	    cmd == DDC_EDID_GET_DATA)
+		hdmitx_hdr_link_changed(hdev);
+	if (cmd == DDC_SCDC_DIV40_SCRAMB)
+		hdmitx_hdr_transport_untrusted(hdev);
 	if ((cmd & CMD_DDC_OFFSET) != CMD_DDC_OFFSET) {
 		pr_err(HW "ddc: invalid cmd 0x%x\n", cmd);
 		return -1;
@@ -4181,6 +4482,16 @@ static int hdmitx_cntl_config(struct hdmitx_dev *hdev, unsigned int cmd,
 	int ret = 0;
 	unsigned int ieee_code = 0;
 
+	/* AVI fields are packet-only; a same-mode refresh rewrites them. */
+	if (cmd == CONF_AVI_RGBYCC_INDIC || cmd == CONF_AVI_Q01 ||
+	    cmd == CONF_AVI_YQ01)
+		hdmitx_hdr_packet_untrusted(hdev, HDMITX_HDR_PKT_AVI);
+	if (cmd == CONF_EMP_NUMBER || cmd == CONF_EMP_PHY_ADDR)
+		hdmitx_hdr_transport_untrusted(hdev);
+	if (cmd == CONF_HDMI_DVI_MODE || cmd == CONF_CLR_AVI_PACKET) {
+		hdmitx_same_mode_hw_changed();
+		hdmitx_hdr_transport_changed(hdev);
+	}
 	if ((cmd & CMD_CONF_OFFSET) != CMD_CONF_OFFSET) {
 		pr_err(HW "config: invalid cmd 0x%x\n", cmd);
 		return -1;
@@ -4194,7 +4505,11 @@ static int hdmitx_cntl_config(struct hdmitx_dev *hdev, unsigned int cmd,
 		ret = hdmitx_get_hdmi_dvi_config(hdev);
 		break;
 	case CONF_AUDIO_MUTE_OP:
-		audio_mute_op(argv == AUDIO_MUTE ? 0 : 1);
+		audio_mute_op(hdev, AUDIO_MUTE_APPLY,
+			argv == AUDIO_MUTE ? 0 : 1);
+		break;
+	case CONF_AUDIO_SET_STATE:
+		audio_mute_op(hdev, AUDIO_MUTE_PUBLISH, argv);
 		break;
 	case CONF_VIDEO_MUTE_OP:
 		hdmitx_set_video_mute(hdev, argv);
@@ -4373,6 +4688,11 @@ static int hdmitx_cntl_misc(struct hdmitx_dev *hdev, unsigned int cmd,
 {
 	static int st;
 
+	if (cmd == MISC_HPLL_FAKE || cmd == MISC_TMDS_CLK_DIV40 ||
+	    cmd == MISC_TMDS_RXSENSE)
+		hdmitx_hdr_transport_untrusted(hdev);
+	if (cmd == MISC_TMDS_PHY_OP || cmd == MISC_TRIGGER_HPD)
+		hdmitx_hdr_link_changed(hdev);
 	if ((cmd & CMD_MISC_OFFSET) != CMD_MISC_OFFSET) {
 		pr_err(HW "misc: w: invalid cmd 0x%x\n", cmd);
 		return -1;
@@ -4652,6 +4972,136 @@ void hdmitx_set_avi_colorimetry(struct hdmi_format_para *para)
 		}
 		break;
 	}
+}
+
+/* AVI fields owned by the modeset; shared with the same-mode refresh. */
+static void hdmitx_config_avi(struct hdmitx_dev *hdev, enum hdmi_vic vic,
+	unsigned char output_color_format)
+{
+	struct hdmi_format_para *para = hdev->para;
+	unsigned long data32;
+	unsigned int tmp = 0;
+
+	/* write AVI Infoframe packet configuration */
+	data32  = 0;
+	data32 |= (((output_color_format>>2)&0x1) << 7);
+	data32 |= (1 << 6);
+	data32 |= (0 << 4);
+	data32 |= (0 << 2);
+	data32 |= (0x2 << 0);    /* FIXED YCBCR 444 */
+	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF0, data32);
+	switch (output_color_format) {
+	case COLORSPACE_RGB444:
+		tmp = 0;
+		break;
+	case COLORSPACE_YUV422:
+		tmp = 1;
+		break;
+	case COLORSPACE_YUV420:
+		tmp = 3;
+		break;
+	case COLORSPACE_YUV444:
+	default:
+		tmp = 2;
+		break;
+	}
+	hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF0, tmp, 0, 2);
+
+	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF1, 0x8);
+	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF2, 0);
+
+	/* set Aspect Ratio in AVIInfo */
+	switch (para->vic) {
+	case HDMI_640x480p60_4x3:
+	case HDMI_720x480p60_4x3:
+	case HDMI_720x480i60_4x3:
+	case HDMI_720x240p60_4x3:
+	case HDMI_2880x480i60_4x3:
+	case HDMI_2880x240p60_4x3:
+	case HDMI_1440x480p60_4x3:
+	case HDMI_720x576p50_4x3:
+	case HDMI_720x576i50_4x3:
+	case HDMI_720x288p_4x3:
+	case HDMI_2880x576i50_4x3:
+	case HDMI_2880x288p50_4x3:
+	case HDMI_1440x576p_4x3:
+	case HDMI_2880x480p60_4x3:
+	case HDMI_2880x576p50_4x3:
+	case HDMI_720x576p100_4x3:
+	case HDMI_720x576i100_4x3:
+	case HDMI_720x480p120_4x3:
+	case HDMI_720x480i120_4x3:
+	case HDMI_720x576p200_4x3:
+	case HDMI_720x576i200_4x3:
+	case HDMI_720x480p240_4x3:
+	case HDMI_720x480i240_4x3:
+		/* Picture Aspect Ratio M1/M0 4:3 */
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x1, 4, 2);
+		break;
+	default:
+		/* Picture Aspect Ratio M1/M0 16:9 */
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x2, 4, 2);
+		break;
+	}
+	/* Active Format Aspect Ratio R3~R0 Same as picture aspect ratio */
+	hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x8, 0, 4);
+
+	hdmitx_set_avi_colorimetry(para);
+	if (hdev->hdr_color_feature == C_BT2020)
+		hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, SET_AVI_BT2020);
+
+	data32  = 0;
+	data32 |= (((0 == COLORRANGE_FUL) ? 1 : 0) << 2);
+	data32 |= (0 << 0);
+	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF3,   data32);
+
+	hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic & HDMITX_VIC_MASK);
+
+	/* For VESA modes, set VIC as 0 */
+	if (para->vic >= HDMITX_VESA_OFFSET) {
+		hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, 0);
+		hdmitx_set_isaformat(para->vic);
+	}
+	/* AVICONF0/2/3 rewritten: RGBYCC, Q and YQ are defined again. */
+	hdmitx_hdr_packet_clean(hdev, HDMITX_HDR_PKT_AVI);
+}
+
+/* DRM and 3D VSIF scheduling as left by a modeset. */
+static void hdmitx_config_pkt_enables(struct hdmitx_dev *hdev)
+{
+	/* If RX  support 2084 or hlg , and the hdr_src_feature is 2020
+	 *  then enable HDR send out
+	 */
+	if ((hdev->rxcap.hdr_info2.hdr_support & 0xc) &&
+	    hdev->hdr_color_feature == C_BT2020) {
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 1, 6, 1);
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 7, 1);
+	} else {
+		/* If RX don't support HDR, then enable HDR send out*/
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 0, 6, 1);
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 7, 1);
+	}
+
+	/* If RX  support 3D, then enable 3D send out */
+	if (hdev->flag_3dfp || hdev->flag_3dtb || hdev->flag_3dss) {
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 1, 3, 1);
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 4, 1);
+	} else {
+	  /* after changing mode, dv will call vsif function again*/
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
+		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 4, 1);
+		/* VSIF no longer transmitted, whatever its registers hold. */
+		hdmitx_hdr_packet_clean(hdev, HDMITX_HDR_PKT_VSIF);
+	}
+}
+
+/* Rewrite modeset-owned packet state without touching timing or the PHY. */
+void hdmitx_hw_same_mode_refresh(struct hdmitx_dev *hdev)
+{
+	if (!hdev->para || !hdev->cur_video_param)
+		return;
+	hdmitx_config_avi(hdev, hdev->cur_video_param->VIC, hdev->para->cs);
+	hdmitx_config_pkt_enables(hdev);
 }
 
 /*
@@ -4994,86 +5444,7 @@ static void config_hdmi20_tx(enum hdmi_vic vic,
 	if (!hdev->repeater_tx)
 		hdmitx_wr_reg(HDMITX_DWC_FC_GCP, data32);
 
-	/* write AVI Infoframe packet configuration */
-	data32  = 0;
-	data32 |= (((output_color_format>>2)&0x1) << 7);
-	data32 |= (1 << 6);
-	data32 |= (0 << 4);
-	data32 |= (0 << 2);
-	data32 |= (0x2 << 0);    /* FIXED YCBCR 444 */
-	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF0, data32);
-	switch (output_color_format) {
-	case COLORSPACE_RGB444:
-		tmp = 0;
-		break;
-	case COLORSPACE_YUV422:
-		tmp = 1;
-		break;
-	case COLORSPACE_YUV420:
-		tmp = 3;
-		break;
-	case COLORSPACE_YUV444:
-	default:
-		tmp = 2;
-		break;
-	}
-	hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF0, tmp, 0, 2);
-
-	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF1, 0x8);
-	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF2, 0);
-
-	/* set Aspect Ratio in AVIInfo */
-	switch (para->vic) {
-	case HDMI_640x480p60_4x3:
-	case HDMI_720x480p60_4x3:
-	case HDMI_720x480i60_4x3:
-	case HDMI_720x240p60_4x3:
-	case HDMI_2880x480i60_4x3:
-	case HDMI_2880x240p60_4x3:
-	case HDMI_1440x480p60_4x3:
-	case HDMI_720x576p50_4x3:
-	case HDMI_720x576i50_4x3:
-	case HDMI_720x288p_4x3:
-	case HDMI_2880x576i50_4x3:
-	case HDMI_2880x288p50_4x3:
-	case HDMI_1440x576p_4x3:
-	case HDMI_2880x480p60_4x3:
-	case HDMI_2880x576p50_4x3:
-	case HDMI_720x576p100_4x3:
-	case HDMI_720x576i100_4x3:
-	case HDMI_720x480p120_4x3:
-	case HDMI_720x480i120_4x3:
-	case HDMI_720x576p200_4x3:
-	case HDMI_720x576i200_4x3:
-	case HDMI_720x480p240_4x3:
-	case HDMI_720x480i240_4x3:
-		/* Picture Aspect Ratio M1/M0 4:3 */
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x1, 4, 2);
-		break;
-	default:
-		/* Picture Aspect Ratio M1/M0 16:9 */
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x2, 4, 2);
-		break;
-	}
-	/* Active Format Aspect Ratio R3~R0 Same as picture aspect ratio */
-	hdmitx_set_reg_bits(HDMITX_DWC_FC_AVICONF1, 0x8, 0, 4);
-
-	hdmitx_set_avi_colorimetry(para);
-	if (hdev->hdr_color_feature == C_BT2020)
-		hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, SET_AVI_BT2020);
-
-	data32  = 0;
-	data32 |= (((0 == COLORRANGE_FUL) ? 1 : 0) << 2);
-	data32 |= (0 << 0);
-	hdmitx_wr_reg(HDMITX_DWC_FC_AVICONF3,   data32);
-
-	hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, vic & HDMITX_VIC_MASK);
-
-	/* For VESA modes, set VIC as 0 */
-	if (para->vic >= HDMITX_VESA_OFFSET) {
-		hdmitx_wr_reg(HDMITX_DWC_FC_AVIVID, 0);
-		hdmitx_set_isaformat(para->vic);
-	}
+	hdmitx_config_avi(hdev, vic, output_color_format);
 
 	/* write Audio Infoframe packet configuration */
 
@@ -5139,28 +5510,7 @@ static void config_hdmi20_tx(enum hdmi_vic vic,
 
 	/* packet scheduller configuration for AVI, GCP, AUDI, ACR. */
 	hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 0x6, 0, 6);
-	/* If RX  support 2084 or hlg , and the hdr_src_feature is 2020
-	 *  then enable HDR send out
-	 */
-	if ((hdev->rxcap.hdr_info2.hdr_support & 0xc) &&
-	    hdev->hdr_color_feature == C_BT2020) {
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 1, 6, 1);
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 7, 1);
-	} else {
-		/* If RX don't support HDR, then enable HDR send out*/
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO3, 0, 6, 1);
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 7, 1);
-	}
-
-	/* If RX  support 3D, then enable 3D send out */
-	if (hdev->flag_3dfp || hdev->flag_3dtb || hdev->flag_3dss) {
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 1, 3, 1);
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 1, 4, 1);
-	} else {
-	  /* after changing mode, dv will call vsif function again*/
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_DATAUTO0, 0, 3, 1);
-		hdmitx_set_reg_bits(HDMITX_DWC_FC_PACKET_TX_EN, 0, 4, 1);
-	}
+	hdmitx_config_pkt_enables(hdev);
 
 	hdmitx_wr_reg(HDMITX_DWC_FC_RDRB0,  0);
 	hdmitx_wr_reg(HDMITX_DWC_FC_RDRB1,  0);

@@ -256,6 +256,8 @@ extern int get_primaries_type(struct vframe_master_display_colour_s *p_mdc);
 #define PROC_SDR_TO_HLG		2
 #define PROC_SDR_TO_CUVA	3
 #define PROC_SDR_TO_TRG		4
+/* sdr_bt2020_out: sdr transfer, bt2020 colour */
+#define PROC_SDR_TO_BT2020	6
 
 /* hdr */
 #define PROC_HDR_TO_SDR		1

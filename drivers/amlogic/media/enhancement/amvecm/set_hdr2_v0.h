@@ -102,6 +102,8 @@ enum hdr_process_sel {
 	HLG_CUVA = BIT(21),
 	PROCESS_MAX = BIT(22),
 	/* reserved  several bits for additional info */
+	/* with SDR_GMT_CONVERT: 709 primaries in, BT.2020 YCbCr out */
+	SDR_BT2020_OUT = BIT(28),
 	RGB_OSD = BIT(29),
 	RGB_VDIN = BIT(30),
 	FULL_VDIN = BIT(31)
@@ -241,6 +243,9 @@ extern u32 percentile[9];
 extern u32 disable_flush_flag;
 extern u32 osd_pq_passthrough;
 extern u32 osd_pq_applied;
+extern u32 sdr_bt2020_out;
+extern u32 sdr_bt2020_policy;
+extern u32 sdr_bt2020_applied;
 struct aml_gain_reg *get_cuva_gain(void);
 int cuva_hdr_update(
 	enum hdr_module_sel module_sel,
