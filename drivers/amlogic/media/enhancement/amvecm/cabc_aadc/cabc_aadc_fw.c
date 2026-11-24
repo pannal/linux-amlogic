@@ -598,50 +598,47 @@ int cabc_aad_print(void)
 	return 0;
 }
 
-static void str_sapr_conv(
-	const char *s, unsigned int size, int *dest, int num)
+static int parse_aad_lut(const char *s, int width, int *dest, int count)
 {
 	int i, j;
-	char *s1;
-	const char *end;
-	unsigned int len;
-	long value;
 
-	if ((size <= 0) || (!s))
-		return;
+	if (strlen(s) != width * count || strspn(s, "0123456789") != width * count)
+		return -EINVAL;
 
-	s1 = kmalloc(size + 1, GFP_KERNEL);
-	len = sizeof(s);
-	end = s;
+	for (i = 0; i < count; i++) {
+		int value = 0;
 
-	j = 0;
-	while (len >= size) {
-		for (i = 0; i < size; i++)
-			s1[i] = end[i];
-		s1[size] = '\0';
-		if (kstrtoul(s1, 10, &value) < 0)
-			break;
-		*dest++ = value;
-		end = s + size;
-		len -= size;
-		j++;
-		if (j >= num)
-			break;
+		for (j = 0; j < width; j++)
+			value = value * 10 + (*s++ - '0');
+		dest[i] = value;
 	}
-	kfree(s1);
+	return 0;
+}
+
+static int parse_aad_values(char **args, int *values, int count)
+{
+	unsigned long value;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		if (!args[i] || kstrtoul(args[i], 10, &value))
+			return -EINVAL;
+		values[i] = value;
+	}
+	return 0;
 }
 
 int cabc_aad_debug(char **param)
 {
-	long val;
+	unsigned long val;
 	struct aad_fw_param_s *fw_aad_param = aad_fw_param_get();
 	struct cabc_fw_param_s *fw_cabc_param = cabc_fw_param_get();
 	struct pgm_param_s *fw_pregm_param = pregam_fw_param_get();
 	int lut[48] = {0};
 	int i;
 
-	if (!param)
-		return -1;
+	if (!param || !param[0])
+		return -EINVAL;
 
 	if (!strcmp(param[0], "enable")) {/*module en/disable*/
 		cabc_aad_en = 1;
@@ -655,11 +652,21 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "aad_disable")) {
 		fw_aad_param->fw_aad_en = 0;
 		pr_info("disable aad\n");
+	} else if (!strcmp(param[0], "aad_print")) {/*print state*/
+		aad_alg_state();
+	} else if (!strcmp(param[0], "cabc_print")) {
+		cabc_alg_state();
+	} else if (!strcmp(param[0], "pregamma_print")) {
+		pre_gamma_alg_state();
+	} else if (!param[1]) {
+		return -EINVAL;
 	} else if (!strcmp(param[0], "aad_status")) {
 		if (!strcmp(param[1], "enable"))
 			fw_aad_param->fw_aad_status = 1;
 		else if (!strcmp(param[1], "disable"))
 			fw_aad_param->fw_aad_status = 0;
+		else
+			goto error;
 		pr_info("aad_status = %d\n", fw_aad_param->fw_aad_status);
 	} else if (!strcmp(param[0], "aad_sensor_mode")) {
 		if (!fw_aad_param->aad_param)
@@ -678,32 +685,20 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "aad_LUT_Y_gain")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (!param[1])
+		if (parse_aad_lut(param[1], 5, fw_aad_param->aad_param->aad_LUT_Y_gain, 17))
 			goto error;
-		str_sapr_conv(
-			param[1], 5,
-			fw_aad_param->aad_param->aad_LUT_Y_gain,
-			17);
 		pr_info("set aad_LUT_Y_gain\n");
 	} else if (!strcmp(param[0], "aad_LUT_RG_gain")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (!param[1])
+		if (parse_aad_lut(param[1], 5, fw_aad_param->aad_param->aad_LUT_RG_gain, 17))
 			goto error;
-		str_sapr_conv(
-			param[1], 5,
-			fw_aad_param->aad_param->aad_LUT_RG_gain,
-			17);
 		pr_info("set aad_LUT_RG_gain\n");
 	} else if (!strcmp(param[0], "aad_LUT_BG_gain")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (!param[1])
+		if (parse_aad_lut(param[1], 5, fw_aad_param->aad_param->aad_LUT_BG_gain, 17))
 			goto error;
-		str_sapr_conv(
-			param[1], 5,
-			fw_aad_param->aad_param->aad_LUT_BG_gain,
-			17);
 		pr_info("set aad_LUT_BG_gain\n");
 	} else if (!strcmp(param[0], "aad_Y_gain_min")) {
 		if (!fw_aad_param->aad_param)
@@ -778,31 +773,21 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "aad_rgb_gain")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (param[3]) {
-			if (kstrtoul(param[1], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_r_gain = val;
-			if (kstrtoul(param[2], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_g_gain = val;
-			if (kstrtoul(param[3], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_b_gain = val;
-			pr_info(
-				"aad_rgb_gain = %d, %d, %d\n",
-				fw_aad_param->aad_param->aad_r_gain,
-				fw_aad_param->aad_param->aad_g_gain,
-				fw_aad_param->aad_param->aad_b_gain);
-		}
+		if (parse_aad_values(&param[1], lut, 3))
+			goto error;
+		fw_aad_param->aad_param->aad_r_gain = lut[0];
+		fw_aad_param->aad_param->aad_g_gain = lut[1];
+		fw_aad_param->aad_param->aad_b_gain = lut[2];
+		pr_info(
+			"aad_rgb_gain = %d, %d, %d\n",
+			fw_aad_param->aad_param->aad_r_gain,
+			fw_aad_param->aad_param->aad_g_gain,
+			fw_aad_param->aad_param->aad_b_gain);
 	} else if (!strcmp(param[0], "aad_gain_lut")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (!param[1])
+		if (parse_aad_lut(param[1], 4, lut, 33))
 			goto error;
-		str_sapr_conv(
-			param[1], 4,
-			lut,
-			33);
 		for (i = 0; i < 11; i++) {
 			fw_aad_param->aad_param->aad_gain_lut[i][0] = lut[i * 3];
 			fw_aad_param->aad_param->aad_gain_lut[i][1] = lut[i * 3 + 1];
@@ -812,35 +797,25 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "gain_lut")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (param[4]) {
-			if (kstrtoul(param[1], 10, &val) < 0)
-				goto error;
-			i = val;
-			if (kstrtoul(param[2], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_gain_lut[i][0] = val;
-			if (kstrtoul(param[3], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_gain_lut[i][1] = val;
-			if (kstrtoul(param[4], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_gain_lut[i][2] = val;
-			pr_info(
-				"gain_lut[%d] = %d, %d, %d\n",
-				i,
-				fw_aad_param->aad_param->aad_gain_lut[i][0],
-				fw_aad_param->aad_param->aad_gain_lut[i][1],
-				fw_aad_param->aad_param->aad_gain_lut[i][2]);
-		}
+		if (kstrtoul(param[1], 10, &val) || val >= ARRAY_SIZE(gain_lut))
+			goto error;
+		i = val;
+		if (parse_aad_values(&param[2], lut, 3))
+			goto error;
+		fw_aad_param->aad_param->aad_gain_lut[i][0] = lut[0];
+		fw_aad_param->aad_param->aad_gain_lut[i][1] = lut[1];
+		fw_aad_param->aad_param->aad_gain_lut[i][2] = lut[2];
+		pr_info(
+			"gain_lut[%d] = %d, %d, %d\n",
+			i,
+			fw_aad_param->aad_param->aad_gain_lut[i][0],
+			fw_aad_param->aad_param->aad_gain_lut[i][1],
+			fw_aad_param->aad_param->aad_gain_lut[i][2]);
 	} else if (!strcmp(param[0], "aad_xy_lut")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (!param[1])
+		if (parse_aad_lut(param[1], 4, lut, 22))
 			goto error;
-		str_sapr_conv(
-			param[1], 4,
-			lut,
-			22);
 		for (i = 0; i < 11; i++) {
 			fw_aad_param->aad_param->aad_xy_lut[i][0] = lut[i * 2];
 			fw_aad_param->aad_param->aad_xy_lut[i][1] = lut[i * 2 + 1];
@@ -849,22 +824,18 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "xy_lut")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (param[3]) {
-			if (kstrtoul(param[1], 10, &val) < 0)
-				goto error;
-			i = val;
-			if (kstrtoul(param[2], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_xy_lut[i][0] = val;
-			if (kstrtoul(param[3], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->aad_xy_lut[i][1] = val;
-			pr_info(
-				"gain_lut[%d] = %d, %d\n",
-				i,
-				fw_aad_param->aad_param->aad_xy_lut[i][0],
-				fw_aad_param->aad_param->aad_xy_lut[i][1]);
-		}
+		if (kstrtoul(param[1], 10, &val) || val >= ARRAY_SIZE(xy_lut))
+			goto error;
+		i = val;
+		if (parse_aad_values(&param[2], lut, 2))
+			goto error;
+		fw_aad_param->aad_param->aad_xy_lut[i][0] = lut[0];
+		fw_aad_param->aad_param->aad_xy_lut[i][1] = lut[1];
+		pr_info(
+			"gain_lut[%d] = %d, %d\n",
+			i,
+			fw_aad_param->aad_param->aad_xy_lut[i][0],
+			fw_aad_param->aad_param->aad_xy_lut[i][1]);
 	} else if (!strcmp(param[0], "aad_min_dist_th")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
@@ -875,22 +846,16 @@ int cabc_aad_debug(char **param)
 	} else if (!strcmp(param[0], "sensor_input")) {
 		if (!fw_aad_param->aad_param)
 			goto error;
-		if (param[3]) {
-			if (kstrtoul(param[1], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->sensor_input[0] = val;
-			if (kstrtoul(param[2], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->sensor_input[1] = val;
-			if (kstrtoul(param[3], 10, &val) < 0)
-				goto error;
-			fw_aad_param->aad_param->sensor_input[2] = val;
-			pr_info(
-				"sensor_input = %d, %d, %d\n",
-				fw_aad_param->aad_param->sensor_input[0],
-				fw_aad_param->aad_param->sensor_input[1],
-				fw_aad_param->aad_param->sensor_input[2]);
-		}
+		if (parse_aad_values(&param[1], lut, 3))
+			goto error;
+		fw_aad_param->aad_param->sensor_input[0] = lut[0];
+		fw_aad_param->aad_param->sensor_input[1] = lut[1];
+		fw_aad_param->aad_param->sensor_input[2] = lut[2];
+		pr_info(
+			"sensor_input = %d, %d, %d\n",
+			fw_aad_param->aad_param->sensor_input[0],
+			fw_aad_param->aad_param->sensor_input[1],
+			fw_aad_param->aad_param->sensor_input[2]);
 	} else if (!strcmp(param[0], "aad_debug_mode")) {
 		if (kstrtoul(param[1], 10, &val) < 0)
 			goto error;
@@ -906,6 +871,8 @@ int cabc_aad_debug(char **param)
 			fw_cabc_param->fw_cabc_status = 1;
 		else if (!strcmp(param[1], "disable"))
 			fw_cabc_param->fw_cabc_status = 0;
+		else
+			goto error;
 		pr_info("cabc_status = %d\n", fw_cabc_param->fw_cabc_status);
 	} else if (!strcmp(param[0], "cabc_max95_ratio")) {
 		if (!fw_cabc_param->cabc_param)
@@ -1001,15 +968,11 @@ int cabc_aad_debug(char **param)
 			goto error;
 		fw_pregm_param->pre_gam_param->pre_gamma_gain_ratio = val;
 		pr_info("pre_gamma_gain_ratio = %d\n", (int)val);
-	} else if (!strcmp(param[0], "aad_print")) {/*print state*/
-		aad_alg_state();
-	} else if (!strcmp(param[0], "cabc_print")) {
-		cabc_alg_state();
-	} else if (!strcmp(param[0], "pregamma_print")) {
-		pre_gamma_alg_state();
+	} else {
+		goto error;
 	}
 
 	return 0;
 error:
-	return -1;
+	return -EINVAL;
 }

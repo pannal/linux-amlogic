@@ -3453,9 +3453,11 @@ static ssize_t amvecm_cabc_aad_store(
 	char *buf_orig, *parm[8] = {NULL};
 
 	if (!buf)
-		return count;
+		return -EINVAL;
 
 	buf_orig = kstrdup(buf, GFP_KERNEL);
+	if (!buf_orig)
+		return -ENOMEM;
 	if (parse_param_amvecm(buf_orig, parm, ARRAY_SIZE(parm)) <= 0) {
 		kfree(buf_orig);
 		return -EINVAL;
@@ -3463,10 +3465,9 @@ static ssize_t amvecm_cabc_aad_store(
 
 	ret = cabc_aad_debug(parm);
 
-	if (ret < 0)
-		pr_info("set parameters failed\n");
-
 	kfree(buf_orig);
+	if (ret < 0)
+		return ret;
 	return count;
 }
 
