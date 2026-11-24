@@ -7355,7 +7355,8 @@ static int dv_parse_metadata_internal(struct vframe_s *vf,
 				!vf->discard_dv_data && !req.dv_enhance_exist &&
 				xbmc_dv_profile == 8 && xbmc_dv_source_native &&
 				xbmc_detect_active_area && xbmc_meta_level_5 &&
-				w == 3840 && h == 2160;
+				((w == 3840 && h == 2160) ||
+				 (w == 1920 && h == 1080));
 
 			if (live_l5)
 				vf_notify_provider_by_name(dv_provider,
