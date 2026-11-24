@@ -219,12 +219,11 @@ void cuva_metadata_bits_parse(struct cuva_md_bits_s *md_bits)
 
 struct cuva_hdr_dynamic_metadata_s cuva_metadata;
 
-void cuva_hdr_metadata_parse(char *metadata, uint32_t size)
+static bool cuva_hdr_metadata_parse(const u8 *metadata, int size,
+				    struct cuva_hdr_dynamic_metadata_s *m)
 {
 	struct cuva_md_bits_s md_bits;
-	int totbitoffset = 0;
-	int value;
-	int num_wds;
+	struct hdr10_plus_reader r = { .data = (const char *)metadata, .size = size };
 	int i, j;
 	int tm_param_num;
 	int spline_num;
@@ -244,277 +243,152 @@ void cuva_hdr_metadata_parse(char *metadata, uint32_t size)
 	}
 	pr_hdr("cuva metadata print end\n");
 
-	metadata += 5;
-	size -= 5;
+	memset(m, 0, sizeof(*m));
 
-	memset(&cuva_metadata, 0,
-		sizeof(struct cuva_hdr_dynamic_metadata_s));
+	m->system_start_code = hdr10_plus_bits(&r, md_bits.system_start_code_bits);
+	pr_hdr("system_start_code = %d\n", m->system_start_code);
 
-	GetBits(metadata, totbitoffset,
-		&value, size,
-		md_bits.system_start_code_bits);
-	cuva_metadata.system_start_code = value;
-	totbitoffset += md_bits.system_start_code_bits;
-	pr_hdr("system_start_code = %d\n", cuva_metadata.system_start_code);
-
-	if (cuva_metadata.system_start_code == 0x1) {
-		num_wds = 1;
+	if (m->system_start_code == 0x1) {
 		/*maxrgb_pq*/
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.min_maxrgb_pq_bits);
-		cuva_metadata.min_maxrgb_pq = value;
-		totbitoffset += md_bits.min_maxrgb_pq_bits;
-		pr_hdr("min_maxrgb_pq = %d\n", cuva_metadata.min_maxrgb_pq);
+		m->min_maxrgb_pq = hdr10_plus_bits(&r, md_bits.min_maxrgb_pq_bits);
+		pr_hdr("min_maxrgb_pq = %d\n", m->min_maxrgb_pq);
 
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.avg_maxrgb_pq_bits);
-		cuva_metadata.avg_maxrgb_pq = value;
-		totbitoffset += md_bits.avg_maxrgb_pq_bits;
-		pr_hdr("avg_maxrgb_pq = %d\n", cuva_metadata.avg_maxrgb_pq);
+		m->avg_maxrgb_pq = hdr10_plus_bits(&r, md_bits.avg_maxrgb_pq_bits);
+		pr_hdr("avg_maxrgb_pq = %d\n", m->avg_maxrgb_pq);
 
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.var_maxrgb_pq_bits);
-		cuva_metadata.var_maxrgb_pq = value;
-		totbitoffset += md_bits.var_maxrgb_pq_bits;
-		pr_hdr("var_maxrgb_pq = %d\n", cuva_metadata.var_maxrgb_pq);
+		m->var_maxrgb_pq = hdr10_plus_bits(&r, md_bits.var_maxrgb_pq_bits);
+		pr_hdr("var_maxrgb_pq = %d\n", m->var_maxrgb_pq);
 
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.max_maxrgb_pq_bits);
-		cuva_metadata.max_maxrgb_pq = value;
-		totbitoffset += md_bits.max_maxrgb_pq_bits;
-		pr_hdr("max_maxrgb_pq = %d\n", cuva_metadata.max_maxrgb_pq);
+		m->max_maxrgb_pq = hdr10_plus_bits(&r, md_bits.max_maxrgb_pq_bits);
+		pr_hdr("max_maxrgb_pq = %d\n", m->max_maxrgb_pq);
 		/*maxrgb_pq end*/
 
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.tm_enable_mode_flag_bits);
-		cuva_metadata.tm_enable_mode_flag = value;
-		totbitoffset += md_bits.tm_enable_mode_flag_bits;
-		pr_hdr("tm_enable_mode_flag = %d\n", cuva_metadata.tm_enable_mode_flag);
+		m->tm_enable_mode_flag = hdr10_plus_bits(&r, md_bits.tm_enable_mode_flag_bits);
+		pr_hdr("tm_enable_mode_flag = %d\n", m->tm_enable_mode_flag);
 
-		if (cuva_metadata.tm_enable_mode_flag == 1) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				md_bits.tm_param_en_num_bits);
-			cuva_metadata.tm_param_en_num = value;
-			totbitoffset += md_bits.tm_param_en_num_bits;
-			pr_hdr("tm_param_en_num = %d\n", cuva_metadata.tm_param_en_num);
+		if (m->tm_enable_mode_flag == 1) {
+			m->tm_param_en_num = hdr10_plus_bits(&r, md_bits.tm_param_en_num_bits);
+			pr_hdr("tm_param_en_num = %d\n", m->tm_param_en_num);
 
-			if (cuva_metadata.tm_param_en_num > 1)
-				cuva_metadata.tm_param_en_num = 1;
-			tm_param_num = cuva_metadata.tm_param_en_num + 1;
+			if (m->tm_param_en_num > 1)
+				m->tm_param_en_num = 1;
+			tm_param_num = m->tm_param_en_num + 1;
 			for (i = 0; i < tm_param_num; i++) {
-				GetBits(metadata, totbitoffset,
-					&value, size,
-					md_bits.tgt_system_dsp_max_luma_pq_bits);
-				cuva_metadata.tgt_system_dsp_max_luma_pq[i] = value;
-				totbitoffset += md_bits.tgt_system_dsp_max_luma_pq_bits;
+				m->tgt_system_dsp_max_luma_pq[i] = hdr10_plus_bits(&r, md_bits.tgt_system_dsp_max_luma_pq_bits);
 				pr_hdr("tgt_system_dsp_max_luma_pq[%d] = %d\n",
-					i, cuva_metadata.tgt_system_dsp_max_luma_pq[i]);
+					i, m->tgt_system_dsp_max_luma_pq[i]);
 
-				GetBits(metadata, totbitoffset,
-					&value, size,
-					md_bits.base_en_flag_bits);
-				cuva_metadata.base_en_flag[i] = value;
-				totbitoffset += md_bits.base_en_flag_bits;
+				m->base_en_flag[i] = hdr10_plus_bits(&r, md_bits.base_en_flag_bits);
 				pr_hdr("base_en_flag[%d] = %d\n",
-					i, cuva_metadata.base_en_flag[i]);
+					i, m->base_en_flag[i]);
 
-				if (cuva_metadata.base_en_flag[i]) {
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_p_bits);
-					cuva_metadata.base_param_m_p[i] = value;
-					totbitoffset += md_bits.base_param_m_p_bits;
+				if (m->base_en_flag[i]) {
+					m->base_param_m_p[i] = hdr10_plus_bits(&r, md_bits.base_param_m_p_bits);
 					pr_hdr("base_param_m_p[%d] = %d\n",
-						i, cuva_metadata.base_param_m_p[i]);
+						i, m->base_param_m_p[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_m_bits);
-					cuva_metadata.base_param_m_m[i] = value;
-					totbitoffset += md_bits.base_param_m_m_bits;
+					m->base_param_m_m[i] = hdr10_plus_bits(&r, md_bits.base_param_m_m_bits);
 					pr_hdr("base_param_m_m[%d] = %d\n",
-						i, cuva_metadata.base_param_m_m[i]);
+						i, m->base_param_m_m[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_a_bits);
-					cuva_metadata.base_param_m_a[i] = value;
-					totbitoffset += md_bits.base_param_m_a_bits;
+					m->base_param_m_a[i] = hdr10_plus_bits(&r, md_bits.base_param_m_a_bits);
 					pr_hdr("base_param_m_a[%d] = %d\n",
-						i, cuva_metadata.base_param_m_a[i]);
+						i, m->base_param_m_a[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_b_bits);
-					cuva_metadata.base_param_m_b[i] = value;
-					totbitoffset += md_bits.base_param_m_b_bits;
+					m->base_param_m_b[i] = hdr10_plus_bits(&r, md_bits.base_param_m_b_bits);
 					pr_hdr("base_param_m_b[%d] = %d\n",
-						i, cuva_metadata.base_param_m_b[i]);
+						i, m->base_param_m_b[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_n_bits);
-					cuva_metadata.base_param_m_n[i] = value;
-					totbitoffset += md_bits.base_param_m_n_bits;
+					m->base_param_m_n[i] = hdr10_plus_bits(&r, md_bits.base_param_m_n_bits);
 					pr_hdr("base_param_m_n[%d] = %d\n",
-						i, cuva_metadata.base_param_m_n[i]);
+						i, m->base_param_m_n[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_k1_bits);
-					cuva_metadata.base_param_m_k1[i] = value;
-					totbitoffset += md_bits.base_param_m_k1_bits;
+					m->base_param_m_k1[i] = hdr10_plus_bits(&r, md_bits.base_param_m_k1_bits);
 					pr_hdr("base_param_m_k1[%d] = %d\n",
-						i, cuva_metadata.base_param_m_k1[i]);
+						i, m->base_param_m_k1[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_k2_bits);
-					cuva_metadata.base_param_m_k2[i] = value;
-					totbitoffset += md_bits.base_param_m_k2_bits;
+					m->base_param_m_k2[i] = hdr10_plus_bits(&r, md_bits.base_param_m_k2_bits);
 					pr_hdr("base_param_m_k2[%d] = %d\n",
-						i, cuva_metadata.base_param_m_k2[i]);
+						i, m->base_param_m_k2[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_m_k3_bits);
-					cuva_metadata.base_param_m_k3[i] = value;
-					totbitoffset += md_bits.base_param_m_k3_bits;
+					m->base_param_m_k3[i] = hdr10_plus_bits(&r, md_bits.base_param_m_k3_bits);
 					pr_hdr("base_param_m_k3[%d] = %d\n",
-						i, cuva_metadata.base_param_m_k3[i]);
+						i, m->base_param_m_k3[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_delta_en_mode_bits);
-					cuva_metadata.base_param_delta_en_mode[i] = value;
-					totbitoffset += md_bits.base_param_delta_en_mode_bits;
+					m->base_param_delta_en_mode[i] = hdr10_plus_bits(&r, md_bits.base_param_delta_en_mode_bits);
 					pr_hdr("base_param_delta_en_mode[%d] = %d\n",
-						i, cuva_metadata.base_param_delta_en_mode[i]);
+						i, m->base_param_delta_en_mode[i]);
 
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.base_param_en_delta_bits);
-					cuva_metadata.base_param_en_delta[i] = value;
-					totbitoffset += md_bits.base_param_en_delta_bits;
+					m->base_param_en_delta[i] = hdr10_plus_bits(&r, md_bits.base_param_en_delta_bits);
 					pr_hdr("base_param_en_delta[%d] = %d\n",
-						i, cuva_metadata.base_param_en_delta[i]);
+						i, m->base_param_en_delta[i]);
 				}
 
-				GetBits(metadata, totbitoffset,
-					&value, size,
-					md_bits.spline_en_flag_bits);
-				cuva_metadata.spline_en_flag[i] = value;
-				totbitoffset += md_bits.spline_en_flag_bits;
+				m->spline_en_flag[i] = hdr10_plus_bits(&r, md_bits.spline_en_flag_bits);
 				pr_hdr("spline_en_flag[%d] = %d\n",
-					i, cuva_metadata.spline_en_flag[i]);
+					i, m->spline_en_flag[i]);
 
-				if (cuva_metadata.spline_en_flag[i]) {
-					GetBits(metadata, totbitoffset,
-						&value, size,
-						md_bits.spline_en_num_bits);
-					cuva_metadata.spline_en_num[i] = value;
-					totbitoffset += md_bits.spline_en_num_bits;
+				if (m->spline_en_flag[i]) {
+					m->spline_en_num[i] = hdr10_plus_bits(&r, md_bits.spline_en_num_bits);
 					pr_hdr("spline_en_num[%d] = %d\n",
-						i, cuva_metadata.spline_en_num[i]);
+						i, m->spline_en_num[i]);
 
-					if (cuva_metadata.spline_en_num[i] > 1)
-						cuva_metadata.spline_en_num[i] = 1;
+					if (m->spline_en_num[i] > 1)
+						m->spline_en_num[i] = 1;
 
-					spline_num = cuva_metadata.spline_en_num[i] + 1;
+					spline_num = m->spline_en_num[i] + 1;
 					for (j = 0; j < spline_num; j++) {
-						GetBits(metadata, totbitoffset,
-							&value, size,
-							md_bits.spline_th_en_mode_bits);
-						cuva_metadata.spline_th_en_mode[j][i] = value;
-						totbitoffset += md_bits.spline_th_en_mode_bits;
+						m->spline_th_en_mode[j][i] = hdr10_plus_bits(&r, md_bits.spline_th_en_mode_bits);
 						pr_hdr("spline_th_en_mode[%d][%d] = %d\n",
-						j, i, cuva_metadata.spline_th_en_mode[j][i]);
+						j, i, m->spline_th_en_mode[j][i]);
 
-						if ((cuva_metadata.spline_th_en_mode[j][i]
+						if ((m->spline_th_en_mode[j][i]
 							== 0) ||
-							(cuva_metadata.spline_th_en_mode[j][i]
+							(m->spline_th_en_mode[j][i]
 							== 2)) {
-							GetBits(metadata, totbitoffset,
-								&value, size,
-								md_bits.spline_th_en_mb_bits);
-							cuva_metadata.spline_th_en_mb[j][i] = value;
-							totbitoffset +=
-								md_bits.spline_th_en_mb_bits;
+							m->spline_th_en_mb[j][i] = hdr10_plus_bits(&r, md_bits.spline_th_en_mb_bits);
 							pr_hdr("spline_th_en_mb[%d][%d] = %d\n",
-							j, i, cuva_metadata.spline_th_en_mb[j][i]);
+							j, i, m->spline_th_en_mb[j][i]);
 						}
 
-						GetBits(metadata, totbitoffset,
-							&value, size,
-							md_bits.spline_th_enable_bits);
-						cuva_metadata.spline_th_enable[j][i] = value;
-						totbitoffset += md_bits.spline_th_enable_bits;
+						m->spline_th_enable[j][i] = hdr10_plus_bits(&r, md_bits.spline_th_enable_bits);
 						pr_hdr("spline_th_enable[%d][%d] = %d\n",
-						j, i, cuva_metadata.spline_th_enable[j][i]);
+						j, i, m->spline_th_enable[j][i]);
 
-						GetBits(metadata, totbitoffset,
-							&value, size,
-							md_bits.spline_th_en_delta1_bits);
-						cuva_metadata.spline_th_en_delta1[j][i] = value;
-						totbitoffset += md_bits.spline_th_en_delta1_bits;
+						m->spline_th_en_delta1[j][i] = hdr10_plus_bits(&r, md_bits.spline_th_en_delta1_bits);
 						pr_hdr("spline_th_en_delta1[%d][%d] = %d\n",
-						j, i, cuva_metadata.spline_th_en_delta1[j][i]);
+						j, i, m->spline_th_en_delta1[j][i]);
 
-						GetBits(metadata, totbitoffset,
-							&value, size,
-							md_bits.spline_th_en_delta2_bits);
-						cuva_metadata.spline_th_en_delta2[j][i] = value;
-						totbitoffset += md_bits.spline_th_en_delta2_bits;
+						m->spline_th_en_delta2[j][i] = hdr10_plus_bits(&r, md_bits.spline_th_en_delta2_bits);
 						pr_hdr("spline_th_en_delta2[%d][%d] = %d\n",
-						j, i, cuva_metadata.spline_th_en_delta2[j][i]);
+						j, i, m->spline_th_en_delta2[j][i]);
 
-						GetBits(metadata, totbitoffset,
-							&value, size,
-							md_bits.spline_en_strengch_bits);
-						cuva_metadata.spline_en_strengch[j][i] = value;
-						totbitoffset += md_bits.spline_en_strengch_bits;
+						m->spline_en_strengch[j][i] = hdr10_plus_bits(&r, md_bits.spline_en_strengch_bits);
 						pr_hdr("spline_en_strengch[%d][%d] = %d\n",
-						j, i, cuva_metadata.spline_en_strengch[j][i]);
+						j, i, m->spline_en_strengch[j][i]);
 					}
 				}
 			}
 		}
 
-		GetBits(metadata, totbitoffset,
-			&value, size,
-			md_bits.color_sat_mapping_flag_bits);
-		cuva_metadata.color_sat_mapping_flag = value;
-		totbitoffset += md_bits.color_sat_mapping_flag_bits;
+		m->color_sat_mapping_flag = hdr10_plus_bits(&r, md_bits.color_sat_mapping_flag_bits);
 		pr_hdr("color_sat_mapping_flag = %d\n",
-			cuva_metadata.color_sat_mapping_flag);
+			m->color_sat_mapping_flag);
 
-		if (cuva_metadata.color_sat_mapping_flag) {
-			GetBits(metadata, totbitoffset,
-				&value, size,
-				md_bits.color_sat_num_bits);
-			cuva_metadata.color_sat_num = value;
-			totbitoffset += md_bits.color_sat_num_bits;
-			pr_hdr("color_sat_num = %d\n", cuva_metadata.color_sat_num);
+		if (m->color_sat_mapping_flag) {
+			m->color_sat_num = hdr10_plus_bits(&r, md_bits.color_sat_num_bits);
+			pr_hdr("color_sat_num = %d\n", m->color_sat_num);
 
-			if (cuva_metadata.color_sat_num > 8)
-				cuva_metadata.color_sat_num = 8;
-			for (i = 0; i < cuva_metadata.color_sat_num; i++) {
-				GetBits(metadata, totbitoffset,
-					&value, size,
-					md_bits.clor_sat_gain_bits);
-				cuva_metadata.clor_sat_gain[i] = value;
-				totbitoffset += md_bits.clor_sat_gain_bits;
+			if (m->color_sat_num > 8)
+				m->color_sat_num = 8;
+			for (i = 0; i < m->color_sat_num; i++) {
+				m->clor_sat_gain[i] = hdr10_plus_bits(&r, md_bits.clor_sat_gain_bits);
 				pr_hdr("clor_sat_gain[%d] = %d\n",
-					i, cuva_metadata.clor_sat_gain[i]);
+					i, m->clor_sat_gain[i]);
 			}
 		}
 	}
+	return !r.error;
 }
 
 static bool read_sei_value(const u8 **pos, const u8 *end, u32 *value)
@@ -533,8 +407,14 @@ static bool read_sei_value(const u8 **pos, const u8 *end, u32 *value)
 	return true;
 }
 
+struct pending_metadata {
+	struct vframe_hdr_plus_sei *hdr10_plus;
+	struct cuva_hdr_dynamic_metadata_s cuva;
+	bool has_cuva;
+};
+
 static bool parse_sei(const u8 *data, size_t size,
-		      struct vframe_hdr_plus_sei **pending)
+		      struct pending_metadata *pending)
 {
 	static const u8 hdr10_plus_id[] = { 0xb5, 0, 0x3c, 0, 1, 4 };
 	static const u8 cuva_id[] = { 0x26, 0, 4, 0, 5 };
@@ -557,16 +437,20 @@ static bool parse_sei(const u8 *data, size_t size,
 		if (type == SEI_Syntax) {
 			if (length >= sizeof(hdr10_plus_id) &&
 			    !memcmp(data, hdr10_plus_id, sizeof(hdr10_plus_id))) {
-				if (!*pending) {
-					*pending = kmalloc(sizeof(**pending), GFP_ATOMIC);
-					if (!*pending)
+				if (!pending->hdr10_plus) {
+					pending->hdr10_plus = kmalloc(sizeof(*pending->hdr10_plus),
+								      GFP_ATOMIC);
+					if (!pending->hdr10_plus)
 						return false;
 				}
-				if (!parse_hdr10_plus((const char *)data, length, *pending))
+				if (!parse_hdr10_plus((const char *)data, length, pending->hdr10_plus))
 					return false;
 			} else if (length >= sizeof(cuva_id) &&
 				   !memcmp(data, cuva_id, sizeof(cuva_id))) {
-				cuva_hdr_metadata_parse((char *)data, length);
+				if (!cuva_hdr_metadata_parse(data + sizeof(cuva_id),
+							     length - sizeof(cuva_id), &pending->cuva))
+					return false;
+				pending->has_cuva = true;
 			}
 		}
 		data += length;
@@ -576,7 +460,7 @@ static bool parse_sei(const u8 *data, size_t size,
 
 static bool parse_aux_metadata(const u8 *data, int size)
 {
-	struct vframe_hdr_plus_sei *pending = NULL;
+	struct pending_metadata pending = {};
 	bool valid = true;
 
 	while (size > 0) {
@@ -599,9 +483,11 @@ static bool parse_aux_metadata(const u8 *data, int size)
 		size -= length;
 	}
 	/* Vsync consumes this state. Keep the last complete frame on failure. */
-	if (valid && pending)
-		hdr_plus_sei = *pending;
-	kfree(pending);
+	if (valid && pending.hdr10_plus)
+		hdr_plus_sei = *pending.hdr10_plus;
+	if (valid && pending.has_cuva)
+		cuva_metadata = pending.cuva;
+	kfree(pending.hdr10_plus);
 	return valid;
 }
 

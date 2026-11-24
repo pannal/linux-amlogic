@@ -4283,6 +4283,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 	enum signal_format_enum *src_format = (enum signal_format_enum *)fmt;
 	static int parse_process_count;
 	static u32 last_play_id;
+	static u32 len_2086_sei;
 
 	if (!aux_buf || aux_size <= 0 || !fmt || !md_buf || !comp_buf ||
 	    !total_comp_size || !total_md_size || !ret_flags)
@@ -4297,6 +4298,7 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 
 	/* release metadata_parser when new playing */
 	if (vf && vf->src_fmt.play_id != last_play_id) {
+		len_2086_sei = 0;
 		if (metadata_parser) {
 			dv_legacy_release();
 			metadata_parser = NULL;
@@ -4480,10 +4482,9 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 	if (atsc_sei && *src_format != FORMAT_DOVI) {
 
 		struct dv_vui_parameters vui_param;
-		static u32 len_2086_sei;
 		u32 len_2094_sei = 0;
 		const char *mastering_payload = NULL;
-		u32 mastering_size = len_2086_sei;
+		u32 mastering_size = 0;
 		static u8 payload_2086_sei[MAX_LEN_2086_SEI];
 		u8 payload_2094_sei[MAX_LEN_2094_SEI];
 		unsigned char nal_type;
@@ -4541,26 +4542,26 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 					if (debug_dolby & 2)
 						pr_dolby_dbg("type %d, size %d\n",
 							     sei_payload_type, sei_payload_size);
-					if (sei_payload_type == SEI_TYPE_MASTERING_DISP_COLOUR_VOLUME) {
-						mastering_size = sei_payload_size;
-						mastering_payload = p + 4;
-					} else if (sei_payload_type == SEI_TYPE_USERDATA_REGISTERED_ITUT_T35) {
-						len_2094_sei = sei_payload_size;
-						memcpy(payload_2094_sei, p + 4, len_2094_sei);
+					/* Keep the first complete pair, but validate every record. */
+					if (!mastering_size || !len_2094_sei) {
+						if (sei_payload_type == SEI_TYPE_MASTERING_DISP_COLOUR_VOLUME) {
+							mastering_size = sei_payload_size;
+							mastering_payload = p + 4;
+						} else if (sei_payload_type == SEI_TYPE_USERDATA_REGISTERED_ITUT_T35) {
+							len_2094_sei = sei_payload_size;
+							memcpy(payload_2094_sei, p + 4, len_2094_sei);
+						}
 					}
-					if (mastering_size && len_2094_sei)
-						break;
 				}
 			}
 			p += size;
 		}
+		/* A mastering-only frame can supply the next T.35 payload. */
+		if (mastering_payload) {
+			len_2086_sei = mastering_size;
+			memcpy(payload_2086_sei, mastering_payload, mastering_size);
+		}
 		if (len_2094_sei > 0) {
-			/* Commit mastering data only after the records used by
-			 * this frame have passed their length checks. */
-			if (mastering_payload) {
-				len_2086_sei = mastering_size;
-				memcpy(payload_2086_sei, mastering_payload, mastering_size);
-			}
 			/* source is VS10 */
 			*total_comp_size = 0;
 			*total_md_size = 0;
@@ -4671,8 +4672,6 @@ int parse_sei_and_meta_ext(struct vframe_s *vf,
 			spin_unlock_irqrestore(&dovi_lock, flags);
 			if (parser_overflow)
 				ret = 2;
-		} else {
-			len_2086_sei = 0;
 		}
 	}
 
