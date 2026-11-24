@@ -831,8 +831,8 @@ static unsigned int dv_target_graphics_LL_max[3][3] = {
 /*these two parameters form OSD*/
 static unsigned int osd_graphic_width = 1920;
 static unsigned int osd_graphic_height = 1080;
-static unsigned int new_osd_graphic_width = 1920;
-static unsigned int new_osd_graphic_height = 1080;
+/* OSD mode changes can publish new dimensions while vsync consumes them. */
+static u32 pending_osd_graphic_size = (1920U << 16) | 1080;
 
 static unsigned int dv_cert_graphic_width = 1920;
 static unsigned int dv_cert_graphic_height = 1080;
@@ -2337,8 +2337,7 @@ static int dolby_core3_set
 void update_graphic_width_height(unsigned int width,
                                  unsigned int height)
 {
-  new_osd_graphic_width = width;
-  new_osd_graphic_height = height;
+  WRITE_ONCE(pending_osd_graphic_size, (width << 16) | (height & 0xffff));
 }
 
 void update_graphic_status(void)
@@ -2367,6 +2366,9 @@ static bool graphic_pq_may_change(void)
 
 static int is_graphic_changed(void)
 {
+  const u32 size = READ_ONCE(pending_osd_graphic_size);
+  const u32 width = size >> 16;
+  const u32 height = size & 0xffff;
   int ret = 0;
 
   if (is_graphics_output_off()) {
@@ -2383,19 +2385,18 @@ static int is_graphic_changed(void)
     ret |= 2;
   }
 
-  if (osd_graphic_width != new_osd_graphic_width ||
-      osd_graphic_height != new_osd_graphic_height) {
+  if (osd_graphic_width != width || osd_graphic_height != height) {
 
     if (debug_dolby & 0x2)
       pr_dolby_dbg("osd changed %d %d-%d %d\n",
                    osd_graphic_width, osd_graphic_height,
-                   new_osd_graphic_width, new_osd_graphic_height);
+                   width, height);
 
     /* TODO: g12/tm2/sc2/t7 osd pps is after dolby core2, but */
     /* sometimes osd do crop,should monitor osd size change */
     if (!is_osd_off /*&& !is_meson_tm2() && !is_meson_sc2()*/) {
-      osd_graphic_width = new_osd_graphic_width;
-      osd_graphic_height = new_osd_graphic_height;
+      osd_graphic_width = width;
+      osd_graphic_height = height;
       ret |= 2;
     }
   }

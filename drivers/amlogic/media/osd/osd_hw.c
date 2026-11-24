@@ -9855,6 +9855,11 @@ static void osd_setting_default_hwc(void)
 	VSYNCOSD_WR_MPEG_REG(VPP_OSD1_IN_SIZE,
 		blend_vsize  << 16 |
 		blend_hsize);
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	/* Core2 takes the blend input size before the OSD is scaled to HDMI. */
+	if (osd_hw.osd_meson_dev.has_dolby_vision && blend_hsize && blend_vsize)
+		update_graphic_width_height(blend_hsize, blend_vsize);
+#endif
 }
 
 static bool set_old_hwc_freescale(u32 index)
