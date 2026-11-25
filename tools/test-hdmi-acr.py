@@ -36,7 +36,7 @@ struct hdmi_format_para {
  enum hdmi_color_space cs;
  enum hdmi_color_depth cd;
 };
-struct hdmitx_dev { int tx_aud_src, frac_rate_policy; struct hdmi_format_para *para; };
+struct hdmitx_dev { int chip_type, tx_aud_src, frac_rate_policy; struct hdmi_format_para *para; };
 struct hdmitx_audpara { enum hdmi_audio_type type; enum hdmi_audio_fs sample_rate; };
 '''
 enums = '\n'.join(helpers.declaration(header, 'enum', name) for name in (
@@ -47,11 +47,11 @@ definitions = tables[begin:tables.index(lookup)]
 caller = helpers.function(hw, 'set_aud_acr_pkt')
 
 main = r'''
-static void check(int mode120, int fractional, enum hdmi_color_space cs,
+static void check(int chip, int mode120, int fractional, enum hdmi_color_space cs,
  enum hdmi_color_depth depth, enum hdmi_audio_fs rate, unsigned int expected,
  int source, enum hdmi_audio_type type) {
  struct hdmi_format_para p={{mode120 ? 296703 : 148352,mode120 ? 297000 : 148500},cs,depth};
- struct hdmitx_dev d={source,fractional,&p};
+ struct hdmitx_dev d={chip,source,fractional,&p};
  struct hdmitx_audpara a={type,rate};
  unsigned int n;
  for(n=0;n<7;n++) regs[n]=0xff;
@@ -82,8 +82,13 @@ int main(void) {
   if(cs==1 && depth>=2 && mode) n=family==0 ? 4096 : family==1 ? 6272 : 6144;
   if(cs==1 && depth==2 && !mode && frac && family==1) n=17836;
   if(cs==1 && depth==2 && !mode && frac && family==2) n=11648;
-  check(mode,frac,spaces[cs],depths[depth],rates[i],n*multiplier,source,types[type]);
-  ++cases;
+  unsigned int expected=n*multiplier;
+  check(MESON_CPU_ID_G12A,mode,frac,spaces[cs],depths[depth],rates[i],expected,source,types[type]);
+  if(mode && frac && source && types[type]==CT_PCM && rates[i]==FS_44K1 &&
+     (spaces[cs]==COLORSPACE_YUV422 || depths[depth]<=COLORDEPTH_30B))
+   expected=4460;
+  check(MESON_CPU_ID_G12B,mode,frac,spaces[cs],depths[depth],rates[i],expected,source,types[type]);
+  cases+=2;
  }
  assert(hdmi_get_aud_n_paras(FS_44K1,COLORDEPTH_24B,123456)==6272);
  assert(hdmi_get_aud_n_paras(FS_88K2,COLORDEPTH_24B,123456)==12544);
@@ -96,7 +101,10 @@ int main(void) {
 import re
 flag = re.search(r'^#define DTS_HD_MA[^\n]*', header, re.M)
 assert flag
-program = flag[0] + '\n' + enums + prelude + helpers.declaration(header, 'struct', 'hdmi_audio_fs_ncts')
+chip_header = (ROOT / 'include/linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h').read_text()
+chip_ids = re.findall(r'^#define MESON_CPU_ID_G12[AB]\s+\d+', chip_header, re.M)
+assert len(chip_ids) == 2
+program = '\n'.join(chip_ids) + '\n' + flag[0] + '\n' + enums + prelude + helpers.declaration(header, 'struct', 'hdmi_audio_fs_ncts')
 program += definitions + lookup + caller + main
 with tempfile.TemporaryDirectory() as temporary:
     source = Path(temporary) / 'acr.c'

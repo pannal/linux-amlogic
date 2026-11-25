@@ -2689,6 +2689,12 @@ static void set_aud_acr_pkt(struct hdmitx_dev *hdev,
 	else
 		aud_n_para = hdmi_get_aud_n_paras(audio_param->sample_rate,
 			hdev->para->cd, char_rate);
+	/* G12B 64-Fs PCM trial: auto CTS at N=4459 matched nominal N=4460. */
+	if (hdev->chip_type == MESON_CPU_ID_G12B && hdev->tx_aud_src &&
+	    audio_param->type == CT_PCM && audio_param->sample_rate == FS_44K1 &&
+	    char_rate == 296703 && aud_n_para == 4459)
+		aud_n_para = 4460;
+
 	pr_info(HW "aud_n_para = %d\n", aud_n_para);
 
 	/* ACR packet configuration */
