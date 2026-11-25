@@ -27,6 +27,7 @@
 #define __STMMAC_PLATFORM_DATA
 
 #include <linux/platform_device.h>
+struct phy_device;
 
 #define STMMAC_RX_COE_NONE	0
 #define STMMAC_RX_COE_TYPE1	1
@@ -132,6 +133,7 @@ struct plat_stmmacenet_data {
 	int tx_fifo_size;
 	int rx_fifo_size;
 	void (*fix_mac_speed)(void *priv, unsigned int speed);
+	int (*calibration_init)(void *priv, struct phy_device *phy);
 	void (*bus_setup)(void __iomem *ioaddr);
 	int (*init)(struct platform_device *pdev, void *priv);
 	void (*exit)(struct platform_device *pdev, void *priv);

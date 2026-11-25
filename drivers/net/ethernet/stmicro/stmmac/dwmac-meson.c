@@ -25,6 +25,9 @@
 #include "dwmac1000.h"
 #include "dwmac_dma.h"
 #include <linux/amlogic/cpu_version.h>
+#include <linux/rtnetlink.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #endif
 #include "stmmac_platform.h"
 
@@ -67,6 +70,21 @@ struct meson_dwmac {
 	void __iomem	*reg;
 #ifdef CONFIG_AMLOGIC_ETH_PRIVE
 	const struct meson_dwmac_data *data;
+	struct net_device *calibration_dev;
+	struct delayed_work calibration_timeout;
+	bool calibration_supported;
+	bool calibration_lease;
+	bool calibration_applied;
+	bool calibration_suspending;
+	unsigned long calibration_expires;
+	int calibration_error;
+	int calibration_index;
+	int calibration_accepted;
+	int calibration_interface;
+	u32 calibration_default_mc;
+	u32 calibration_default_delay;
+	u32 calibration_default_index;
+	u32 calibration_generation;
 #endif
 };
 
@@ -77,6 +95,14 @@ static void meson6_dwmac_fix_mac_speed(void *priv, unsigned int speed)
 	unsigned int val;
 
 	if ((dwmac->data->g12a_phy) && (!is_internal_phy)) {
+		if (dwmac->calibration_supported &&
+		    dwmac->calibration_index >= 0) {
+			val = dwmac->calibration_index >= 16 ? 0x1629 : 0x1621;
+			if (speed != SPEED_1000)
+				val &= ~BIT(3);
+			writel(val, dwmac->reg);
+			return;
+		}
 		if (!external_invert_flag)
 			return;
 		val = readl(dwmac->reg);
@@ -343,6 +369,277 @@ void __iomem *phy_analog_config_addr;
 u32 mc_val;
 u32 cali_val;
 void __iomem *REG_ETH_reg0_addr;
+
+static int meson_calibration_init(void *data, struct phy_device *phy)
+{
+	struct meson_dwmac *dwmac = data;
+	int page, rx, tx, ret;
+	u32 config, delay;
+
+	if (!dwmac->calibration_supported)
+		return 0;
+	dwmac->calibration_generation++;
+	dwmac->calibration_applied = false;
+	if (!phy || phy->phy_id != 0x001cc916 ||
+	    (int)phy->interface != dwmac->calibration_interface) {
+		ret = -ENODEV;
+		goto report;
+	}
+
+	mutex_lock(&phy->lock);
+	page = phy_read(phy, 0x1f);
+	if (page < 0) {
+		ret = page;
+		goto unlock;
+	}
+	ret = phy_write(phy, 0x1f, 0xd08);
+	if (ret < 0)
+		goto unlock;
+	rx = phy_read(phy, 0x15);
+	tx = phy_read(phy, 0x11);
+	ret = phy_write(phy, 0x1f, page);
+	if (ret < 0)
+		goto unlock;
+	if (rx < 0 || tx < 0) {
+		ret = rx < 0 ? rx : tx;
+		goto unlock;
+	}
+	if ((rx & BIT(3)) || (tx & BIT(8))) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+	config = dwmac->calibration_default_mc;
+	delay = dwmac->calibration_default_delay;
+	if (dwmac->calibration_index >= 0) {
+		config = dwmac->calibration_index >= 16 ? 0x1629 : 0x1621;
+		delay = (dwmac->calibration_index % 16) << 16;
+	}
+	writel(config, dwmac->reg);
+	writel(delay, dwmac->reg + REG_ETH_REG1_OFFSET);
+	dwmac->calibration_applied = true;
+	ret = 0;
+unlock:
+	mutex_unlock(&phy->lock);
+report:
+	dwmac->calibration_error = ret;
+	if (ret)
+		dev_err(dwmac->dev, "Ethernet calibration apply failed: %d\n", ret);
+	/* Unsupported calibration must not disable uncalibrated vendor networking. */
+	return dwmac->calibration_index < 0 ? 0 : ret;
+}
+
+/* ndo_stop/open quiesces DMA and reapplies timing after PHY initialization. */
+static int meson_calibration_switch(struct meson_dwmac *dwmac, int index)
+{
+	struct net_device *ndev = dwmac->calibration_dev;
+	bool running = netif_running(ndev);
+	int old = dwmac->calibration_index, ret;
+
+	if (running)
+		dev_close(ndev);
+	dwmac->calibration_index = index;
+	dwmac->calibration_applied = false;
+	if (!running)
+		return 0;
+	ret = dev_open(ndev);
+	if (!ret)
+		return 0;
+	dwmac->calibration_index = old;
+	if (dev_open(ndev))
+		dev_err(dwmac->dev, "Ethernet calibration rollback could not reopen interface\n");
+	return ret;
+}
+
+static int meson_calibration_restore(struct meson_dwmac *dwmac)
+{
+	int ret = meson_calibration_switch(dwmac, dwmac->calibration_accepted);
+
+	if (ret) {
+		/* A failed rollback must not leave an unverified scan candidate running. */
+		if (netif_running(dwmac->calibration_dev))
+			dev_close(dwmac->calibration_dev);
+		dwmac->calibration_index = dwmac->calibration_accepted;
+		dwmac->calibration_applied = false;
+		dwmac->calibration_error = ret;
+	}
+	return ret;
+}
+
+static void meson_calibration_expire(struct work_struct *work)
+{
+	struct meson_dwmac *dwmac = container_of(to_delayed_work(work),
+				struct meson_dwmac, calibration_timeout);
+	unsigned long now;
+	int ret;
+
+	rtnl_lock();
+	now = jiffies;
+	if (dwmac->calibration_lease) {
+		/* A running callback may have waited behind renewal or a new lease. */
+		if (time_before(now, dwmac->calibration_expires)) {
+			mod_delayed_work(system_wq, &dwmac->calibration_timeout,
+					 dwmac->calibration_expires - now);
+			goto unlock;
+		}
+		ret = meson_calibration_restore(dwmac);
+		dwmac->calibration_lease = false;
+		dev_warn(dwmac->dev, "Ethernet calibration lease expired, rollback: %d\n", ret);
+	}
+unlock:
+	rtnl_unlock();
+}
+
+static ssize_t ce_calibration_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct net_device *ndev = to_net_dev(dev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct meson_dwmac *dwmac = priv->plat->bsp_priv;
+	ssize_t count;
+
+	rtnl_lock();
+	count = scnprintf(buf, PAGE_SIZE,
+		"{\"abi\":1,\"backend\":\"am6b-rtl8211f-v1\","
+		"\"index\":%d,\"default_index\":%u,\"lease\":%s,\"applied\":%s,"
+		"\"error\":%d,\"generation\":%u}\n",
+		dwmac->calibration_index, dwmac->calibration_default_index,
+		dwmac->calibration_lease ? "true" : "false",
+		dwmac->calibration_applied ? "true" : "false",
+		dwmac->calibration_error, dwmac->calibration_generation);
+	rtnl_unlock();
+	return count;
+}
+
+static ssize_t ce_calibration_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct net_device *ndev = to_net_dev(dev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct meson_dwmac *dwmac = priv->plat->bsp_priv;
+	bool setting = !strncmp(buf, "set ", 4);
+	bool profile = !strncmp(buf, "profile ", 8);
+	int index = -1, ret = 0;
+
+	if ((setting || profile) &&
+	    kstrtoint(buf + (setting ? 4 : 8), 10, &index))
+		return -EINVAL;
+	rtnl_lock();
+	if (dwmac->calibration_suspending) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (sysfs_streq(buf, "begin")) {
+		if (dwmac->calibration_lease) {
+			ret = -EBUSY;
+			goto out;
+		}
+		dwmac->calibration_accepted = dwmac->calibration_index;
+		dwmac->calibration_lease = true;
+	} else if (sysfs_streq(buf, "keepalive")) {
+		if (!dwmac->calibration_lease)
+			ret = -EINVAL;
+	} else if (setting || profile) {
+		if (index < 0 || index > 31 ||
+		    (setting && !dwmac->calibration_lease) ||
+		    (profile && dwmac->calibration_lease)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = meson_calibration_switch(dwmac, index);
+		if (!ret && profile)
+			dwmac->calibration_accepted = index;
+	} else if (sysfs_streq(buf, "accept")) {
+		if (!dwmac->calibration_lease || !dwmac->calibration_applied) {
+			ret = -EINVAL;
+			goto out;
+		}
+		dwmac->calibration_accepted = dwmac->calibration_index;
+		dwmac->calibration_lease = false;
+	} else if (sysfs_streq(buf, "restore")) {
+		if (!dwmac->calibration_lease) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = meson_calibration_restore(dwmac);
+		dwmac->calibration_lease = false;
+	} else if (sysfs_streq(buf, "default")) {
+		if (dwmac->calibration_lease) {
+			ret = -EBUSY;
+			goto out;
+		}
+		ret = meson_calibration_switch(dwmac, -1);
+		if (!ret)
+			dwmac->calibration_accepted = -1;
+	} else {
+		ret = -EINVAL;
+	}
+	if (!ret && dwmac->calibration_lease) {
+		dwmac->calibration_expires = jiffies + 10 * HZ;
+		mod_delayed_work(system_wq, &dwmac->calibration_timeout, 10 * HZ);
+	} else if (!dwmac->calibration_lease)
+		cancel_delayed_work(&dwmac->calibration_timeout);
+out:
+	rtnl_unlock();
+	return ret ? ret : count;
+}
+static DEVICE_ATTR(ce_calibration, 0600, ce_calibration_show, ce_calibration_store);
+
+static void meson_calibration_register(struct meson_dwmac *dwmac,
+				       struct platform_device *pdev)
+{
+	struct net_device *ndev = platform_get_drvdata(pdev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct phy_device *phy;
+	struct device_node *root;
+	struct resource *res;
+	const char *model, *dt_id;
+	u32 index;
+	bool match, legacy_mode;
+
+	if (!dwmac->data->g12a_phy || is_internal_phy || !dwmac->reg ||
+	    !priv->mii || priv->plat->phy_addr < 0)
+		return;
+	/* This board's vendor DT omits phy-mode; retain its legacy representation. */
+	legacy_mode = priv->plat->interface < 0 &&
+		!of_find_property(pdev->dev.of_node, "phy-mode", NULL) &&
+		!of_find_property(pdev->dev.of_node, "phy-connection-type", NULL);
+	if (priv->plat->interface != PHY_INTERFACE_MODE_RGMII && !legacy_mode)
+		return;
+	root = of_find_node_by_path("/");
+	if (!root)
+		return;
+	match = (of_device_is_compatible(root, "amlogic, g12b") ||
+		 of_device_is_compatible(root, "amlogic,g12b")) &&
+		!of_property_read_string(root, "model", &model) &&
+		!strcmp(model, "UGOOS AM6B") &&
+		!of_property_read_string(root, "amlogic-dt-id", &dt_id) &&
+		!strcmp(dt_id, "g12b_AM6b_b4g");
+	of_node_put(root);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eth_cfg");
+	phy = mdiobus_get_phy(priv->mii, priv->plat->phy_addr);
+	if (!match || !res || res->start != 0xff634540 ||
+	    resource_size(res) < 8 || !phy || phy->phy_id != 0x001cc916 ||
+	    of_property_read_u32(pdev->dev.of_node, "auto_cali_idx", &index) ||
+	    index > 31)
+		return;
+	dwmac->calibration_dev = ndev;
+	dwmac->calibration_default_mc = readl(dwmac->reg);
+	dwmac->calibration_default_delay = readl(dwmac->reg + REG_ETH_REG1_OFFSET);
+	dwmac->calibration_default_index = index;
+	dwmac->calibration_interface = priv->plat->interface;
+	dwmac->calibration_index = -1;
+	dwmac->calibration_accepted = -1;
+	dwmac->calibration_supported = true;
+	INIT_DELAYED_WORK(&dwmac->calibration_timeout, meson_calibration_expire);
+	priv->plat->calibration_init = meson_calibration_init;
+	if (device_create_file(&ndev->dev, &dev_attr_ce_calibration)) {
+		priv->plat->calibration_init = NULL;
+		dwmac->calibration_supported = false;
+		dev_err(&pdev->dev, "Unable to expose Ethernet calibration backend\n");
+	}
+}
+
 static void __iomem *g12a_network_interface_setup(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -538,10 +835,20 @@ static int dwmac_meson_recover_analog(struct device *dev)
 static int meson6_dwmac_suspend(struct device *dev)
 {
 	int ret;
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct meson_dwmac *dwmac = priv->plat->bsp_priv;
 	/*shudown internal phy analog*/
 	struct pinctrl *pin_ctrl;
 	struct pinctrl_state *turnoff_tes = NULL;
 
+	rtnl_lock();
+	if (dwmac->calibration_lease) {
+		rtnl_unlock();
+		return -EBUSY;
+	}
+	dwmac->calibration_suspending = true;
+	rtnl_unlock();
 	/*shudown internal phy analog*/
 	pr_info("suspend inter = %d\n", is_internal_phy);
 	if ((is_internal_phy) && (support_mac_wol == 0)) {
@@ -564,12 +871,20 @@ static int meson6_dwmac_suspend(struct device *dev)
 		dwmac_meson_disable_analog(dev);
 	}
 	ret = stmmac_pltfr_suspend(dev);
+	if (ret) {
+		rtnl_lock();
+		dwmac->calibration_suspending = false;
+		rtnl_unlock();
+	}
 
 	return ret;
 }
 static int meson6_dwmac_resume(struct device *dev)
 {
 	int ret;
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct meson_dwmac *dwmac = priv->plat->bsp_priv;
 	struct pinctrl *pin_ctrl;
 	struct pinctrl_state *turnon_tes = NULL;
 	pr_info("resuem inter = %d\n", is_internal_phy);
@@ -609,6 +924,9 @@ static int meson6_dwmac_resume(struct device *dev)
 		}
 	}
 	ret = stmmac_pltfr_resume(dev);
+	rtnl_lock();
+	dwmac->calibration_suspending = false;
+	rtnl_unlock();
 	return ret;
 }
 EXPORT_SYMBOL_GPL(meson6_dwmac_resume);
@@ -673,6 +991,7 @@ static int meson6_dwmac_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto err_remove_config_dt;
 	}
+	dwmac->dev = &pdev->dev;
 
 #ifdef CONFIG_AMLOGIC_ETH_PRIVE
 	dwmac->data = (const struct meson_dwmac_data *)
@@ -703,6 +1022,9 @@ static int meson6_dwmac_probe(struct platform_device *pdev)
 	ret = stmmac_dvr_probe(&pdev->dev, plat_dat, &stmmac_res);
 	if (ret)
 		goto err_remove_config_dt;
+#ifdef CONFIG_AMLOGIC_ETH_PRIVE
+	meson_calibration_register(dwmac, pdev);
+#endif
 	if (support_mac_wol)
 		device_init_wakeup(&pdev->dev, 1);
 	return 0;
@@ -711,6 +1033,21 @@ err_remove_config_dt:
 	stmmac_remove_config_dt(pdev, plat_dat);
 
 	return ret;
+}
+
+static int meson6_dwmac_remove(struct platform_device *pdev)
+{
+#ifdef CONFIG_AMLOGIC_ETH_PRIVE
+	struct net_device *ndev = platform_get_drvdata(pdev);
+	struct stmmac_priv *priv = netdev_priv(ndev);
+	struct meson_dwmac *dwmac = priv->plat->bsp_priv;
+
+	if (dwmac->calibration_supported) {
+		device_remove_file(&ndev->dev, &dev_attr_ce_calibration);
+		cancel_delayed_work_sync(&dwmac->calibration_timeout);
+	}
+#endif
+	return stmmac_pltfr_remove(pdev);
 }
 
 #ifdef CONFIG_AMLOGIC_ETH_PRIVE
@@ -750,7 +1087,7 @@ SIMPLE_DEV_PM_OPS(stmmac_pltfr_pm_ops, meson6_dwmac_suspend,
 #endif
 static struct platform_driver meson6_dwmac_driver = {
 	.probe  = meson6_dwmac_probe,
-	.remove = stmmac_pltfr_remove,
+	.remove = meson6_dwmac_remove,
 #ifdef CONFIG_AMLOGIC_ETH_PRIVE
 	.shutdown = meson6_dwmac_shutdown,
 #endif
