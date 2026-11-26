@@ -34,7 +34,7 @@ preamble = r'''
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
-enum { COLORSPACE_RGB444, COLORSPACE_YUV422, COLORSPACE_YUV444, COLORSPACE_YUV420 };
+enum hdmi_color_space { COLORSPACE_RGB444, COLORSPACE_YUV422, COLORSPACE_YUV444, COLORSPACE_YUV420 };
 enum { COLORDEPTH_24B=4, COLORDEPTH_30B, COLORDEPTH_36B, COLORDEPTH_48B };
 enum { COLORRANGE_LIM, COLORRANGE_FUL };
 struct parse_cd { int cd; const char *name; };
@@ -44,7 +44,12 @@ struct hdmi_format_para { int cs, cd, cr; };
 struct device { int unused; };
 struct device_attribute { int unused; };
 static struct hdmi_format_para para;
-static struct { char fmt_attr[16]; struct hdmi_format_para *para; } hdmitx_device = { .para=&para };
+#define BIT(n) (1U << (n))
+enum { HDMI_Unknown = 0, HDMITX_VIC420_OFFSET = 0x100, HDMITX_VIC420_FAKE_OFFSET = 0x200 };
+struct hdmitx_dev { char fmt_attr[16]; struct hdmi_format_para *para;
+    int ready, edid_parsing, cur_VIC; struct { unsigned native_Mode; } rxcap; };
+static bool hdmitx_native_dv_tunnel(const struct hdmitx_dev *dev) { return false; }
+static struct hdmitx_dev hdmitx_device = { .para=&para };
 static int setclk_mutex, lock_depth, modesets, checks, failures;
 static int output_cs, output_cd;
 static char applied_attr[16];
@@ -130,6 +135,21 @@ int main(void) {
     write_attr("444,12bit,limit,xxxxxxxxxxxxxxxx");
     CHECK(hdmitx_device.fmt_attr[15] == '\0');
     CHECK(para.cs == COLORSPACE_YUV444);
+    /* Changing a preference without modesetting must preserve constrained scanout. */
+    hdmitx_device.ready = hdmitx_device.edid_parsing = 1;
+    hdmitx_device.cur_VIC = HDMITX_VIC420_OFFSET + 102;
+    hdmitx_device.rxcap.native_Mode = BIT(4);
+    para.cs = COLORSPACE_YUV420;
+    write_attr(",422,12bit");
+    CHECK(para.cs == COLORSPACE_YUV420 && !strcmp(hdmitx_device.fmt_attr, ",422,12bit"));
+    hdmitx_device.cur_VIC = 16;
+    hdmitx_device.rxcap.native_Mode = 0;
+    para.cs = COLORSPACE_RGB444;
+    write_attr(",422,12bit");
+    CHECK(para.cs == COLORSPACE_RGB444);
+    hdmitx_device.rxcap.native_Mode = BIT(4);
+    write_attr(",422,12bit");
+    CHECK(para.cs == COLORSPACE_YUV422);
     printf("%d attribute checks, %d failures\n", checks, failures);
     return failures != 0;
 }

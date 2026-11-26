@@ -99,7 +99,7 @@ static void hdmitx_fmt_attr(struct hdmitx_dev *hdev);
 static void clear_rx_vinfo(struct hdmitx_dev *hdev);
 static void edidinfo_attach_to_vinfo(struct hdmitx_dev *hdev);
 static void edidinfo_detach_to_vinfo(struct hdmitx_dev *hdev);
-static bool is_cur_tmds_div40(struct hdmitx_dev *hdev);
+static bool is_cur_tmds_div40(struct hdmitx_dev *hdev, bool programmed);
 static void hdmitx_resend_div40(struct hdmitx_dev *hdev);
 static unsigned int hdmitx_get_frame_duration(void);
 
@@ -475,6 +475,96 @@ int get_cur_vout_index(void)
 	return vout_index;
 }
 
+static bool hdmitx_native_dv_tunnel(const struct hdmitx_dev *hdev)
+{
+	return !xbmc_dv_non_ipt &&
+		(hdev->hdmi_current_eotf_type == EOTF_T_DOLBYVISION ||
+		 hdev->hdmi_current_eotf_type == EOTF_T_LL_MODE ||
+		 hdev->hdmi_current_eotf_type == EOTF_T_DV_AHEAD);
+}
+
+/* A Y420VDB advertises only the offset VIC. A capability map adds the
+ * offset VIC alongside the normal one. dc_cap alone cannot tell them apart.
+ * Keep fmt_attr as the user's preference for the next timing or receiver.
+ */
+static enum hdmi_vic hdmitx_apply_edid_color(struct hdmitx_dev *hdev,
+					    enum hdmi_vic vic)
+{
+	const struct rx_cap *rx = &hdev->rxcap;
+	struct hdmi_format_para *p = hdev->para, *target;
+	enum hdmi_vic base = vic & HDMITX_VIC_MASK;
+	enum hdmi_vic y420 = base + HDMITX_VIC420_OFFSET;
+	enum hdmi_color_depth depth = p->cd;
+	enum hdmi_color_space cs = p->cs;
+	enum hdmi_vic output;
+	unsigned int max_khz, pixel_khz, i;
+	bool has_base = false, has_420 = false, can_422;
+
+	if (!hdev->edid_parsing || vic == HDMI_Unknown ||
+	    vic >= HDMITX_VIC420_FAKE_OFFSET)
+		return vic;
+
+	for (i = 0; i < rx->VIC_count && i < VIC_MAX_NUM; i++) {
+		if (rx->VIC[i] == base)
+			has_base = true;
+		if (rx->VIC[i] == y420)
+			has_420 = true;
+	}
+	if (!has_base && !has_420)
+		return vic;
+
+	pixel_khz = p->tmds_clk;
+	max_khz = (rx->Max_TMDS_Clock2 ? rx->Max_TMDS_Clock2 :
+		   rx->Max_TMDS_Clock1) * 5000;
+	can_422 = has_base && (rx->native_Mode & BIT(4)) &&
+		  (!max_khz || pixel_khz <= max_khz);
+
+	/* A retained 420 suffix can belong to the previous sink. Re-evaluate
+	 * an explicit 422 preference against this receiver at this timing.
+	 */
+	if (vic == y420 && can_422 && strstr(hdev->fmt_attr, "422"))
+		cs = COLORSPACE_YUV422;
+
+	if (has_420 && (!has_base || cs == COLORSPACE_YUV420 ||
+			(cs == COLORSPACE_YUV422 && !can_422))) {
+		output = y420;
+		cs = COLORSPACE_YUV420;
+		/* The TX PLL supports 8/10/12 bpc. TMDS = pixel clock * bpc / 16. */
+		if (!strstr(hdev->fmt_attr, "bit"))
+			depth = COLORDEPTH_36B;
+		if (depth >= COLORDEPTH_36B && rx->dc_36bit_420 &&
+		    pixel_khz * 3 <= max_khz * 4)
+			depth = COLORDEPTH_36B;
+		else if (depth >= COLORDEPTH_30B && rx->dc_30bit_420 &&
+			 pixel_khz * 5 <= max_khz * 8)
+			depth = COLORDEPTH_30B;
+		else
+			depth = COLORDEPTH_24B;
+	} else {
+		output = base;
+		/* A new receiver may only advertise the base VIC while the
+		 * active timing still has the previous receiver's 420 suffix.
+		 */
+		if (cs == COLORSPACE_YUV420)
+			cs = can_422 ? COLORSPACE_YUV422 : COLORSPACE_RGB444;
+		if (cs == COLORSPACE_YUV422 && !(rx->native_Mode & BIT(4)))
+			cs = COLORSPACE_RGB444;
+		if (cs == COLORSPACE_RGB444 && cs != p->cs)
+			depth = COLORDEPTH_24B;
+	}
+
+	if (vic == output && p->vic == output && p->cs == cs && p->cd == depth)
+		return vic;
+	target = hdmi_get_fmt_paras(output);
+	if (target->vic != output)
+		return vic;
+	target->cr = p->cr;
+	target->cs = cs;
+	target->cd = depth;
+	hdev->para = target;
+	return output;
+}
+
 static  int  set_disp_mode(const char *mode)
 {
 	int ret =  -1;
@@ -503,6 +593,8 @@ static  int  set_disp_mode(const char *mode)
 		vic = HDMI_1080p50;
 
 	hdmitx_device.cur_VIC = HDMI_Unknown;
+	if (!hdmitx_native_dv_tunnel(hdev))
+		vic = hdmitx_apply_edid_color(hdev, vic);
 	ret = hdmitx_set_display(&hdmitx_device, vic);
 	if (ret >= 0) {
 		hdmitx_device.hwop.cntl(&hdmitx_device,
@@ -877,6 +969,11 @@ static int set_disp_mode_auto_locked(void)
 		para->cd = COLORDEPTH_36B;
 	}
 
+	if (!hdmitx_native_dv_tunnel(hdev)) {
+		vic = hdmitx_apply_edid_color(hdev, vic);
+		para = hdev->para;
+	}
+
 	pr_info("set_disp_mode_auto - cd [%d] cs [%s]\n",
 		colour_depths[para->cd - COLORDEPTH_24B], colour_sampling[para->cs]);
 
@@ -985,6 +1082,7 @@ ssize_t store_attr(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	char *now;
+	enum hdmi_color_space active_cs;
 
 	mutex_lock(&setclk_mutex);
 	/* A refresh must not discard the explicit colour/depth selection. */
@@ -993,6 +1091,7 @@ ssize_t store_attr(struct device *dev,
 		goto out;
 	}
 
+	active_cs = hdmitx_device.para->cs;
 	strncpy(hdmitx_device.fmt_attr, buf, sizeof(hdmitx_device.fmt_attr));
 	hdmitx_device.fmt_attr[15] = '\0';
 	if (strstr(hdmitx_device.fmt_attr, "rgb"))
@@ -1005,6 +1104,20 @@ ssize_t store_attr(struct device *dev,
 		hdmitx_device.para->cs = COLORSPACE_YUV420;
 	else
 		hdmitx_device.para->cs = COLORSPACE_YUV422;
+
+	/* attr is also written without a modeset. Keep the effective colour
+	 * for consumers such as audio ACR until the new timing is applied.
+	 */
+	if (hdmitx_device.ready && hdmitx_device.edid_parsing &&
+	    hdmitx_device.cur_VIC != HDMI_Unknown &&
+	    hdmitx_device.cur_VIC < HDMITX_VIC420_FAKE_OFFSET &&
+	    !hdmitx_native_dv_tunnel(&hdmitx_device)) {
+		if (hdmitx_device.cur_VIC >= HDMITX_VIC420_OFFSET)
+			hdmitx_device.para->cs = COLORSPACE_YUV420;
+		else if (hdmitx_device.para->cs == COLORSPACE_YUV422 &&
+			 !(hdmitx_device.rxcap.native_Mode & BIT(4)))
+			hdmitx_device.para->cs = active_cs;
+	}
 
 	now = strstr(hdmitx_device.fmt_attr, "now");
 	if (now) {
@@ -1952,7 +2065,7 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 }
 
-void update_current_para(struct hdmitx_dev *hdev)
+static void hdmitx_read_current_para(struct hdmitx_dev *hdev, bool ordinary)
 {
 	struct vinfo_s *info = NULL;
 	unsigned char mode[32];
@@ -1968,6 +2081,19 @@ void update_current_para(struct hdmitx_dev *hdev)
 			strncat(mode, "420", 3);
 	}
 	hdev->para = hdmi_get_fmt_name(mode, hdev->fmt_attr);
+	if (ordinary) {
+		if (xbmc_aml_linux_force_422) {
+			hdev->para->cs = COLORSPACE_YUV422;
+			hdev->para->cd = COLORDEPTH_36B;
+		}
+		hdmitx_apply_edid_color(hdev, hdmitx_edid_vic_tab_map_vic(mode));
+	}
+}
+
+/* Restore the ordinary HDMI format when leaving a Dolby Vision tunnel. */
+void update_current_para(struct hdmitx_dev *hdev)
+{
+	hdmitx_read_current_para(hdev, true);
 }
 
 /* A reconnect must use the newly read sink capabilities. */
@@ -5879,7 +6005,8 @@ static int hdmitx_set_current_vmode(enum vmode_e mode)
 		set_disp_mode_auto();
 	else {
 		pr_info("alread display in uboot\n");
-		update_current_para(&hdmitx_device);
+		hdmitx_read_current_para(&hdmitx_device,
+			!hdmitx_native_dv_tunnel(&hdmitx_device));
 		edidinfo_attach_to_vinfo(&hdmitx_device);
 	}
 	return 0;
@@ -6416,7 +6543,7 @@ static void hdmitx_hpd_plugin_handler(struct work_struct *work)
 		 * TV, packets may not be cleared. pkt sending will
 		 * be callbacked later after vinfo attached.
 		 */
-		if (is_cur_tmds_div40(hdev))
+		if (is_cur_tmds_div40(hdev, true))
 			hdmitx_resend_div40(hdev);
 		if (!is_tv_changed()) {
 			hdev->hwop.cntlmisc(hdev, MISC_AVMUTE_OP,
@@ -6578,7 +6705,7 @@ int tv_audio_support(int type, struct rx_cap *prxcap)
 	return audio_check;
 }
 
-static bool is_cur_tmds_div40(struct hdmitx_dev *hdev)
+static bool is_cur_tmds_div40(struct hdmitx_dev *hdev, bool programmed)
 {
 	struct hdmi_format_para *para1 = NULL;
 	struct hdmi_format_para *para2 = NULL;
@@ -6595,6 +6722,10 @@ static bool is_cur_tmds_div40(struct hdmitx_dev *hdev)
 		return 0;
 	}
 	pr_info("hdmitx: mode name %s\n", para1->name);
+	if (programmed && hdev->cur_VIC >= HDMITX_VIC420_OFFSET &&
+	    hdev->cur_VIC < HDMITX_VIC420_FAKE_OFFSET &&
+	    !hdmitx_native_dv_tunnel(hdev))
+		return hdev->div40;
 	para2 = hdmi_tst_fmt_name(para1->name, hdev->fmt_attr);
 	if (!para2) {
 		pr_info("%s[%d]\n", __func__, __LINE__);
@@ -6675,6 +6806,12 @@ static int hdmi_task_handle(void *data)
 
 	hdmitx_device->tx_aud_cfg = 1; /* default audio configure is on */
 
+	/* Initialise the cached colour before an HPD worker can program the link. */
+	info = hdmitx_get_current_vinfo();
+	if (info && info->name && info->mode == VMODE_HDMI)
+		hdmitx_read_current_para(hdmitx_device,
+					!hdmitx_native_dv_tunnel(hdmitx_device));
+
 	/*Direct Rander Management use another irq*/
 	if (hdmitx_device->drm_feature == 0)
 		hdmitx_device->hwop.setupirq(hdmitx_device);
@@ -6685,7 +6822,7 @@ static int hdmi_task_handle(void *data)
 		/* When bootup mbox and TV simutanously,
 		 * TV may not handle SCDC/DIV40
 		 */
-		if (is_cur_tmds_div40(hdmitx_device))
+		if (is_cur_tmds_div40(hdmitx_device, false))
 			hdmitx_resend_div40(hdmitx_device);
 		hdmitx_device->hwop.cntlmisc(hdmitx_device,
 			MISC_TRIGGER_HPD, 1);
@@ -6699,12 +6836,6 @@ static int hdmi_task_handle(void *data)
 	}
 
 	hdmitx_device->hdmi_init = 1;
-	info = hdmitx_get_current_vinfo();
-	if (!info || !info->name)
-		return 0;
-	if (info->mode == VMODE_HDMI)
-		hdmitx_device->para = hdmi_get_fmt_name(info->name,
-			hdmitx_device->fmt_attr);
 
 	return 0;
 }
