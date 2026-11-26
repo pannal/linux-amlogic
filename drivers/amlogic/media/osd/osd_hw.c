@@ -9403,7 +9403,7 @@ static void set_blend_reg(struct layer_blend_reg_s *blend_reg)
 	}
 
 	dv_core2_vsize = (blend_reg->osd_blend_blend0_size >> 16) & 0xfff;
-	dv_core2_hsize = blend_reg->osd_blend_blend0_size & 0xfff;
+	dv_core2_hsize = blend_reg->osd_blend_blend0_size & 0x1fff;
 
 	if (osd_hw.osd_meson_dev.has_dolby_vision) {
 		VSYNCOSD_WR_MPEG_REG(
