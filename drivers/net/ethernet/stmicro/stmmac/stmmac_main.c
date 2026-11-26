@@ -1889,6 +1889,13 @@ static int stmmac_open(struct net_device *dev)
 		}
 	}
 
+	if (priv->plat->calibration_init) {
+		ret = priv->plat->calibration_init(priv->plat->bsp_priv,
+						 priv->phydev);
+		if (ret)
+			goto dma_desc_error;
+	}
+
 	/* Extra statistics */
 	memset(&priv->xstats, 0, sizeof(struct stmmac_extra_stats));
 	priv->xstats.threshold = tc;
@@ -3824,6 +3831,15 @@ int stmmac_resume(struct device *dev)
 		phy_start(priv->phydev);
 
 #ifdef CONFIG_AMLOGIC_ETH_PRIVE
+	if (priv->plat->calibration_init) {
+		int ret;
+
+		rtnl_lock();
+		dev_close(ndev);
+		ret = dev_open(ndev);
+		rtnl_unlock();
+		return ret;
+	}
 	stmmac_release(ndev);
 	stmmac_open(ndev);
 #endif
