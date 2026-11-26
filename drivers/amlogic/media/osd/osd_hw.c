@@ -6077,6 +6077,7 @@ static void osd_update_disp_freescale_enable(u32 index)
 	u32 data32 = 0x0;
 	u32 shift_workaround = 0;
 	u32 output_index = 0;
+	bool bypass_filters;
 
 	if (osd_hw.osd_meson_dev.osd_ver != OSD_HIGH_ONE)
 		osd_reg = &hw_osd_reg_array[0];
@@ -6117,6 +6118,21 @@ static void osd_update_disp_freescale_enable(u32 index)
 		osd_hw.free_dst_data[index].x_start + 1;
 	dst_h = osd_hw.free_dst_data[index].y_end -
 		osd_hw.free_dst_data[index].y_start + 1;
+	/*
+	 * A native SMPTE GUI needs no filtering across its 4096-pixel row.
+	 * Keep the scaler path and its output window active on G12B rev B.
+	 * Disabling free_scale also changes how the OSD is positioned.
+	 */
+	bypass_filters = index == OSD1 && src_w == 4096 && src_h == 2160 &&
+		osd_hw.hwc_enable[VIU1] && osd_hw.osd_display_fb[VIU1] &&
+		osd_hw.osd_meson_dev.cpu_id == __MESON_CPU_MAJOR_ID_G12B &&
+		is_meson_rev_b() && !is_scaler_interlaced(index) &&
+		osd_hw.vinfo_width[VIU1] == 4096 &&
+		osd_hw.vinfo_height[VIU1] == 2160 &&
+		dst_w == src_w && dst_h == src_h &&
+		!osd_hw.free_dst_data[index].x_start &&
+		!osd_hw.free_dst_data[index].y_start;
+
 	/* config osd sc control reg */
 	data32 = 0x0;
 	if (osd_hw.free_scale_enable[index]) {
@@ -6228,7 +6244,8 @@ static void osd_update_disp_freescale_enable(u32 index)
 				| (1 << 23);
 		if (osd_hw.scale_workaround == SC_4K2K)
 			data32 |= 1 << 21;
-		data32 |= 1 << 24;
+		if (!bypass_filters)
+			data32 |= 1 << 24;
 		if (osd_hw.osd_meson_dev.cpu_id >=
 			__MESON_CPU_MAJOR_ID_G12B)
 			data32 |= 1 << 25;
@@ -6239,7 +6256,8 @@ static void osd_update_disp_freescale_enable(u32 index)
 		data32 |= (hf_bank_len & 0x7)
 			| ((hsc_ini_rcv_num & 0xf) << 3)
 			| ((hsc_ini_rpt_p0_num & 0x3) << 8);
-		data32 |= 1 << 22;
+		if (!bypass_filters)
+			data32 |= 1 << 22;
 	}
 	VSYNCOSD_WR_MPEG_REG(osd_reg->osd_hsc_ctrl0, data32);
 
