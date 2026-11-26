@@ -181,17 +181,26 @@ static int __init get_logo_height(char *str)
 	return 0;
 }
 
-int set_osd_logo_freescaler(void)
+/* The mode notifier directs a dual boot logo to the first VIU. */
+static int logo_scaler_plane(void)
+{
+	if (osd_hw.osd_meson_dev.has_viu2 &&
+	    logo_info.index >= LOGO_DEV_VIU2_OSD0)
+		return LOGO_DEV_OSD0;
+	return logo_info.index;
+}
+
+static int reset_logo_freescaler(void)
 {
 	const struct vinfo_s *vinfo;
-	u32 index = logo_info.index;
+	u32 index = logo_scaler_plane();
 	s32 src_x_start = 0, src_x_end = 0;
 	s32 src_y_start = 0, src_y_end = 0;
 	s32 dst_x_start = 0, dst_x_end = 0;
 	s32 dst_y_start = 0, dst_y_end = 0;
 	s32 target_x_end = 0, target_y_end = 0;
 
-	if (logo_info.loaded == 0 || logo_info.index < 0)
+	if (!get_logo_loaded() || logo_info.index < 0)
 		return 0;
 
 	if (osd_get_logo_index() != logo_info.index) {
@@ -199,16 +208,8 @@ int set_osd_logo_freescaler(void)
 		return -1;
 	}
 
-	if ((osd_hw.osd_meson_dev.osd_ver == OSD_SIMPLE) && (index >= 1))
+	if ((osd_hw.osd_meson_dev.osd_ver == OSD_SIMPLE) && (logo_info.index >= 1))
 		return -1;
-
-	/* for dual logo,
-	 * if viu1 interface(such as hdmi) is unplugged when booting.
-	 * the viu2 display device will be used for viu1 after booting.
-	 */
-	if (osd_hw.osd_meson_dev.has_viu2)
-		if (index >= LOGO_DEV_VIU2_OSD0)
-			index = LOGO_DEV_OSD0;
 
 	if (osd_get_position_from_reg(
 		index,
@@ -259,14 +260,35 @@ int set_osd_logo_freescaler(void)
 	return 0;
 }
 
+int set_osd_logo_freescaler(void)
+{
+	int ret;
+
+	mutex_lock(&logo_lock);
+	ret = reset_logo_freescaler();
+	mutex_unlock(&logo_lock);
+	return ret;
+}
+
+void osd_logo_plane_takeover(u32 index)
+{
+	/* Finish any boot-logo modeset before fbdev programs its own geometry. */
+	mutex_lock(&logo_lock);
+	if (get_logo_loaded() && logo_scaler_plane() == index) {
+		set_logo_loaded();
+		pr_info("fb%u took over the boot logo plane\n", index);
+	}
+	mutex_unlock(&logo_lock);
+}
+
 int get_logo_loaded(void)
 {
-	return logo_info.loaded;
+	return READ_ONCE(logo_info.loaded);
 }
 
 void set_logo_loaded(void)
 {
-	logo_info.loaded = 0;
+	WRITE_ONCE(logo_info.loaded, 0);
 }
 
 __setup("logo=", logo_setup);

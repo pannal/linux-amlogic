@@ -422,6 +422,7 @@ size_t osd_canvas_align(size_t x)
 static void osddev_setup(struct osd_fb_dev_s *fbdev)
 {
 	if (fbdev->fb_mem_paddr) {
+		osd_logo_plane_takeover(fbdev->fb_info->node);
 		mutex_lock(&fbdev->lock);
 		osd_setup_hw(fbdev->fb_info->node,
 			     &fbdev->osd_ctl,
