@@ -33,6 +33,15 @@ static enum signal_format_enum dv_mode_dst_format(void)
 	return FORMAT_SDR;
 }
 
+/* Sources the VS10 SDR route hands to the newer library: DV without a native
+ * RPU (Kodi's HDR10+ conversion) and the non-DV formats. Everything else
+ * (MVC, CUVA, SDR_2020) stays on legacy. */
+static bool dv_new_vs10_src(enum signal_format_enum src)
+{
+	return src == FORMAT_DOVI || src == FORMAT_DOVI_LL || src == FORMAT_SDR ||
+		src == FORMAT_HDR10 || src == FORMAT_HLG || src == FORMAT_HDR10PLUS;
+}
+
 /* Both numerator and denominator must be known; never truncate 50.x to 50. */
 static bool dv_new_route(enum signal_format_enum src,
 			 enum signal_format_enum dst, const struct vinfo_s *vinfo)
@@ -42,10 +51,13 @@ static bool dv_new_route(enum signal_format_enum src,
 		!(READ_ONCE(dv_new_signal_range) == -1 &&
 		  READ_ONCE(dolby_vision_signal_range) == SIGNAL_RANGE_SDI) &&
 		READ_ONCE(dv_new_backend_available) &&
-		READ_ONCE(xbmc_dv_source_native) && is_meson_g12b_cpu() &&
-		(src == FORMAT_DOVI || src == FORMAT_DOVI_LL) &&
-		(dst == FORMAT_DOVI ||
-		 (dst == FORMAT_SDR && READ_ONCE(xbmc_dv_new_sdr_route))) &&
+		is_meson_g12b_cpu() &&
+		(((READ_ONCE(xbmc_dv_source_native) &&
+		   (src == FORMAT_DOVI || src == FORMAT_DOVI_LL) &&
+		   (dst == FORMAT_DOVI ||
+		    (dst == FORMAT_SDR && READ_ONCE(xbmc_dv_new_sdr_route))))) ||
+		 (dst == FORMAT_SDR && READ_ONCE(xbmc_dv_new_sdr_route) &&
+		  READ_ONCE(xbmc_dv_new_vs10_route) && dv_new_vs10_src(src))) &&
 		READ_ONCE(xbmc_dv_vp) == 0 &&
 		vinfo && vinfo->width && vinfo->height &&
 		vinfo->width <= 16384 && vinfo->height <= 16384 &&
@@ -110,6 +122,105 @@ static bool dv_new_metadata_valid(const char *md, int size)
 		count++;
 	}
 	return count == (u8)md[ETSI_META_OFFSET - 1];
+}
+
+/* Zero min_pq in every L1 block. Parsed layout: be32 length, level byte, then
+ * min/max/avg_pq as be16 each (an HDR10+ -> DV RPU reads 003e 0821 0333 =
+ * 62/2081/819). The block walk was validated by dv_new_metadata_valid(). */
+static int dv_new_zero_l1_min(char *md, int size)
+{
+	u8 *p, *end;
+	int old = -1;
+
+	if (size < ETSI_META_OFFSET || size > DV5_MD_CAPACITY)
+		return old;
+	p = (u8 *)md + ETSI_META_OFFSET;
+	end = (u8 *)md + size;
+	while (end - p >= 5) {
+		u32 len = get_unaligned_be32(p);
+
+		if (len > end - p - 5)
+			return old;
+		if (p[4] == 1 && len >= 2) {
+			if (old < 0)
+				old = get_unaligned_be16(p + 5);
+			p[5] = 0;
+			p[6] = 0;
+		}
+		p += len + 5;
+	}
+	return old;
+}
+
+/* Overwrite min/max/avg_pq in every L1 block (same layout as above). Returns
+ * the old max_pq of the first L1 block, -1 when there is none. */
+static int dv_new_set_l1(char *md, int size, u16 min, u16 avg, u16 max)
+{
+	u8 *p, *end;
+	int old = -1;
+
+	if (size < ETSI_META_OFFSET || size > DV5_MD_CAPACITY)
+		return old;
+	p = (u8 *)md + ETSI_META_OFFSET;
+	end = (u8 *)md + size;
+	while (end - p >= 5) {
+		u32 len = get_unaligned_be32(p);
+
+		if (len > end - p - 5)
+			return old;
+		if (p[4] == 1 && len >= 6) {
+			if (old < 0)
+				old = get_unaligned_be16(p + 7);
+			put_unaligned_be16(min, p + 5);
+			put_unaligned_be16(max, p + 7);
+			put_unaligned_be16(avg, p + 9);
+		}
+		p += len + 5;
+	}
+	return old;
+}
+
+/* Insert a 100-nit L2 trim when the metadata has none: no L2 for target 2081
+ * and no CMv4.0 L8. Same values as Kodi's HDR10 static RPU, the median 100-nit
+ * trim of graded titles (slope 1680, offset 2020, power 1475, chroma/saturation/
+ * ms neutral); payload = 7 be16. Kodi keeps such RPUs CMv2.9, as the newer
+ * library ignores L2 in CMv4.0. It goes
+ * after the L1/L2 blocks to keep the levels in order. Idempotent (a repeated
+ * frame reuses the buffer). Returns 1 added, 0 trim present, < 0 error. */
+static int dv_new_add_l2_trim(char *md, int *size)
+{
+	static const u8 l2[] = { 0, 0, 0, 14, 2,
+				 0x08, 0x21, 0x06, 0x90, 0x07, 0xe4, 0x05, 0xc3,
+				 0x08, 0x00, 0x08, 0x00, 0x08, 0x00 };
+	u8 *base = (u8 *)md, *p, *end, *ins = NULL;
+
+	if (*size < ETSI_META_OFFSET || *size > DV5_MD_CAPACITY)
+		return -EINVAL;
+	p = base + ETSI_META_OFFSET;
+	end = base + *size;
+	while (p < end) {
+		u32 len;
+
+		if (end - p < 5)
+			return -EINVAL;
+		len = get_unaligned_be32(p);
+		if (len > end - p - 5)
+			return -EINVAL;
+		if (p[4] == 8 || (p[4] == 2 && len >= 2 && get_unaligned_be16(p + 5) == 2081))
+			return 0;
+		if (!ins && p[4] > 2)
+			ins = p;
+		p += len + 5;
+	}
+	if (!ins)
+		ins = end;
+	if (sizeof(l2) > DV5_MD_CAPACITY - *size || base[ETSI_META_OFFSET - 1] == 255)
+		return -EOVERFLOW;
+	memmove(ins + sizeof(l2), ins, end - ins);
+	memcpy(ins, l2, sizeof(l2));
+	base[ETSI_META_OFFSET - 1]++;
+	*size += sizeof(l2);
+	return 1;
 }
 
 static bool dv_new_parse_raw_locked(struct provider_aux_req_s *req,
@@ -180,13 +291,28 @@ static bool dv_new_parse_raw_locked(struct provider_aux_req_s *req,
 	return true;
 }
 
-static bool dv_prepare_new(struct provider_aux_req_s *req, bool drop, bool repeat)
+static bool dv_prepare_new(struct provider_aux_req_s *req, bool drop, bool repeat,
+			   enum signal_format_enum src)
 {
 	unsigned long flags;
 	bool ok = false;
 	spin_lock_irqsave(&dovi_lock, flags);
 	if (p_funcs_stb && p_funcs_new && try_module_get(dv_new_owner)) {
-		ok = dv_new_parse_raw_locked(req, drop, repeat);
+		if (src == FORMAT_DOVI || src == FORMAT_DOVI_LL) {
+			ok = dv_new_parse_raw_locked(req, drop, repeat);
+		} else {
+			/* No RPU: the library takes HDR10 statics (or nothing),
+			 * but the shim still needs its parser context attached. */
+			ok = dv_new_parser_ready;
+			if (!ok && p_funcs_new->metadata_parser_init(0)) {
+				dv_new_parser_ready = true;
+				ok = !p_funcs_new->metadata_parser_reset(1);
+				if (!ok)
+					dv_new_retire_locked();
+			}
+			dv_new_md_size = 0;
+			dv_new_comp_size = 0;
+		}
 		module_put(dv_new_owner);
 	}
 	spin_unlock_irqrestore(&dovi_lock, flags);
